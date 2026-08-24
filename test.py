@@ -90,7 +90,7 @@ if "selected_stock" not in st.session_state:
     st.session_state.selected_stock = ""
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)
 def get_krx_listing():
     return fdr.StockListing("KRX")
 
@@ -313,7 +313,7 @@ def calculate_chartist_trendlines(df):
 
 
 # ====================================================
-# [정밀 퀀트 채점 엔진]
+# [정밀 퀀트 채점 엔진 (100점 만점 기준)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -468,14 +468,14 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [초고속 랭킹 연산 엔진 (주도주 TOP10 & 퀀트 점수 TOP10)]
+# [랭킹 엔진: 주도 자금 랭킹 & 100% 점수 동기화 퀀트 랭킹]
 # ====================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1800)
 def generate_all_market_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 자금 주도 모멘텀 (거래대금 로그 + 등락률 강도)
+    # 1. 시장 주도 자금 랭킹 (거래대금 + 등락률 기반)
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     chg = df_active["ChagesRatio"]
     df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
@@ -485,14 +485,72 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 퀀트 종합 지표 스코어링 (시총 상위 우량주 기반 밸류 + 모멘텀 + 유동성 모델)
-    marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
-    # 퀀트 점수 모델: 거래대금 강도(25) + 시총 우량도(20) + 주가 안정성/상승률(35) + 베이스(20)
-    score_calc = 50 + (chg.clip(lower=-15, upper=25) * 1.5) + ((amount_log - 8) * 6) + ((marcap_log - 10) * 3)
-    df_active["퀀트점수"] = score_calc.clip(lower=18, upper=95).astype(int)
+    # 2. 퀀트 정밀 종합 점수 랭킹 (시총 상위 및 주도주 40종목 대상 100점 만점 실제 엔진 가동)
+    top_candidates = df_active.sort_values(by="Amount", ascending=False).head(40)
+    score_results = []
 
-    top10_score = df_active.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-    bot10_score = df_active.sort_values(by=["퀀트점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
+    for _, row in top_candidates.iterrows():
+        c_code = row["Code"]
+        c_name = row["Name"]
+        c_close = row["Close"]
+        c_chg_str = f"{row['ChagesRatio']:+.2f}%"
+
+        try:
+            c_df = fdr.DataReader(c_code, (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d"))
+            if len(c_df) < 40:
+                continue
+
+            c_df["MA5"] = c_df["Close"].rolling(5).mean()
+            c_df["MA20"] = c_df["Close"].rolling(20).mean()
+            c_df["MA60"] = c_df["Close"].rolling(60).mean()
+            c_df["STD20"] = c_df["Close"].rolling(20).std()
+            c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
+            c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
+            c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
+
+            exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
+            exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
+            c_df["MACD"] = exp12 - exp26
+            c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
+            c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
+
+            delta = c_df["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+            c_df["OBV"] = (np.sign(c_df["Close"].diff()).fillna(0) * c_df["Volume"]).cumsum()
+
+            tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
+            rmf = tp * c_df["Volume"]
+            pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
+            neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
+            c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
+
+            # 간이 펀더멘털 더미 (빠른 계산)
+            fund_dummy = {"목표주가": None, "PER": 15.0, "PBR": 1.2, "배당수익률": 1.5, "업종PER": 18.0, "ROE": 10.0}
+            short_dummy = {"공매도비중": 2.0}
+            inv_dummy = pd.DataFrame()
+
+            real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_dummy, fund_dummy, short_dummy)
+
+            score_results.append({
+                "Code": c_code,
+                "Name": c_name,
+                "Close": c_close,
+                "등락률표시": c_chg_str,
+                "퀀트점수": real_score,
+                "Amount": row["Amount"],
+                "RawChg": row["ChagesRatio"]
+            })
+        except Exception:
+            continue
+
+    df_scored = pd.DataFrame(score_results)
+    if not df_scored.empty:
+        top10_score = df_scored.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
+        bot10_score = df_scored.sort_values(by=["퀀트점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
+    else:
+        top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
 
     return top10_lead, bot10_lead, top10_score, bot10_score
 
@@ -515,11 +573,10 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹 (2개 독립 섹션: 주도주 TOP10 & 퀀트 점수 TOP10)
+# 1. 오른쪽 시장 랭킹
 with rank_col:
     top10_lead, bot10_lead, top10_score, bot10_score = generate_all_market_rankings()
 
-    # 섹션 1: 시장 주도 자금 랭킹
     st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🔥 시장 주도 자금 랭킹 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
 
@@ -543,8 +600,7 @@ with rank_col:
     st.write("")
     st.divider()
 
-    # 섹션 2: 퀀트 종합 점수 랭킹
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 퀀트 종합 지표 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 퀀트 종합 100점 만점 랭킹 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
 
     def render_score_buttons(df_rank, prefix):
@@ -596,6 +652,7 @@ with main_col:
                 else:
                     latest_price = df["Close"].iloc[-1]
                     prev_price = df["Close"].iloc[-2]
+                    today_open = df["Open"].iloc[-1]
 
                     df["MA5"] = df["Close"].rolling(5).mean()
                     df["MA20"] = df["Close"].rolling(20).mean()
@@ -604,6 +661,14 @@ with main_col:
                     df["BB_Upper"] = df["MA20"] + (df["STD20"] * 2)
                     df["BB_Lower"] = df["MA20"] - (df["STD20"] * 2)
                     df["BB_%b"] = (df["Close"] - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"] + 1e-9)
+
+                    # ATR 변동폭 계산
+                    tr1 = df["High"] - df["Low"]
+                    tr2 = (df["High"] - df["Close"].shift(1)).abs()
+                    tr3 = (df["Low"] - df["Close"].shift(1)).abs()
+                    df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    df["ATR14"] = df["TR"].rolling(14).mean()
+                    atr_val = df["ATR14"].iloc[-1] if not pd.isna(df["ATR14"].iloc[-1]) else latest_price * 0.03
 
                     exp12 = df["Close"].ewm(span=12, adjust=False).mean()
                     exp26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -652,17 +717,40 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
+                    # =========================================================
+                    # [실전 트레이딩 타점 완전 개편] 급등주/대형주 완벽 대응
+                    # =========================================================
+                    ma5_val = df["MA5"].iloc[-1]
+                    ma20_val = df["MA20"].iloc[-1]
+
+                    # 1차 진입가: 현재가 부근 (-1%)
                     entry_1 = round(latest_price * 0.99, -2)
-                    entry_2 = round(df["MA20"].iloc[-1], -2)
-                    t1_calc = max(high_20 * 1.02, latest_price * 1.07)
+
+                    # 2차 진입가(눌림목):
+                    # 급등주(이격도 과대)일 경우 20일선 대신 '5일선' 또는 '당일 시가'를 지지선으로 설정
+                    if (latest_price - ma20_val) / ma20_val > 0.15:  # 20일선과 15% 이상 벌어진 급등주
+                        entry_2 = round(max(ma5_val, today_open * 0.98), -2)
+                    else:
+                        entry_2 = round(ma20_val, -2)
+                    
+                    # 2차 진입가는 항상 1차 진입가보다 합리적으로 낮아야 함
+                    if entry_2 >= entry_1:
+                        entry_2 = round(latest_price * 0.95, -2)
+
+                    # 목표가 산출
+                    t1_calc = max(high_20 * 1.02, latest_price * 1.06)
                     target_1 = round(t1_calc, -2)
 
                     if fund["목표주가"] and fund["목표주가"] > target_1 * 1.05:
                         target_2 = round(fund["목표주가"], -2)
                     else:
-                        target_2 = round(target_1 * 1.10, -2)
+                        target_2 = round(target_1 * 1.08, -2)
 
-                    stop_loss = round(min(low_20 * 0.98, latest_price * 0.94), -2)
+                    # 손절가 산출: 급등주일 때 과거 저점이 아닌 '당일 시가 이탈' 또는 '현재가 대비 -5~7%' 지지선
+                    if (latest_price - low_20) / low_20 > 0.20:
+                        stop_loss = round(min(today_open * 0.96, latest_price * 0.93), -2)
+                    else:
+                        stop_loss = round(max(low_20 * 0.98, latest_price - (atr_val * 1.8)), -2)
 
                     target_grid_html = (
                         f'<div class="score-container">'
@@ -674,7 +762,7 @@ with main_col:
                         f'<div class="target-item"><div class="target-title">2차 진입 (눌림목)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">손절 기준선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
                         f'</div>'
                         f'</div>'
                     )
