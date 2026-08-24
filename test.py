@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+from scipy.signal import find_peaks
 import streamlit as st
 
 st.set_page_config(
@@ -16,7 +17,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# 핀테크 스타일 모던 다크 테마 CSS
 st.markdown(
     """
     <style>
@@ -87,7 +87,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 세션 상태 초기화 (원클릭 종목 분석 연동)
 if "selected_stock" not in st.session_state:
   st.session_state.selected_stock = ""
 
@@ -308,6 +307,36 @@ def calculate_quick_score(row):
     score += 5
 
   return int(max(10, min(98, score)))
+
+
+# 차티스트 추세선 계산 함수 (Pivot 변곡점 기반 빗금 작도)
+def calculate_trendlines(df):
+  highs = df["High"].values
+  lows = df["Low"].values
+  n = len(df)
+
+  # 변곡점 피크 추출 (거리 10일 기준)
+  peak_highs, _ = find_peaks(highs, distance=10)
+  peak_lows, _ = find_peaks(-lows, distance=10)
+
+  upper_line = [None] * n
+  lower_line = [None] * n
+
+  # 1. 하락 저항선 작도 (최근 고점 2개 연결)
+  if len(peak_highs) >= 2:
+    p1, p2 = peak_highs[-2], peak_highs[-1]
+    slope = (highs[p2] - highs[p1]) / (p2 - p1)
+    for i in range(p1, n):
+      upper_line[i] = highs[p1] + slope * (i - p1)
+
+  # 2. 상승 지지선 작도 (최근 저점 2개 연결)
+  if len(peak_lows) >= 2:
+    p1, p2 = peak_lows[-2], peak_lows[-1]
+    slope = (lows[p2] - lows[p1]) / (p2 - p1)
+    for i in range(p1, n):
+      lower_line[i] = lows[p1] + slope * (i - p1)
+
+  return upper_line, lower_line
 
 
 def evaluate_pro_quant_score(df, df_inv, fund, short):
@@ -546,7 +575,7 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹 (원클릭 종목 분석 연동)
+# 1. 오른쪽 시장 랭킹
 with rank_col:
   st.markdown(
       "<div style='font-size:15px; font-weight:700; margin-bottom:10px;'"
@@ -610,8 +639,6 @@ with rank_col:
 # 2. 왼쪽 메인 정밀 분석
 with main_col:
   col_s1, col_s2 = st.columns([4, 1])
-
-  # 세션에 저장된 선택 종목이 있으면 기본값으로 불러옴
   default_search = st.session_state.selected_stock
   search_input = col_s1.text_input(
       "종목 검색",
@@ -623,7 +650,6 @@ with main_col:
       "🚀 정밀 분석", type="primary", use_container_width=True
   )
 
-  # 검색어가 변경되면 세션 동기화
   if search_input != st.session_state.selected_stock:
     st.session_state.selected_stock = search_input
 
@@ -644,7 +670,6 @@ with main_col:
           latest_price = df["Close"].iloc[-1]
           prev_price = df["Close"].iloc[-2]
 
-          # 보조지표
           df["MA5"] = df["Close"].rolling(5).mean()
           df["MA20"] = df["Close"].rolling(20).mean()
           df["MA60"] = df["Close"].rolling(60).mean()
@@ -654,13 +679,6 @@ with main_col:
           df["BB_%b"] = (df["Close"] - df["BB_Lower"]) / (
               df["BB_Upper"] - df["BB_Lower"] + 1e-9
           )
-
-          # ATR (Average True Range) 변동폭 계산
-          tr1 = df["High"] - df["Low"]
-          tr2 = (df["High"] - df["Close"].shift(1)).abs()
-          tr3 = (df["Low"] - df["Close"].shift(1)).abs()
-          df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-          df["ATR14"] = df["TR"].rolling(14).mean()
 
           exp12 = df["Close"].ewm(span=12, adjust=False).mean()
           exp26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -696,24 +714,16 @@ with main_col:
 
           high_20 = df["High"].tail(20).max()
           low_20 = df["Low"].tail(20).min()
-          atr_val = (
-              df["ATR14"].iloc[-1]
-              if not pd.isna(df["ATR14"].iloc[-1])
-              else latest_price * 0.03
-          )
 
-          # =========================================================
-          # 매물대 (Volume Profile) 계산: 가격대별 12개 구간 거래량 분할
-          # =========================================================
+          # 매물대 프로파일
           price_min, price_max = df["Low"].min(), df["High"].max()
           bins = np.linspace(price_min, price_max, 13)
           v_counts, _ = np.histogram(
               df["Close"], bins=bins, weights=df["Volume"]
           )
-          max_vol_idx = np.argmax(v_counts)
-          poc_support_low = bins[
-              max_vol_idx
-          ]  # 최다 거래량 매물대 하단 가격선
+
+          # 차티스트 빗금 추세선 계산
+          upper_trend, lower_trend = calculate_trendlines(df)
 
           df_inv = fetch_investor_naver(code)
           fund = fetch_fundamental_and_consensus(code)
@@ -743,12 +753,8 @@ with main_col:
               df, df_inv, fund, short
           )
 
-          # =========================================================
-          # [정밀 타점 산출] 2차 목표가 상방 보정 및 다중 지지 기반 손절선
-          # =========================================================
           entry_1 = round(latest_price * 0.99, -2)
           entry_2 = round(df["MA20"].iloc[-1], -2)
-
           t1_calc = max(high_20 * 1.02, latest_price * 1.07)
           target_1 = round(t1_calc, -2)
 
@@ -757,26 +763,8 @@ with main_col:
           else:
             target_2 = round(target_1 * 1.10, -2)
 
-          # 손절선 정밀 분석:
-          # 1) 20일 최저점 이탈선 (low_20 * 0.98)
-          # 2) ATR 2배수 변동폭 하단 (latest_price - atr_val * 2.0)
-          # 3) 최다 매물대 하단선 (poc_support_low * 0.98)
-          candidate_stops = [
-              low_20 * 0.98,
-              latest_price - (atr_val * 2.0),
-              poc_support_low * 0.98,
-          ]
-          # 비정상적으로 먼 값 제외 후 현실적인 지지선 선정
-          valid_stops = [
-              s for s in candidate_stops if latest_price * 0.88 <= s < latest_price
-          ]
-          stop_loss = (
-              round(max(valid_stops), -2)
-              if valid_stops
-              else round(latest_price * 0.94, -2)
-          )
+          stop_loss = round(min(low_20 * 0.98, latest_price * 0.94), -2)
 
-          # 점수 및 전략 박스
           target_grid_html = (
               f'<div class="score-container">'
               f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>'
@@ -787,15 +775,14 @@ with main_col:
               f'<div class="target-item"><div class="target-title">2차 진입 (눌림목)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
               f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
               f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-              f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+              f'<div class="target-item"><div class="target-title">손절 기준선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
               f"</div>"
               f"</div>"
           )
           st.markdown(target_grid_html, unsafe_allow_html=True)
 
-          # 탭 메뉴
           t1, t2, t3, t4, t5 = st.tabs([
-              "차트 & 매물대 & 전략선",
+              "차트 & 추세선 & 매물대",
               "외인/기관 수급",
               "전망 & 애널리스트",
               "퀀트 채점표",
@@ -820,7 +807,7 @@ with main_col:
                 specs=[[{}, {}], [{}, None]],
             )
 
-            # 1. 메인 캔들 차트
+            # 1. 캔들스틱
             fig.add_trace(
                 go.Candlestick(
                     x=df.index,
@@ -854,49 +841,31 @@ with main_col:
                 col=1,
             )
 
-            # 2. 전략 가격 기준선 (수평 점선 오버레이)
-            fig.add_hline(
-                y=target_2,
-                line_dash="dot",
-                line_color="#10b981",
-                annotation_text=f"2차목표 {target_2:,.0f}",
-                annotation_position="top left",
-                annotation_font_size=10,
+            # 2. 차티스트 빗금 추세선 (상단 하락저항선 / 하단 상승지지선)
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=upper_trend,
+                    mode="lines",
+                    line=dict(color="#f43f5e", width=2, dash="dash"),
+                    name="하락저항선",
+                ),
                 row=1,
                 col=1,
             )
-            fig.add_hline(
-                y=target_1,
-                line_dash="dot",
-                line_color="#38bdf8",
-                annotation_text=f"1차목표 {target_1:,.0f}",
-                annotation_position="top left",
-                annotation_font_size=10,
-                row=1,
-                col=1,
-            )
-            fig.add_hline(
-                y=entry_2,
-                line_dash="dash",
-                line_color="#f59e0b",
-                annotation_text=f"2차진입(20선) {entry_2:,.0f}",
-                annotation_position="bottom left",
-                annotation_font_size=10,
-                row=1,
-                col=1,
-            )
-            fig.add_hline(
-                y=stop_loss,
-                line_dash="dash",
-                line_color="#ef4444",
-                annotation_text=f"정밀손절 {stop_loss:,.0f}",
-                annotation_position="bottom left",
-                annotation_font_size=10,
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=lower_trend,
+                    mode="lines",
+                    line=dict(color="#22c55e", width=2, dash="dash"),
+                    name="상승지지선",
+                ),
                 row=1,
                 col=1,
             )
 
-            # 3. 매물대 프로파일 (Volume Profile 수평 바)
+            # 3. 우측 매물대 프로파일 바
             bin_centers = 0.5 * (bins[:-1] + bins[1:])
             fig.add_trace(
                 go.Bar(
