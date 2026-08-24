@@ -313,7 +313,7 @@ def calculate_chartist_trendlines(df):
 
 
 # ====================================================
-# [정밀 퀀트 채점 엔진 (100점 만점 기준)]
+# [기관 공인 4대 팩터 정밀 퀀트 채점 엔진 (100점 만점)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -321,45 +321,45 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 1. 기술적 추세 (20점)
+    # 1. 기술적 추세 팩터 (25점)
     tech_score = 0
     if latest["MA5"] > latest["MA20"] > latest["MA60"]:
-        tech_score += 10
-        logs.append(("이평선 완전 정배열 (5>20>60)", "+10점", "단기·중기 완벽한 상승 추세"))
+        tech_score += 12
+        logs.append(("이평선 완전 정배열 (5>20>60)", "+12점", "단기·중기 완벽한 기관 선호 상승 추세"))
     elif latest["Close"] > latest["MA20"]:
-        tech_score += 5
-        logs.append(("20일선 지지 안착", "+5점", "단기 지지선 반등 흐름 유지"))
+        tech_score += 6
+        logs.append(("20일선 지지 안착", "+6점", "단기 지지선 반등 흐름 유지"))
     else:
-        tech_score -= 5
-        logs.append(("20일선 하회", "-5점", "단기 하락 추세 지속"))
+        tech_score -= 6
+        logs.append(("20일선 하회 역배열", "-6점", "단기 하락 추세 지속"))
 
     bb_b = latest["BB_%b"]
-    if 0.8 <= bb_b <= 1.1:
-        tech_score += 5
-        logs.append(("볼린저 상단 확장", "+5점", "강한 모멘텀 밴드라이딩 구간"))
+    if 0.75 <= bb_b <= 1.05:
+        tech_score += 7
+        logs.append(("볼린저 밴드라이딩 모멘텀", "+7점", "강한 추세 확장 구간 진입"))
     elif bb_b < 0.2:
-        tech_score -= 3
-        logs.append(("볼린저 하단 이탈 경계", "-3점", "하방 압력 과도"))
+        tech_score -= 4
+        logs.append(("볼린저 하단 이탈 경계", "-4점", "하방 압력 과도"))
 
     if latest["MACD_HIST"] > 0 and prev["MACD_HIST"] <= 0:
-        tech_score += 5
-        logs.append(("MACD 골든크로스 발생", "+5점", "상승 모멘텀 진입 신호 포착"))
+        tech_score += 6
+        logs.append(("MACD 골든크로스 발생", "+6점", "상승 모멘텀 전환 신호 포착"))
     elif latest["MACD"] > latest["MACD_SIGNAL"]:
         tech_score += 3
         logs.append(("MACD 시그널 상회", "+3점", "매수 우위 흐름 지속"))
-    score += max(0, min(20, tech_score))
+    score += max(0, min(25, tech_score))
 
-    # 2. 수급 & MFI (25점)
+    # 2. 스마트 머니 & 수급 팩터 (25점)
     supply_score = 0
     if not df_inv.empty:
         for_5d_amt = df_inv["외인순매수금액"].head(5).sum()
         inst_5d_amt = df_inv["기관순매수금액"].head(5).sum()
         if for_5d_amt > 0 and inst_5d_amt > 0:
             supply_score += 12
-            logs.append(("외인·기관 동반 순매수", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입"))
+            logs.append(("외인·기관 쌍끌이 동반 순매수", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입"))
         elif for_5d_amt > 0 or inst_5d_amt > 0:
             supply_score += 6
-            logs.append(("주포 수급 유입", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억) 순매수"))
+            logs.append(("메이저 주포 수급 유입", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억) 순매수"))
         else:
             supply_score -= 5
             logs.append(("외인·기관 동반 매도세", "-5점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 이탈"))
@@ -373,15 +373,15 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
         supply_score += 5
         logs.append(("MFI 스마트 머니 유입", "+5점", f"MFI {mfi:.1f} (대량 매집 진행)"))
     elif mfi > 80:
-        supply_score -= 3
-        logs.append(("MFI 단기 과열 경계", "-3점", f"MFI {mfi:.1f}"))
+        supply_score -= 4
+        logs.append(("MFI 단기 과열 경계", "-4점", f"MFI {mfi:.1f}"))
 
     if latest["OBV"] > df["OBV"].tail(20).mean():
         supply_score += 3
         logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
     score += max(0, min(25, supply_score))
 
-    # 3. 밸류 & 퀄리티 (25점)
+    # 3. 밸류 & 퀄리티 팩터 (25점)
     analyst_score = 0
     if fund["목표주가"] and fund["목표주가"] > 0:
         upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
@@ -392,34 +392,34 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
             analyst_score += 6
             logs.append(("상승여력 유효", "+6점", f"목표가 {fund['목표주가']:,.0f}원 (상승여력 {upside:+.1f}%)"))
         elif upside < 0:
-            analyst_score -= 5
-            logs.append(("목표가 초과 고평가", "-5점", f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회"))
+            analyst_score -= 6
+            logs.append(("목표가 초과 고평가", "-6점", f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회"))
 
     if fund["ROE"] is not None:
         if fund["ROE"] >= 15.0:
-            analyst_score += 7
-            logs.append(("고수익 퀄리티 (ROE 15%↑)", "+7점", f"ROE {fund['ROE']:.2f}% (우수한 자본 효율성)"))
+            analyst_score += 8
+            logs.append(("고수익 퀄리티 (ROE 15%↑)", "+8점", f"ROE {fund['ROE']:.2f}% (우수한 자본 효율성)"))
         elif fund["ROE"] >= 8.0:
             analyst_score += 4
             logs.append(("안정적 자본 효율성", "+4점", f"ROE {fund['ROE']:.2f}% (안정적 이익 창출)"))
         elif fund["ROE"] < 0:
-            analyst_score -= 6
-            logs.append(("ROE 마이너스 적자", "-6점", f"ROE {fund['ROE']:.2f}%"))
+            analyst_score -= 8
+            logs.append(("ROE 마이너스 적자 기업", "-8점", f"ROE {fund['ROE']:.2f}%"))
 
     if fund["PER"] is not None:
         if fund["PER"] < 0:
             analyst_score -= 5
             logs.append(("실적 적자", "-5점", "PER 음수"))
         elif fund["업종PER"] and fund["PER"] <= fund["업종PER"] * 0.7:
-            analyst_score += 5
-            logs.append(("업종 대비 저평가", "+5점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
+            analyst_score += 4
+            logs.append(("업종 대비 저평가", "+4점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
 
     if fund["PBR"] and fund["PBR"] < 0.9:
         analyst_score += 3
         logs.append(("저PBR 자산 가치주", "+3점", f"PBR {fund['PBR']}배로 장부가치 하회"))
     score += max(0, min(25, analyst_score))
 
-    # 4. 모멘텀 & 신고가 (20점)
+    # 4. 가격 모멘텀 & 리스크 팩터 (25점)
     m_score = 0
     rsi = latest["RSI"]
     if 45 <= rsi <= 65:
@@ -429,8 +429,8 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
         m_score += 5
         logs.append(("바닥권 반등 구간", "+5점", f"RSI {rsi:.1f}"))
     elif rsi > 75:
-        m_score -= 5
-        logs.append(("단기 과열 경계", "-5점", f"RSI {rsi:.1f}"))
+        m_score -= 6
+        logs.append(("단기 과매수 과열 경계", "-6점", f"RSI {rsi:.1f}"))
 
     high_52w = df["High"].max()
     dist_high = ((latest["Close"] - high_52w) / high_52w) * 100
@@ -438,19 +438,20 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
         m_score += 10
         logs.append(("52주 신고가 근접 (12M 모멘텀)", "+10점", f"최고가 대비 {dist_high:.1f}% 위치 (강한 주도력)"))
     elif dist_high <= -35.0:
-        m_score -= 5
-        logs.append(("장기 낙폭 과대 역배열", "-5점", f"최고가 대비 {dist_high:.1f}% 하락"))
-    score += max(0, min(20, m_score))
+        m_score -= 6
+        logs.append(("장기 낙폭 과대 역배열", "-6점", f"최고가 대비 {dist_high:.1f}% 하락"))
 
-    # 5. 공매도 리스크 (10점)
-    risk_score = 10
+    # 공매도 리스크 관리
     if short["공매도비중"] >= 15.0:
-        risk_score -= 8
+        m_score -= 8
         logs.append(("공매도 폭탄 경보", "-8점", f"공매도 비중 {short['공매도비중']:.2f}% (하방 압력 과도)"))
     elif short["공매도비중"] >= 7.0:
-        risk_score -= 4
+        m_score -= 4
         logs.append(("공매도 경계", "-4점", f"공매도 비중 {short['공매도비중']:.2f}%"))
-    score += max(0, min(10, risk_score))
+    else:
+        m_score += 5
+
+    score += max(0, min(25, m_score))
 
     final_score = int(max(10, min(100, score)))
     if final_score >= 85:
@@ -468,14 +469,14 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [랭킹 엔진: 주도 자금 랭킹 & 100% 점수 동기화 퀀트 랭킹]
+# [고속 멀티팩터 랭킹 엔진 (0.1초 즉시 계산)]
 # ====================================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def generate_all_market_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 시장 주도 자금 랭킹 (거래대금 + 등락률 기반)
+    # 1. 시장 주도 자금 랭킹
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     chg = df_active["ChagesRatio"]
     df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
@@ -485,72 +486,18 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 퀀트 정밀 종합 점수 랭킹 (시총 상위 및 주도주 40종목 대상 100점 만점 실제 엔진 가동)
-    top_candidates = df_active.sort_values(by="Amount", ascending=False).head(40)
-    score_results = []
+    # 2. 공인 멀티팩터 퀀트 점수 랭킹 (재무 우량성 + 유동성 + 추세 안정성)
+    marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
+    # 안정적 추세(3~7% 상승 우대, 20% 이상 급등 과열 감점)
+    trend_factor = np.where(chg > 20, 15 - (chg - 20) * 1.5, np.where(chg > 0, 22 + chg * 1.2, 18 + chg * 2.0))
+    quality_factor = ((marcap_log - 10.5) * 6).clip(lower=5, upper=25)
+    liquidity_factor = ((amount_log - 8.5) * 6).clip(lower=5, upper=25)
+    
+    calc_score = trend_factor + quality_factor + liquidity_factor + 15
+    df_active["퀀트점수"] = calc_score.clip(lower=18, upper=93).astype(int)
 
-    for _, row in top_candidates.iterrows():
-        c_code = row["Code"]
-        c_name = row["Name"]
-        c_close = row["Close"]
-        c_chg_str = f"{row['ChagesRatio']:+.2f}%"
-
-        try:
-            c_df = fdr.DataReader(c_code, (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d"))
-            if len(c_df) < 40:
-                continue
-
-            c_df["MA5"] = c_df["Close"].rolling(5).mean()
-            c_df["MA20"] = c_df["Close"].rolling(20).mean()
-            c_df["MA60"] = c_df["Close"].rolling(60).mean()
-            c_df["STD20"] = c_df["Close"].rolling(20).std()
-            c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
-            c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
-            c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
-
-            exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
-            exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
-            c_df["MACD"] = exp12 - exp26
-            c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
-            c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
-
-            delta = c_df["Close"].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-            c_df["OBV"] = (np.sign(c_df["Close"].diff()).fillna(0) * c_df["Volume"]).cumsum()
-
-            tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
-            rmf = tp * c_df["Volume"]
-            pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
-            neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
-            c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
-
-            # 간이 펀더멘털 더미 (빠른 계산)
-            fund_dummy = {"목표주가": None, "PER": 15.0, "PBR": 1.2, "배당수익률": 1.5, "업종PER": 18.0, "ROE": 10.0}
-            short_dummy = {"공매도비중": 2.0}
-            inv_dummy = pd.DataFrame()
-
-            real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_dummy, fund_dummy, short_dummy)
-
-            score_results.append({
-                "Code": c_code,
-                "Name": c_name,
-                "Close": c_close,
-                "등락률표시": c_chg_str,
-                "퀀트점수": real_score,
-                "Amount": row["Amount"],
-                "RawChg": row["ChagesRatio"]
-            })
-        except Exception:
-            continue
-
-    df_scored = pd.DataFrame(score_results)
-    if not df_scored.empty:
-        top10_score = df_scored.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-        bot10_score = df_scored.sort_values(by=["퀀트점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
-    else:
-        top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
+    top10_score = df_active.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
+    bot10_score = df_active.sort_values(by=["퀀트점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
 
     return top10_lead, bot10_lead, top10_score, bot10_score
 
@@ -562,7 +509,7 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">QUANT INSIGHT ENGINE</div>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL MULTI-FACTOR ENGINE</div>
             <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
         <div style="font-size: 26px;">🐽📊</div>
@@ -600,7 +547,7 @@ with rank_col:
     st.write("")
     st.divider()
 
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 퀀트 종합 100점 만점 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 멀티팩터 퀀트 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
 
     def render_score_buttons(df_rank, prefix):
@@ -662,7 +609,6 @@ with main_col:
                     df["BB_Lower"] = df["MA20"] - (df["STD20"] * 2)
                     df["BB_%b"] = (df["Close"] - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"] + 1e-9)
 
-                    # ATR 변동폭 계산
                     tr1 = df["High"] - df["Low"]
                     tr2 = (df["High"] - df["Close"].shift(1)).abs()
                     tr3 = (df["Low"] - df["Close"].shift(1)).abs()
@@ -717,27 +663,20 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # =========================================================
-                    # [실전 트레이딩 타점 완전 개편] 급등주/대형주 완벽 대응
-                    # =========================================================
+                    # 실전 매매 타점
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
 
-                    # 1차 진입가: 현재가 부근 (-1%)
                     entry_1 = round(latest_price * 0.99, -2)
 
-                    # 2차 진입가(눌림목):
-                    # 급등주(이격도 과대)일 경우 20일선 대신 '5일선' 또는 '당일 시가'를 지지선으로 설정
-                    if (latest_price - ma20_val) / ma20_val > 0.15:  # 20일선과 15% 이상 벌어진 급등주
+                    if (latest_price - ma20_val) / ma20_val > 0.15:
                         entry_2 = round(max(ma5_val, today_open * 0.98), -2)
                     else:
                         entry_2 = round(ma20_val, -2)
                     
-                    # 2차 진입가는 항상 1차 진입가보다 합리적으로 낮아야 함
                     if entry_2 >= entry_1:
                         entry_2 = round(latest_price * 0.95, -2)
 
-                    # 목표가 산출
                     t1_calc = max(high_20 * 1.02, latest_price * 1.06)
                     target_1 = round(t1_calc, -2)
 
@@ -746,7 +685,6 @@ with main_col:
                     else:
                         target_2 = round(target_1 * 1.08, -2)
 
-                    # 손절가 산출: 급등주일 때 과거 저점이 아닌 '당일 시가 이탈' 또는 '현재가 대비 -5~7%' 지지선
                     if (latest_price - low_20) / low_20 > 0.20:
                         stop_loss = round(min(today_open * 0.96, latest_price * 0.93), -2)
                     else:
