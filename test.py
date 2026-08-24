@@ -10,48 +10,80 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="부리부리 7대 종합 주식 작전실",
-    page_icon="🐷",
+    page_title="부리부리 퀀트 인사이트",
+    page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
+# 핀테크 스타일 정갈한 미니멀 다크 테마 CSS
 st.markdown(
     """
     <style>
-    .stApp { background: linear-gradient(135deg, #0d1117 0%, #161b22 100%); color: #c9d1d9; }
-    .hero-banner { 
-        background: linear-gradient(90deg, #ff758c 0%, #ff7eb3 100%); 
-        padding: 18px 24px; 
-        border-radius: 14px; 
-        color: white; 
-        margin-bottom: 20px; 
-        display: flex; 
-        justify-content: space-between; 
-        align-items: center; 
-        box-shadow: 0 4px 20px rgba(255,117,140,0.2); 
-    }
-    .score-box { 
-        background: rgba(255, 255, 255, 0.04); 
-        border: 2px solid #ff7eb3; 
-        border-radius: 14px; 
-        padding: 20px; 
-        text-align: center; 
-        margin-bottom: 15px;
-    }
-    .strategy-card { 
-        background: rgba(56, 139, 253, 0.08); 
-        border-left: 4px solid #58a6ff; 
-        padding: 15px 20px; 
-        border-radius: 8px; 
-        margin-top: 15px; 
-    }
-    [data-testid="stMetric"] {
-        background: rgba(255, 255, 255, 0.03);
+    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+    * { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, sans-serif; }
+    .stApp { background-color: #0c0f17; color: #e1e7f0; }
+    
+    /* 헤더 카드 */
+    .header-card {
+        background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
         border: 1px solid rgba(255, 255, 255, 0.08);
-        padding: 10px;
-        border-radius: 10px;
+        border-radius: 16px;
+        padding: 20px 24px;
+        margin-bottom: 24px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        backdrop-filter: blur(10px);
     }
+    
+    /* 점수 메트릭 카드 */
+    .score-container {
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid rgba(255, 255, 255, 0.07);
+        border-radius: 16px;
+        padding: 20px;
+        text-align: center;
+        margin-bottom: 20px;
+    }
+    
+    /* 전략 타점 카드 */
+    .target-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+        gap: 12px;
+        margin-top: 15px;
+    }
+    .target-item {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 10px;
+        padding: 12px;
+        text-align: center;
+    }
+    .target-title { font-size: 11px; color: #8b9bb4; margin-bottom: 4px; }
+    .target-val { font-size: 15px; font-weight: 700; color: #38bdf8; }
+
+    /* 리포트 및 인사이트 박스 */
+    .insight-card {
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 12px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+        line-height: 1.6;
+        font-size: 14px;
+        color: #cbd5e1;
+    }
+
+    [data-testid="stMetric"] {
+        background: rgba(255, 255, 255, 0.02) !important;
+        border: 1px solid rgba(255, 255, 255, 0.06) !important;
+        padding: 14px !important;
+        border-radius: 12px !important;
+    }
+    [data-testid="stMetricLabel"] { font-size: 12px !important; color: #94a3b8 !important; }
+    [data-testid="stMetricValue"] { font-size: 20px !important; font-weight: 700 !important; }
     </style>
 """,
     unsafe_allow_html=True,
@@ -119,7 +151,7 @@ def fetch_investor_naver(code):
   return pd.DataFrame(rows)
 
 
-# 펀더멘털 & 컨센서스 크롤러
+# 펀더멘털 & 애널리스트 리포트 & 기업 전망 크롤러
 def fetch_fundamental_and_consensus(code):
   url = f"https://finance.naver.com/item/main.naver?code={code}"
   headers = {
@@ -134,10 +166,14 @@ def fetch_fundamental_and_consensus(code):
       "업종PER": None,
       "목표주가": None,
       "ROE": None,
+      "기업개요": "기업 정보 준비 중",
+      "컨센서스_매출": [],
+      "리포트_목록": [],
   }
   try:
     res = requests.get(url, headers=headers, timeout=5)
     soup = BeautifulSoup(res.text, "html.parser")
+
     per_tag = soup.select_one("#_per")
     pbr_tag = soup.select_one("#_pbr")
     dvr_tag = soup.select_one("#_dvr")
@@ -155,7 +191,12 @@ def fetch_fundamental_and_consensus(code):
     if target_tag and target_tag.text.strip():
       data["목표주가"] = float(target_tag.text.replace(",", ""))
 
-    # 주요 재무 지표 테이블에서 ROE 파싱
+    # 기업 개요 및 향후 사업 방향
+    summary_tag = soup.select_one("div.summary_info p")
+    if summary_tag:
+      data["기업개요"] = summary_tag.text.strip()
+
+    # ROE 파싱
     cop_table = soup.select_one("div.section.cop_analysis table")
     if cop_table:
       for tr in cop_table.select("tbody tr"):
@@ -171,6 +212,31 @@ def fetch_fundamental_and_consensus(code):
               except Exception:
                 continue
           break
+
+    # 최신 증권사 리포트 크롤링
+    report_url = (
+        f"https://finance.naver.com/item/research.naver?code={code}"
+    )
+    res_rep = requests.get(report_url, headers=headers, timeout=5)
+    soup_rep = BeautifulSoup(res_rep.text, "html.parser")
+    for tr in soup_rep.select("table.type2 tr")[2:7]:
+      tds = tr.select("td")
+      if len(tds) >= 4 and tds[0].text.strip():
+        title = tds[0].text.strip()
+        broker = tds[2].text.strip()
+        date = tds[3].text.strip()
+        link_tag = tds[0].select_one("a")
+        link = (
+            "https://finance.naver.com" + link_tag["href"]
+            if link_tag
+            else "#"
+        )
+        data["리포트_목록"].append({
+            "title": title,
+            "broker": broker,
+            "date": date,
+            "link": link,
+        })
   except Exception:
     pass
   return data
@@ -222,7 +288,7 @@ def fetch_news(keyword):
   return news_list
 
 
-# 단일 종목 고속 스캔 퀀트 채점 (사이드 랭킹용)
+# 빠른 랭킹 점수 계산
 def calculate_quick_score(row):
   score = 50
   chg = row.get("ChagesRatio", 0)
@@ -252,21 +318,19 @@ def calculate_quick_score(row):
   return int(max(10, min(98, score)))
 
 
-# ====================================================
-# [기관 전문 퀀트 모델] 정밀 팩터 채점 알고리즘 (100점 만점)
-# ====================================================
+# 정밀 팩터 채점 알고리즘
 def evaluate_pro_quant_score(df, df_inv, fund, short):
   score = 0
   logs = []
   latest = df.iloc[-1]
   prev = df.iloc[-2]
 
-  # 1. 기술적 추세 & 볼린저 밴드 팩터 (20점)
+  # 1. 기술적 추세
   tech_score = 0
   if latest["MA5"] > latest["MA20"] > latest["MA60"]:
     tech_score += 10
     logs.append(
-        ("이평선 완전 정배열 (5>20>60)", "+10점", "단·중기 완벽한 상승 추세")
+        ("이평선 정배열 (5>20>60)", "+10점", "단기·중기 완벽한 상승 추세")
     )
   elif latest["Close"] > latest["MA20"]:
     tech_score += 5
@@ -275,13 +339,10 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     tech_score -= 5
     logs.append(("20일선 하회", "-5점", "단기 하락 추세 지속"))
 
-  # 볼린저 밴드 %b 위치
   bb_b = latest["BB_%b"]
   if 0.8 <= bb_b <= 1.1:
     tech_score += 5
-    logs.append(
-        ("볼린저밴드 상단 밴드라이딩", "+5점", "강한 모멘텀 확장 구간 진입")
-    )
+    logs.append(("볼린저 상단 확장", "+5점", "강한 모멘텀 밴드라이딩 구간"))
   elif bb_b < 0.2:
     tech_score -= 3
     logs.append(("볼린저 하단 이탈 경계", "-3점", "하방 압력 과도"))
@@ -294,10 +355,9 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
   elif latest["MACD"] > latest["MACD_SIGNAL"]:
     tech_score += 3
     logs.append(("MACD 시그널 상회", "+3점", "매수 우위 흐름 지속"))
-
   score += max(0, min(20, tech_score))
 
-  # 2. 수급 에너지 & MFI(자금유입지수) 팩터 (25점)
+  # 2. 수급 & MFI
   supply_score = 0
   if not df_inv.empty:
     for_5d_amt = df_inv["외인순매수금액"].head(5).sum()
@@ -305,14 +365,14 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     if for_5d_amt > 0 and inst_5d_amt > 0:
       supply_score += 12
       logs.append((
-          "외인·기관 쌍끌이 동반 순매수",
+          "외인·기관 동반 순매수",
           "+12점",
           f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입",
       ))
     elif for_5d_amt > 0 or inst_5d_amt > 0:
       supply_score += 6
       logs.append((
-          "메이저 수급 유입",
+          "주포 수급 유입",
           "+6점",
           f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억) 순매수",
       ))
@@ -329,29 +389,27 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     ].iloc[9]:
       supply_score += 5
       logs.append((
-          "외국인 지분율 상승세",
+          "외국인 지분율 확대",
           "+5점",
           f"현재 외인 지분율 {df_inv['외인보유율'].iloc[0]:.2f}%",
       ))
 
-  # MFI (Money Flow Index) 스마트 머니 분석
   mfi = latest["MFI"]
   if 50 <= mfi <= 75:
     supply_score += 5
     logs.append(
-        ("MFI 스마트 머니 순유입", "+5점", f"MFI {mfi:.1f} (안정적 대량 매집)")
+        ("MFI 스마트 머니 유입", "+5점", f"MFI {mfi:.1f} (대량 매집 진행)")
     )
   elif mfi > 80:
     supply_score -= 3
-    logs.append(("MFI 단기 과열", "-3점", f"MFI {mfi:.1f} (단기 매수 과열)"))
+    logs.append(("MFI 단기 과열 경계", "-3점", f"MFI {mfi:.1f}"))
 
   if latest["OBV"] > df["OBV"].tail(20).mean():
     supply_score += 3
-    logs.append(("OBV 매집 추세 지속", "+3점", "거래량 기반 매집 에너지 양호"))
-
+    logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
   score += max(0, min(25, supply_score))
 
-  # 3. 밸류 & 퀄리티 팩터 (Piotroski ROE / PBR / 컨센서스) (25점)
+  # 3. 밸류 & 퀄리티 (ROE & 컨센서스)
   analyst_score = 0
   if fund["목표주가"] and fund["목표주가"] > 0:
     upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
@@ -377,19 +435,18 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
           f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회",
       ))
 
-  # ROE 퀄리티
   if fund["ROE"] is not None:
     if fund["ROE"] >= 15.0:
       analyst_score += 7
       logs.append((
-          "고수익성 퀄리티 기업 (ROE 15%↑)",
+          "고수익 퀄리티 (ROE 15%↑)",
           "+7점",
           f"ROE {fund['ROE']:.2f}% (우수한 자본 효율성)",
       ))
     elif fund["ROE"] >= 8.0:
       analyst_score += 4
       logs.append((
-          "양호한 자본 효율성",
+          "안정적 자본 효율성",
           "+4점",
           f"ROE {fund['ROE']:.2f}% (안정적 이익 창출)",
       ))
@@ -400,7 +457,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
   if fund["PER"] is not None:
     if fund["PER"] < 0:
       analyst_score -= 5
-      logs.append(("실적 적자 지속", "-5점", "PER 음수"))
+      logs.append(("실적 적자", "-5점", "PER 음수"))
     elif fund["업종PER"] and fund["PER"] <= fund["업종PER"] * 0.7:
       analyst_score += 5
       logs.append((
@@ -412,12 +469,11 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
   if fund["PBR"] and fund["PBR"] < 0.9:
     analyst_score += 3
     logs.append(
-        ("저PBR 자산 가치주", "+3점", f"PBR {fund['PBR']}배로 청산가치 하회")
+        ("저PBR 자산 가치주", "+3점", f"PBR {fund['PBR']}배로 장부가치 하회")
     )
-
   score += max(0, min(25, analyst_score))
 
-  # 4. 가격 모멘텀 팩터 (RSI & 신고가 이격) (20점)
+  # 4. 모멘텀 & 신고가
   m_score = 0
   rsi = latest["RSI"]
   if 45 <= rsi <= 65:
@@ -430,9 +486,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     logs.append(("바닥권 반등 구간", "+5점", f"RSI {rsi:.1f}"))
   elif rsi > 75:
     m_score -= 5
-    logs.append(
-        ("단기 과매수 주의", "-5점", f"RSI {rsi:.1f} (차익 실현 매물 경계)")
-    )
+    logs.append(("단기 과열 경계", "-5점", f"RSI {rsi:.1f}"))
 
   high_52w = df["High"].max()
   dist_high = ((latest["Close"] - high_52w) / high_52w) * 100
@@ -445,14 +499,12 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     ))
   elif dist_high <= -35.0:
     m_score -= 5
-    logs.append((
-        "장기 역배열 낙폭 과대",
-        "-5점",
-        f"최고가 대비 {dist_high:.1f}% 하락",
-    ))
+    logs.append(
+        ("장기 낙폭 과대", "-5점", f"최고가 대비 {dist_high:.1f}% 하락")
+    )
   score += max(0, min(20, m_score))
 
-  # 5. 공매도 & 리스크 관리 (10점)
+  # 5. 공매도 리스크
   risk_score = 10
   if short["공매도비중"] >= 15.0:
     risk_score -= 8
@@ -486,16 +538,16 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# 메인 상단 헤더
+# 메인 헤더
 # ====================================================
 st.markdown(
     """
-    <div class="hero-banner">
+    <div class="header-card">
         <div>
-            <h2 style="margin:0; font-weight:800;">🐷 부리부리 7차원 기관 퀀트 정밀 진단 시스템</h2>
-            <p style="margin:4px 0 0 0; font-size:13px; opacity:0.95;">MFI 수급강도 · ROE 퀄리티 · 볼린저스퀴즈 · 외인/기관 팩터 종합 분석실</p>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:4px;">QUANT INSIGHT ENGINE</div>
+            <h2 style="margin:0; font-size:24px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
-        <div style="font-size: 38px;">🐽📊</div>
+        <div style="font-size: 28px;">🐽📊</div>
     </div>
 """,
     unsafe_allow_html=True,
@@ -503,9 +555,13 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 사이드 랭킹
+# 1. 오른쪽 시장 랭킹
 with rank_col:
-  st.markdown("### 🏆 시장 퀀트 랭킹")
+  st.markdown(
+      "<div style='font-size:16px; font-weight:700; margin-bottom:12px;'"
+      ">🏆 실시간 시장 퀀트 랭킹</div>",
+      unsafe_allow_html=True,
+  )
   with st.spinner("시장 주도주 스캔 중..."):
     krx_all = get_krx_listing()
     active_krx = krx_all[
@@ -538,7 +594,7 @@ with rank_col:
             columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
         ),
         use_container_width=True,
-        height=520,
+        height=500,
     )
   with rank_tab2:
     st.dataframe(
@@ -546,16 +602,17 @@ with rank_col:
             columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
         ),
         use_container_width=True,
-        height=520,
+        height=500,
     )
 
 # 2. 왼쪽 메인 정밀 분석
 with main_col:
   col_s1, col_s2 = st.columns([4, 1])
   search_input = col_s1.text_input(
-      "🔍 분석할 종목명 또는 종목코드",
+      "종목 검색",
       value="",
-      placeholder="예: 삼성전자, 현대차, SK하이닉스, 000660 등 입력",
+      placeholder="종목명(예: 삼성전자, 현대차, SK하이닉스) 또는 6자리 코드 입력",
+      label_visibility="collapsed",
   )
   analyze_btn = col_s2.button(
       "🚀 정밀 분석", type="primary", use_container_width=True
@@ -568,7 +625,7 @@ with main_col:
       st.error(f"'{search_input}' 종목을 찾을 수 없습니다.")
     else:
       with st.spinner(
-          f"부리부리 대마왕이 [{stock_name}]의 퀀트 팩터를 정밀 계산 중..."
+          f"[{stock_name}]의 펀더멘털 및 컨센서스를 정밀 분석 중..."
       ):
         end_dt = datetime.today()
         start_dt = end_dt - timedelta(days=365)
@@ -604,7 +661,6 @@ with main_col:
               np.sign(df["Close"].diff()).fillna(0) * df["Volume"]
           ).cumsum()
 
-          # MFI (Money Flow Index) 계산
           tp = (df["High"] + df["Low"] + df["Close"]) / 3
           rmf = tp * df["Volume"]
           pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
@@ -618,9 +674,6 @@ with main_col:
           ) * 100
           ret_1m = (
               (latest_price - df["Close"].iloc[-20]) / df["Close"].iloc[-20]
-          ) * 100
-          ret_3m = (
-              (latest_price - df["Close"].iloc[-60]) / df["Close"].iloc[-60]
           ) * 100
           ret_1y = (
               (latest_price - df["Close"].iloc[0]) / df["Close"].iloc[0]
@@ -667,41 +720,48 @@ with main_col:
           )
           target_2 = round(latest_price * 1.15, -2)
 
+          # 종합 진단 카드
           st.markdown(
               f"""
-                <div class="score-box">
-                    <h3 style="color:#ff7eb3; margin:0;">[{stock_name} ({code})] 퀀트 팩터 진단 리포트</h3>
-                    <h1 style="font-size: 52px; color: #ffd166; margin: 6px 0; font-weight:800;">{total_score}점 / 100점</h1>
-                    <h3 style="margin:0;">판정: {grade_text} ({stars})</h3>
+                <div class="score-container">
+                    <div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>
+                    <div style="font-size: 46px; color: #38bdf8; font-weight: 800; margin: 4px 0;">{total_score}<span style="font-size:20px; color:#64748b;"> / 100</span></div>
+                    <div style="font-size: 15px; font-weight: 600; color: #f1f5f9;">{grade_text} <span style="color:#eab308;">{stars}</span></div>
+                    
+                    <div class="target-grid">
+                        <div class="target-item">
+                            <div class="target-title">1차 진입 (현재가 부근)</div>
+                            <div class="target-val">{entry_1:,.0f}원</div>
+                        </div>
+                        <div class="target-item">
+                            <div class="target-title">2차 진입 (눌림목)</div>
+                            <div class="target-val">{entry_2:,.0f}원</div>
+                        </div>
+                        <div class="target-item">
+                            <div class="target-title">1차 목표 (단기 저항)</div>
+                            <div class="target-val">{target_1:,.0f}원</div>
+                        </div>
+                        <div class="target-item">
+                            <div class="target-title">2차 목표 (추세 확장)</div>
+                            <div class="target-val">{target_2:,.0f}원</div>
+                        </div>
+                        <div class="target-item">
+                            <div class="target-title">손절 기준선</div>
+                            <div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div>
+                        </div>
+                    </div>
                 </div>
                 """,
               unsafe_allow_html=True,
           )
 
-          st.markdown(
-              f"""
-            <div class="strategy-card">
-                <h4 style="margin:0 0 6px 0; color:#58a6ff;">🎯 퀀트 타점 가이드</h4>
-                <div style="display: flex; gap: 15px; flex-wrap: wrap; font-size:13px;">
-                    <div>🔹 <b>1차 진입:</b> {entry_1:,.0f}원</div>
-                    <div>🔹 <b>2차 진입:</b> {entry_2:,.0f}원</div>
-                    <div>🎯 <b>1차 목표가:</b> {target_1:,.0f}원</div>
-                    <div>🚀 <b>2차 목표가:</b> {target_2:,.0f}원</div>
-                    <div>🚨 <b>손절선:</b> {stop_loss:,.0f}원</div>
-                </div>
-            </div>
-            """,
-              unsafe_allow_html=True,
-          )
-
-          st.divider()
-
+          # 정갈한 탭 메뉴 구성
           t1, t2, t3, t4, t5 = st.tabs([
-              "① 주가 & 차트",
-              "② 외인/기관 수급 & MFI",
-              "③ 밸류/퀄리티(ROE)",
-              "④ 퀀트 채점표",
-              "⑤ 뉴스/재료",
+              "차트 & 가격",
+              "외인/기관 수급",
+              "전망 & 애널리스트",
+              "퀀트 채점표",
+              "뉴스 브리핑",
           ])
 
           with t1:
@@ -734,7 +794,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["MA20"],
-                    line=dict(color="#58a6ff", width=1.5),
+                    line=dict(color="#38bdf8", width=1.5),
                     name="20일선",
                 ),
                 row=1,
@@ -744,7 +804,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["MA60"],
-                    line=dict(color="#238636", width=1.5),
+                    line=dict(color="#10b981", width=1.5),
                     name="60일선",
                 ),
                 row=1,
@@ -754,7 +814,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["BB_Upper"],
-                    line=dict(color="rgba(255,100,100,0.5)", dash="dot"),
+                    line=dict(color="rgba(239,68,68,0.4)", dash="dot"),
                     name="볼린저상단",
                 ),
                 row=1,
@@ -764,7 +824,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["BB_Lower"],
-                    line=dict(color="rgba(100,100,255,0.5)", dash="dot"),
+                    line=dict(color="rgba(59,130,246,0.4)", dash="dot"),
                     name="볼린저하단",
                 ),
                 row=1,
@@ -775,7 +835,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["MACD"],
-                    line=dict(color="#ff758c", width=1.2),
+                    line=dict(color="#f43f5e", width=1.2),
                     name="MACD",
                 ),
                 row=2,
@@ -785,7 +845,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["MACD_SIGNAL"],
-                    line=dict(color="#ffd166", width=1.2),
+                    line=dict(color="#fbbf24", width=1.2),
                     name="Signal",
                 ),
                 row=2,
@@ -793,20 +853,21 @@ with main_col:
             )
             fig.update_layout(
                 template="plotly_dark",
-                height=450,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                height=430,
                 margin=dict(l=5, r=5, t=5, b=5),
                 xaxis_rangeslider_visible=False,
             )
             st.plotly_chart(fig, use_container_width=True)
 
           with t2:
-            st.subheader("🏦 수급 에너지 및 MFI 자금흐름 지표")
             s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("5일 외국인", f"{for_5d:+.1f}억원")
             s2.metric("5일 기관", f"{inst_5d:+.1f}억원")
             s3.metric("20일 외국인", f"{for_20d:+.1f}억원")
             s4.metric("외인 지분율", f"{for_rate:.2f}%")
-            s5.metric("MFI(자금유입강도)", f"{df['MFI'].iloc[-1]:.1f} pt")
+            s5.metric("MFI(자금유입)", f"{df['MFI'].iloc[-1]:.1f} pt")
 
             if not df_inv.empty:
               show_inv = df_inv.head(10)[
@@ -824,6 +885,13 @@ with main_col:
               st.dataframe(show_inv, use_container_width=True)
 
           with t3:
+            st.markdown("#### 🏢 기업 핵심 개요 & 사업 방향")
+            st.markdown(
+                f'<div class="insight-card">{fund["기업개요"]}</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("#### 📊 펀더멘털 & 애널리스트 컨센서스")
             v1, v2, v3, v4, v5 = st.columns(5)
             v1.metric(
                 "목표주가",
@@ -848,8 +916,18 @@ with main_col:
             v4.metric("PBR", f"{fund['PBR'] or '-'}배")
             v5.metric("공매도비중", f"{short['공매도비중']:.2f}%")
 
+            st.markdown("#### 📑 최신 증권사 애널리스트 리포트")
+            if fund["리포트_목록"]:
+              for rep in fund["리포트_목록"]:
+                st.markdown(
+                    f"- **[{rep['broker']}]** [{rep['title']}]({rep['link']})"
+                    f" <span style='color:#64748b; font-size:12px;'>({rep['date']})</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+              st.write("최근 등록된 증권사 분석 리포트가 없습니다.")
+
           with t4:
-            st.markdown("### 📋 퀀트 팩터 채점 상세 내역")
             st.dataframe(
                 pd.DataFrame(
                     logs, columns=["평가 항목", "가감점", "상세 내용"]
@@ -858,12 +936,10 @@ with main_col:
             )
 
           with t5:
-            st.subheader(f"📰 [{stock_name}] 주요 뉴스")
             for item in news_items:
-              st.markdown(f"- 🐽 [{item['title']}]({item['link']})")
+              st.markdown(f"- [{item['title']}]({item['link']})")
   else:
     st.info(
         "💡 상단 검색창에 분석하고자 하는 **종목명(예: 삼성전자, 현대차)** 또는"
-        " **6자리 종목코드**를 입력하신 후 엔터를 누르시거나 [🚀 정밀 분석]"
-        " 버튼을 눌러주세요부리!"
+        " **6자리 종목코드**를 입력하신 후 [🚀 정밀 분석] 버튼을 눌러주세요부리!"
     )
