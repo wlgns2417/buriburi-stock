@@ -16,7 +16,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# 핀테크 스타일 정갈한 미니멀 다크 테마 CSS
+# 핀테크 스타일 모던 다크 테마 CSS
 st.markdown(
     """
     <style>
@@ -86,6 +86,10 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
+# 세션 상태 초기화 (원클릭 종목 분석 연동)
+if "selected_stock" not in st.session_state:
+  st.session_state.selected_stock = ""
 
 
 @st.cache_data(ttl=3600)
@@ -542,11 +546,11 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹
+# 1. 오른쪽 시장 랭킹 (원클릭 종목 분석 연동)
 with rank_col:
   st.markdown(
       "<div style='font-size:15px; font-weight:700; margin-bottom:10px;'"
-      ">🏆 실시간 시장 퀀트 랭킹</div>",
+      ">🏆 실시간 시장 퀀트 랭킹 (클릭 시 자동 분석)</div>",
       unsafe_allow_html=True,
   )
   with st.spinner("시장 랭킹 집계 중..."):
@@ -563,47 +567,65 @@ with rank_col:
         active_krx.sort_values(
             by=["점수", "Amount"], ascending=[False, False]
         )
-        .head(20)[["Name", "Close", "등락률", "점수"]]
+        .head(20)
         .reset_index(drop=True)
     )
     bottom_20 = (
         active_krx.sort_values(by=["점수", "ChagesRatio"], ascending=[True, True])
-        .head(20)[["Name", "Close", "등락률", "점수"]]
+        .head(20)
         .reset_index(drop=True)
     )
 
   rank_tab1, rank_tab2 = st.tabs(
       ["🔥 상위 TOP 20", "❄️ 하위 TOP 20"]
   )
+
+  def render_rank_buttons(df_rank, prefix):
+    for i, row in df_rank.iterrows():
+      cols = st.columns([5, 3, 2])
+      if cols[0].button(
+          f"{i+1}. {row['Name']}",
+          key=f"{prefix}_{row['Code']}",
+          use_container_width=True,
+      ):
+        st.session_state.selected_stock = row["Name"]
+        st.rerun()
+      cols[1].markdown(
+          f"<div style='text-align:right; font-size:13px; padding-top:6px;'>"
+          f" {row['Close']:,}원 ({row['등락률']})</div>",
+          unsafe_allow_html=True,
+      )
+      cols[2].markdown(
+          f"<div style='text-align:center; font-weight:700; font-size:13px;"
+          f" color:#38bdf8; padding-top:6px;'>{row['점수']}점</div>",
+          unsafe_allow_html=True,
+      )
+
   with rank_tab1:
-    st.dataframe(
-        top_20.rename(
-            columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
-        ),
-        use_container_width=True,
-        height=480,
-    )
+    render_rank_buttons(top_20, "top")
   with rank_tab2:
-    st.dataframe(
-        bottom_20.rename(
-            columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
-        ),
-        use_container_width=True,
-        height=480,
-    )
+    render_rank_buttons(bottom_20, "bot")
+
 
 # 2. 왼쪽 메인 정밀 분석
 with main_col:
   col_s1, col_s2 = st.columns([4, 1])
+
+  # 세션에 저장된 선택 종목이 있으면 기본값으로 불러옴
+  default_search = st.session_state.selected_stock
   search_input = col_s1.text_input(
       "종목 검색",
-      value="",
+      value=default_search,
       placeholder="종목명(예: 삼성전자, 현대차, SK하이닉스) 또는 6자리 코드 입력",
       label_visibility="collapsed",
   )
   analyze_btn = col_s2.button(
       "🚀 정밀 분석", type="primary", use_container_width=True
   )
+
+  # 검색어가 변경되면 세션 동기화
+  if search_input != st.session_state.selected_stock:
+    st.session_state.selected_stock = search_input
 
   if search_input.strip():
     code, stock_name = resolve_stock_code(search_input)
@@ -622,6 +644,7 @@ with main_col:
           latest_price = df["Close"].iloc[-1]
           prev_price = df["Close"].iloc[-2]
 
+          # 보조지표
           df["MA5"] = df["Close"].rolling(5).mean()
           df["MA20"] = df["Close"].rolling(20).mean()
           df["MA60"] = df["Close"].rolling(60).mean()
@@ -631,6 +654,13 @@ with main_col:
           df["BB_%b"] = (df["Close"] - df["BB_Lower"]) / (
               df["BB_Upper"] - df["BB_Lower"] + 1e-9
           )
+
+          # ATR (Average True Range) 변동폭 계산
+          tr1 = df["High"] - df["Low"]
+          tr2 = (df["High"] - df["Close"].shift(1)).abs()
+          tr3 = (df["Low"] - df["Close"].shift(1)).abs()
+          df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+          df["ATR14"] = df["TR"].rolling(14).mean()
 
           exp12 = df["Close"].ewm(span=12, adjust=False).mean()
           exp26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -666,6 +696,24 @@ with main_col:
 
           high_20 = df["High"].tail(20).max()
           low_20 = df["Low"].tail(20).min()
+          atr_val = (
+              df["ATR14"].iloc[-1]
+              if not pd.isna(df["ATR14"].iloc[-1])
+              else latest_price * 0.03
+          )
+
+          # =========================================================
+          # 매물대 (Volume Profile) 계산: 가격대별 12개 구간 거래량 분할
+          # =========================================================
+          price_min, price_max = df["Low"].min(), df["High"].max()
+          bins = np.linspace(price_min, price_max, 13)
+          v_counts, _ = np.histogram(
+              df["Close"], bins=bins, weights=df["Volume"]
+          )
+          max_vol_idx = np.argmax(v_counts)
+          poc_support_low = bins[
+              max_vol_idx
+          ]  # 최다 거래량 매물대 하단 가격선
 
           df_inv = fetch_investor_naver(code)
           fund = fetch_fundamental_and_consensus(code)
@@ -696,25 +744,39 @@ with main_col:
           )
 
           # =========================================================
-          # [정밀 타점 산출 로직 개선] 2차 목표가가 항상 더 높도록 보정
+          # [정밀 타점 산출] 2차 목표가 상방 보정 및 다중 지지 기반 손절선
           # =========================================================
           entry_1 = round(latest_price * 0.99, -2)
           entry_2 = round(df["MA20"].iloc[-1], -2)
 
-          # 1차 목표가: 단기 20일 고점 돌파선 또는 현재가 +6~8% 중 높은 값
           t1_calc = max(high_20 * 1.02, latest_price * 1.07)
           target_1 = round(t1_calc, -2)
 
-          # 2차 목표가: 애널리스트 목표가가 1차보다 높으면 사용, 아니면 1차 대비 최소 +8% 이상 확장
           if fund["목표주가"] and fund["목표주가"] > target_1 * 1.05:
             target_2 = round(fund["목표주가"], -2)
           else:
             target_2 = round(target_1 * 1.10, -2)
 
-          # 손절 기준선: 20일 최저점 -2% 또는 현재가 -6% 중 적정 지지선
-          stop_loss = round(min(low_20 * 0.98, latest_price * 0.94), -2)
+          # 손절선 정밀 분석:
+          # 1) 20일 최저점 이탈선 (low_20 * 0.98)
+          # 2) ATR 2배수 변동폭 하단 (latest_price - atr_val * 2.0)
+          # 3) 최다 매물대 하단선 (poc_support_low * 0.98)
+          candidate_stops = [
+              low_20 * 0.98,
+              latest_price - (atr_val * 2.0),
+              poc_support_low * 0.98,
+          ]
+          # 비정상적으로 먼 값 제외 후 현실적인 지지선 선정
+          valid_stops = [
+              s for s in candidate_stops if latest_price * 0.88 <= s < latest_price
+          ]
+          stop_loss = (
+              round(max(valid_stops), -2)
+              if valid_stops
+              else round(latest_price * 0.94, -2)
+          )
 
-          # HTML 렌더링 정상화 (한 줄 구성으로 깨짐 방지)
+          # 점수 및 전략 박스
           target_grid_html = (
               f'<div class="score-container">'
               f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>'
@@ -725,15 +787,15 @@ with main_col:
               f'<div class="target-item"><div class="target-title">2차 진입 (눌림목)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
               f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
               f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-              f'<div class="target-item"><div class="target-title">손절 기준선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+              f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
               f"</div>"
               f"</div>"
           )
           st.markdown(target_grid_html, unsafe_allow_html=True)
 
-          # 정갈한 탭 메뉴
+          # 탭 메뉴
           t1, t2, t3, t4, t5 = st.tabs([
-              "차트 & 가격",
+              "차트 & 매물대 & 전략선",
               "외인/기관 수급",
               "전망 & 애널리스트",
               "퀀트 채점표",
@@ -749,11 +811,16 @@ with main_col:
 
             fig = make_subplots(
                 rows=2,
-                cols=1,
+                cols=2,
                 shared_xaxes=True,
-                row_heights=[0.7, 0.3],
+                row_heights=[0.72, 0.28],
+                column_widths=[0.85, 0.15],
+                horizontal_spacing=0.01,
                 vertical_spacing=0.04,
+                specs=[[{}, {}], [{}, None]],
             )
+
+            # 1. 메인 캔들 차트
             fig.add_trace(
                 go.Candlestick(
                     x=df.index,
@@ -770,7 +837,7 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["MA20"],
-                    line=dict(color="#38bdf8", width=1.5),
+                    line=dict(color="#38bdf8", width=1.3),
                     name="20일선",
                 ),
                 row=1,
@@ -780,33 +847,71 @@ with main_col:
                 go.Scatter(
                     x=df.index,
                     y=df["MA60"],
-                    line=dict(color="#10b981", width=1.5),
+                    line=dict(color="#10b981", width=1.3),
                     name="60일선",
                 ),
                 row=1,
                 col=1,
             )
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=df["BB_Upper"],
-                    line=dict(color="rgba(239,68,68,0.4)", dash="dot"),
-                    name="볼린저상단",
-                ),
+
+            # 2. 전략 가격 기준선 (수평 점선 오버레이)
+            fig.add_hline(
+                y=target_2,
+                line_dash="dot",
+                line_color="#10b981",
+                annotation_text=f"2차목표 {target_2:,.0f}",
+                annotation_position="top left",
+                annotation_font_size=10,
                 row=1,
                 col=1,
             )
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=df["BB_Lower"],
-                    line=dict(color="rgba(59,130,246,0.4)", dash="dot"),
-                    name="볼린저하단",
-                ),
+            fig.add_hline(
+                y=target_1,
+                line_dash="dot",
+                line_color="#38bdf8",
+                annotation_text=f"1차목표 {target_1:,.0f}",
+                annotation_position="top left",
+                annotation_font_size=10,
+                row=1,
+                col=1,
+            )
+            fig.add_hline(
+                y=entry_2,
+                line_dash="dash",
+                line_color="#f59e0b",
+                annotation_text=f"2차진입(20선) {entry_2:,.0f}",
+                annotation_position="bottom left",
+                annotation_font_size=10,
+                row=1,
+                col=1,
+            )
+            fig.add_hline(
+                y=stop_loss,
+                line_dash="dash",
+                line_color="#ef4444",
+                annotation_text=f"정밀손절 {stop_loss:,.0f}",
+                annotation_position="bottom left",
+                annotation_font_size=10,
                 row=1,
                 col=1,
             )
 
+            # 3. 매물대 프로파일 (Volume Profile 수평 바)
+            bin_centers = 0.5 * (bins[:-1] + bins[1:])
+            fig.add_trace(
+                go.Bar(
+                    y=bin_centers,
+                    x=v_counts,
+                    orientation="h",
+                    marker_color="rgba(56, 189, 248, 0.35)",
+                    showlegend=False,
+                    hoverinfo="none",
+                ),
+                row=1,
+                col=2,
+            )
+
+            # 4. 하단 MACD 서브 차트
             fig.add_trace(
                 go.Scatter(
                     x=df.index,
@@ -827,14 +932,17 @@ with main_col:
                 row=2,
                 col=1,
             )
+
             fig.update_layout(
                 template="plotly_dark",
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
-                height=430,
+                height=450,
                 margin=dict(l=5, r=5, t=5, b=5),
                 xaxis_rangeslider_visible=False,
             )
+            fig.update_xaxes(showticklabels=False, row=1, col=2)
+            fig.update_yaxes(showticklabels=False, row=1, col=2)
             st.plotly_chart(fig, use_container_width=True)
 
           with t2:
@@ -916,6 +1024,6 @@ with main_col:
               st.markdown(f"- [{item['title']}]({item['link']})")
   else:
     st.info(
-        "💡 상단 검색창에 분석하고자 하는 **종목명(예: 삼성전자, 현대차)** 또는"
-        " **6자리 종목코드**를 입력하신 후 [🚀 정밀 분석] 버튼을 눌러주세요부리!"
+        "💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **실시간 시장 퀀트"
+        " 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!"
     )
