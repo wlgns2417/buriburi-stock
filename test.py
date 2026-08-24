@@ -7,7 +7,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
-from scipy.signal import find_peaks
 import streamlit as st
 
 st.set_page_config(
@@ -309,32 +308,40 @@ def calculate_quick_score(row):
   return int(max(10, min(98, score)))
 
 
-# 차티스트 추세선 계산 함수 (Pivot 변곡점 기반 빗금 작도)
+# 외부 라이브러리 없이 자체 구현한 순수 변곡점 추세선 계산 알고리즘
 def calculate_trendlines(df):
   highs = df["High"].values
   lows = df["Low"].values
   n = len(df)
+  window = 5
 
-  # 변곡점 피크 추출 (거리 10일 기준)
-  peak_highs, _ = find_peaks(highs, distance=10)
-  peak_lows, _ = find_peaks(-lows, distance=10)
+  # 로컬 고점(Pivot High) 및 저점(Pivot Low) 탐색
+  peak_highs = []
+  peak_lows = []
+  for i in range(window, n - window):
+    if highs[i] == max(highs[i - window : i + window + 1]):
+      peak_highs.append(i)
+    if lows[i] == min(lows[i - window : i + window + 1]):
+      peak_lows.append(i)
 
   upper_line = [None] * n
   lower_line = [None] * n
 
-  # 1. 하락 저항선 작도 (최근 고점 2개 연결)
+  # 상단 하락 저항 추세선
   if len(peak_highs) >= 2:
     p1, p2 = peak_highs[-2], peak_highs[-1]
-    slope = (highs[p2] - highs[p1]) / (p2 - p1)
-    for i in range(p1, n):
-      upper_line[i] = highs[p1] + slope * (i - p1)
+    if p2 != p1:
+      slope = (highs[p2] - highs[p1]) / (p2 - p1)
+      for i in range(p1, n):
+        upper_line[i] = highs[p1] + slope * (i - p1)
 
-  # 2. 상승 지지선 작도 (최근 저점 2개 연결)
+  # 하단 상승 지지 추세선
   if len(peak_lows) >= 2:
     p1, p2 = peak_lows[-2], peak_lows[-1]
-    slope = (lows[p2] - lows[p1]) / (p2 - p1)
-    for i in range(p1, n):
-      lower_line[i] = lows[p1] + slope * (i - p1)
+    if p2 != p1:
+      slope = (lows[p2] - lows[p1]) / (p2 - p1)
+      for i in range(p1, n):
+        lower_line[i] = lows[p1] + slope * (i - p1)
 
   return upper_line, lower_line
 
@@ -575,7 +582,7 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹
+# 1. 오른쪽 시장 랭킹 (원클릭 종목 분석 연동)
 with rank_col:
   st.markdown(
       "<div style='font-size:15px; font-weight:700; margin-bottom:10px;'"
@@ -807,7 +814,6 @@ with main_col:
                 specs=[[{}, {}], [{}, None]],
             )
 
-            # 1. 캔들스틱
             fig.add_trace(
                 go.Candlestick(
                     x=df.index,
@@ -841,7 +847,7 @@ with main_col:
                 col=1,
             )
 
-            # 2. 차티스트 빗금 추세선 (상단 하락저항선 / 하단 상승지지선)
+            # 차티스트 빗금 추세선
             fig.add_trace(
                 go.Scatter(
                     x=df.index,
@@ -865,7 +871,7 @@ with main_col:
                 col=1,
             )
 
-            # 3. 우측 매물대 프로파일 바
+            # 매물대 프로파일 바
             bin_centers = 0.5 * (bins[:-1] + bins[1:])
             fig.add_trace(
                 go.Bar(
@@ -880,7 +886,7 @@ with main_col:
                 col=2,
             )
 
-            # 4. 하단 MACD 서브 차트
+            # MACD
             fig.add_trace(
                 go.Scatter(
                     x=df.index,
