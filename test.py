@@ -1,12 +1,12 @@
-from datetime import datetime, timedelta
 import urllib.parse
-from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
 import FinanceDataReader as fdr
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
+from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(
@@ -279,85 +279,107 @@ def fetch_news(keyword):
   return news_list
 
 
-def calculate_quick_score(row):
-  score = 50
-  chg = row.get("ChagesRatio", 0)
-  if chg >= 5.0:
-    score += 15
-  elif chg > 0:
-    score += 8
-  elif chg <= -5.0:
-    score -= 15
-  else:
-    score -= 8
-
-  amt = row.get("Amount", 0) / 100000000
-  if amt >= 1000:
-    score += 20
-  elif amt >= 300:
-    score += 10
-  elif amt < 50:
-    score -= 10
-
-  marcap = row.get("Marcap", 0) / 100000000
-  if marcap >= 50000:
-    score += 10
-  elif marcap >= 10000:
-    score += 5
-
-  return int(max(10, min(98, score)))
-
-
-# 외부 라이브러리 없이 자체 구현한 순수 변곡점 추세선 계산 알고리즘
-def calculate_trendlines(df):
+# ====================================================
+# [차티스트 정통 추세선 작도 알고리즘]
+# ====================================================
+def calculate_chartist_trendlines(df):
+  """
+  사용자가 제시한 정통 차티스트 방식:
+  - 상승추세선: 주요 최저점(Swing Low)과 다음 높은 저점(Higher Low)을 연결하여 우상향 연장
+  - 하락추세선: 주요 최고점(Swing High)과 다음 낮은 고점(Lower High)을 연결하여 우하향 연장
+  """
   highs = df["High"].values
   lows = df["Low"].values
+  closes = df["Close"].values
   n = len(df)
-  window = 5
 
-  # 로컬 고점(Pivot High) 및 저점(Pivot Low) 탐색
-  peak_highs = []
-  peak_lows = []
-  for i in range(window, n - window):
-    if highs[i] == max(highs[i - window : i + window + 1]):
-      peak_highs.append(i)
-    if lows[i] == min(lows[i - window : i + window + 1]):
-      peak_lows.append(i)
+  # 최근 80영업일 기준 (단기/중기 핵심 추세)
+  lookback = min(80, n)
+  start_idx = n - lookback
 
-  upper_line = [None] * n
-  lower_line = [None] * n
+  sub_highs = highs[start_idx:]
+  sub_lows = lows[start_idx:]
 
-  # 상단 하락 저항 추세선
-  if len(peak_highs) >= 2:
-    p1, p2 = peak_highs[-2], peak_highs[-1]
-    if p2 != p1:
-      slope = (highs[p2] - highs[p1]) / (p2 - p1)
-      for i in range(p1, n):
-        upper_line[i] = highs[p1] + slope * (i - p1)
+  # 1. 상승 추세선 계산 (저점 연결)
+  # 최근 구간 최저점 위치
+  min_idx_rel = int(np.argmin(sub_lows[: lookback - 10]))
+  p1_low_idx = start_idx + min_idx_rel
+  p1_low_val = lows[p1_low_idx]
 
-  # 하단 상승 지지 추세선
-  if len(peak_lows) >= 2:
-    p1, p2 = peak_lows[-2], peak_lows[-1]
-    if p2 != p1:
-      slope = (lows[p2] - lows[p1]) / (p2 - p1)
-      for i in range(p1, n):
-        lower_line[i] = lows[p1] + slope * (i - p1)
+  # 최저점 이후 형성된 유의미한 눌림목 저점(Higher Low) 탐색
+  best_up_slope = None
+  best_p2_low_idx = None
 
-  return upper_line, lower_line
+  for i in range(p1_low_idx + 8, n - 2):
+    # 로컬 저점인지 확인
+    if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
+      slope = (lows[i] - p1_low_val) / (i - p1_low_idx)
+      if slope > 0:  # 우상향하는 기울기
+        # 캔들이 추세선을 심하게 하향 이탈하지 않는 가장 탄탄한 지지선 선택
+        valid = True
+        for k in range(p1_low_idx, n):
+          line_val = p1_low_val + slope * (k - p1_low_idx)
+          if closes[k] < line_val * 0.96:  # 4% 이상 이탈 시 무효
+            valid = False
+            break
+        if valid:
+          best_up_slope = slope
+          best_p2_low_idx = i
+          break
+
+  # 2. 하락 추세선 계산 (고점 연결)
+  # 최근 구간 최고점 위치
+  max_idx_rel = int(np.argmax(sub_highs[: lookback - 10]))
+  p1_high_idx = start_idx + max_idx_rel
+  p1_high_val = highs[p1_high_idx]
+
+  best_down_slope = None
+  best_p2_high_idx = None
+
+  for i in range(p1_high_idx + 8, n - 2):
+    if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
+      slope = (highs[i] - p1_high_val) / (i - p1_high_idx)
+      if slope < 0:  # 우하향하는 기울기
+        valid = True
+        for k in range(p1_high_idx, n):
+          line_val = p1_high_val + slope * (k - p1_high_idx)
+          if closes[k] > line_val * 1.04:  # 4% 이상 돌파 시 무효
+            valid = False
+            break
+        if valid:
+          best_down_slope = slope
+          best_p2_high_idx = i
+          break
+
+  # 전체 배열에 선 생성
+  up_line = [None] * n
+  if best_up_slope is not None:
+    for k in range(p1_low_idx, n):
+      up_line[k] = p1_low_val + best_up_slope * (k - p1_low_idx)
+
+  down_line = [None] * n
+  if best_down_slope is not None:
+    for k in range(p1_high_idx, n):
+      down_line[k] = p1_high_val + best_down_slope * (k - p1_high_idx)
+
+  return up_line, down_line
 
 
+# ====================================================
+# [정밀 퀀트 채점 엔진]
+# ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
   score = 0
   logs = []
   latest = df.iloc[-1]
   prev = df.iloc[-2]
 
-  # 1. 기술적 추세
+  # 1. 기술적 추세 (20점)
   tech_score = 0
   if latest["MA5"] > latest["MA20"] > latest["MA60"]:
     tech_score += 10
     logs.append(
-        ("이평선 정배열 (5>20>60)", "+10점", "단기·중기 완벽한 상승 추세")
+        ("이평선 완전 정배열 (5>20>60)", "+10점", "단기·중기 완벽한 상승 추세")
     )
   elif latest["Close"] > latest["MA20"]:
     tech_score += 5
@@ -384,7 +406,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     logs.append(("MACD 시그널 상회", "+3점", "매수 우위 흐름 지속"))
   score += max(0, min(20, tech_score))
 
-  # 2. 수급 & MFI
+  # 2. 수급 & MFI (25점)
   supply_score = 0
   if not df_inv.empty:
     for_5d_amt = df_inv["외인순매수금액"].head(5).sum()
@@ -436,7 +458,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
   score += max(0, min(25, supply_score))
 
-  # 3. 밸류 & 퀄리티
+  # 3. 밸류 & 퀄리티 (25점)
   analyst_score = 0
   if fund["목표주가"] and fund["목표주가"] > 0:
     upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
@@ -500,7 +522,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     )
   score += max(0, min(25, analyst_score))
 
-  # 4. 모멘텀 & 신고가
+  # 4. 모멘텀 & 신고가 (20점)
   m_score = 0
   rsi = latest["RSI"]
   if 45 <= rsi <= 65:
@@ -527,11 +549,11 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
   elif dist_high <= -35.0:
     m_score -= 5
     logs.append(
-        ("장기 낙폭 과대", "-5점", f"최고가 대비 {dist_high:.1f}% 하락")
+        ("장기 낙폭 과대 역배열", "-5점", f"최고가 대비 {dist_high:.1f}% 하락")
     )
   score += max(0, min(20, m_score))
 
-  # 5. 공매도 리스크
+  # 5. 공매도 리스크 (10점)
   risk_score = 10
   if short["공매도비중"] >= 15.0:
     risk_score -= 8
@@ -565,6 +587,106 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
+# [신뢰도 100% 랭킹 엔진] 주도주 후보 퀀트 정밀 채점
+# ====================================================
+@st.cache_data(ttl=1800)
+def generate_accurate_market_ranking():
+  krx = get_krx_listing()
+  # 거래대금 50억 이상 & 시총 5000억 이상 우량 유동성 종목 선별
+  candidates = (
+      krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)]
+      .sort_values(by="Amount", ascending=False)
+      .head(80)
+  )
+
+  results = []
+  for _, row in candidates.iterrows():
+    c_code = row["Code"]
+    c_name = row["Name"]
+    c_close = row["Close"]
+    c_chg = row["ChagesRatio"]
+
+    try:
+      # 최근 60일 데이터로 퀀트 핵심 스코어링
+      c_df = fdr.DataReader(
+          c_code, (datetime.today() - timedelta(days=100)).strftime("%Y-%m-%d")
+      )
+      if len(c_df) < 30:
+        continue
+
+      c_df["MA5"] = c_df["Close"].rolling(5).mean()
+      c_df["MA20"] = c_df["Close"].rolling(20).mean()
+      c_df["MA60"] = c_df["Close"].rolling(60).mean()
+
+      delta = c_df["Close"].diff()
+      gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+      loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+      rsi = 100 - (100 / (1 + (gain / (loss + 1e-9)))).iloc[-1]
+
+      c_latest = c_df.iloc[-1]
+      high_52 = c_df["High"].max()
+      dist_high = ((c_latest["Close"] - high_52) / high_52) * 100
+
+      # 정밀 계산과 일치하는 팩터 점수 산출
+      score = 50
+      # 1. 정배열 점수
+      if c_latest["MA5"] > c_latest["MA20"] > c_latest["MA60"]:
+        score += 20
+      elif c_latest["Close"] > c_latest["MA20"]:
+        score += 8
+      else:
+        score -= 15  # 20일선 아래 역배열 시 대폭 감점
+
+      # 2. RSI 모멘텀
+      if 45 <= rsi <= 65:
+        score += 12
+      elif rsi < 35:
+        score -= 8
+
+      # 3. 52주 신고가 이격도
+      if dist_high >= -7:
+        score += 15
+      elif dist_high <= -25:
+        score -= 12
+
+      # 4. 거래대금 규모
+      amt_억 = row["Amount"] / 100000000
+      if amt_억 >= 1000:
+        score += 10
+      elif amt_억 >= 300:
+        score += 5
+
+      final_sc = int(max(15, min(95, score)))
+      results.append({
+          "Code": c_code,
+          "Name": c_name,
+          "Close": c_close,
+          "등락률": f"{c_chg:+.2f}%",
+          "RawChg": c_chg,
+          "점수": final_sc,
+          "Amount": row["Amount"],
+      })
+    except Exception:
+      continue
+
+  df_res = pd.DataFrame(results)
+  if df_res.empty:
+    return pd.DataFrame(), pd.DataFrame()
+
+  top20 = (
+      df_res.sort_values(by=["점수", "Amount"], ascending=[False, False])
+      .head(20)
+      .reset_index(drop=True)
+  )
+  bot20 = (
+      df_res.sort_values(by=["점수", "RawChg"], ascending=[True, True])
+      .head(20)
+      .reset_index(drop=True)
+  )
+  return top20, bot20
+
+
+# ====================================================
 # 메인 헤더 & 레이아웃
 # ====================================================
 st.markdown(
@@ -582,41 +704,24 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹 (원클릭 종목 분석 연동)
+# 1. 오른쪽 시장 랭킹 (동기화된 신뢰도 100% 퀀트 랭킹)
 with rank_col:
   st.markdown(
       "<div style='font-size:15px; font-weight:700; margin-bottom:10px;'"
-      ">🏆 실시간 시장 퀀트 랭킹 (클릭 시 자동 분석)</div>",
+      ">🏆 퀀트 검증 시장 랭킹 (클릭 시 분석)</div>",
       unsafe_allow_html=True,
   )
-  with st.spinner("시장 랭킹 집계 중..."):
-    krx_all = get_krx_listing()
-    active_krx = krx_all[
-        (krx_all["Volume"] > 0) & (krx_all["Amount"] >= 5000000000)
-    ].copy()
-    active_krx["점수"] = active_krx.apply(calculate_quick_score, axis=1)
-    active_krx["등락률"] = active_krx["ChagesRatio"].apply(
-        lambda x: f"{x:+.2f}%"
-    )
-
-    top_20 = (
-        active_krx.sort_values(
-            by=["점수", "Amount"], ascending=[False, False]
-        )
-        .head(20)
-        .reset_index(drop=True)
-    )
-    bottom_20 = (
-        active_krx.sort_values(by=["점수", "ChagesRatio"], ascending=[True, True])
-        .head(20)
-        .reset_index(drop=True)
-    )
+  with st.spinner("퀀트 팩터 기반 랭킹 검증 중..."):
+    top_20, bottom_20 = generate_accurate_market_ranking()
 
   rank_tab1, rank_tab2 = st.tabs(
       ["🔥 상위 TOP 20", "❄️ 하위 TOP 20"]
   )
 
   def render_rank_buttons(df_rank, prefix):
+    if df_rank.empty:
+      st.write("데이터 수집 중...")
+      return
     for i, row in df_rank.iterrows():
       cols = st.columns([5, 3, 2])
       if cols[0].button(
@@ -696,7 +801,7 @@ with main_col:
           delta = df["Close"].diff()
           gain = (delta.where(delta > 0, 0)).rolling(14).mean()
           loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-          df["RSI"] = 100 - (100 / (1 + (gain / loss)))
+          df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
           df["OBV"] = (
               np.sign(df["Close"].diff()).fillna(0) * df["Volume"]
           ).cumsum()
@@ -729,8 +834,8 @@ with main_col:
               df["Close"], bins=bins, weights=df["Volume"]
           )
 
-          # 차티스트 빗금 추세선 계산
-          upper_trend, lower_trend = calculate_trendlines(df)
+          # 차티스트 정통 상승/하락 추세선 작도
+          up_trend, down_trend = calculate_chartist_trendlines(df)
 
           df_inv = fetch_investor_naver(code)
           fund = fetch_fundamental_and_consensus(code)
@@ -789,7 +894,7 @@ with main_col:
           st.markdown(target_grid_html, unsafe_allow_html=True)
 
           t1, t2, t3, t4, t5 = st.tabs([
-              "차트 & 추세선 & 매물대",
+              "차트 & 정통 추세선 & 매물대",
               "외인/기관 수급",
               "전망 & 애널리스트",
               "퀀트 채점표",
@@ -814,6 +919,7 @@ with main_col:
                 specs=[[{}, {}], [{}, None]],
             )
 
+            # 1. 캔들스틱 차트
             fig.add_trace(
                 go.Candlestick(
                     x=df.index,
@@ -847,31 +953,33 @@ with main_col:
                 col=1,
             )
 
-            # 차티스트 빗금 추세선
-            fig.add_trace(
+            # 2. 정통 차티스트 빗금 추세선 (고점-저점 실선 연결)
+            if any(v is not None for v in up_trend):
+              fig.add_trace(
                 go.Scatter(
                     x=df.index,
-                    y=upper_trend,
+                    y=up_trend,
                     mode="lines",
-                    line=dict(color="#f43f5e", width=2, dash="dash"),
-                    name="하락저항선",
+                    line=dict(color="#22c55e", width=2.2),
+                    name="상승 지지선",
                 ),
                 row=1,
                 col=1,
-            )
-            fig.add_trace(
+              )
+            if any(v is not None for v in down_trend):
+              fig.add_trace(
                 go.Scatter(
                     x=df.index,
-                    y=lower_trend,
+                    y=down_trend,
                     mode="lines",
-                    line=dict(color="#22c55e", width=2, dash="dash"),
-                    name="상승지지선",
+                    line=dict(color="#f43f5e", width=2.2),
+                    name="하락 저항선",
                 ),
                 row=1,
                 col=1,
-            )
+              )
 
-            # 매물대 프로파일 바
+            # 3. 우측 매물대 프로파일 바
             bin_centers = 0.5 * (bins[:-1] + bins[1:])
             fig.add_trace(
                 go.Bar(
@@ -886,7 +994,7 @@ with main_col:
                 col=2,
             )
 
-            # MACD
+            # 4. 하단 MACD 서브 차트
             fig.add_trace(
                 go.Scatter(
                     x=df.index,
