@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="부리부리 퀀트 인사이트",
+    page_title="부리부리 퀀트 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -24,20 +24,17 @@ st.markdown(
     * { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, sans-serif; }
     .stApp { background-color: #0c0f17; color: #e1e7f0; }
     
-    /* 헤더 카드 */
     .header-card {
         background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
         border: 1px solid rgba(255, 255, 255, 0.08);
         border-radius: 16px;
-        padding: 20px 24px;
-        margin-bottom: 24px;
+        padding: 18px 24px;
+        margin-bottom: 20px;
         display: flex;
         justify-content: space-between;
         align-items: center;
-        backdrop-filter: blur(10px);
     }
     
-    /* 점수 메트릭 카드 */
     .score-container {
         background: rgba(255, 255, 255, 0.02);
         border: 1px solid rgba(255, 255, 255, 0.07);
@@ -47,24 +44,25 @@ st.markdown(
         margin-bottom: 20px;
     }
     
-    /* 전략 타점 카드 */
     .target-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-        gap: 12px;
-        margin-top: 15px;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 16px;
+        flex-wrap: wrap;
     }
     .target-item {
+        flex: 1;
+        min-width: 110px;
         background: rgba(255, 255, 255, 0.03);
         border: 1px solid rgba(255, 255, 255, 0.06);
         border-radius: 10px;
-        padding: 12px;
+        padding: 10px 6px;
         text-align: center;
     }
     .target-title { font-size: 11px; color: #8b9bb4; margin-bottom: 4px; }
     .target-val { font-size: 15px; font-weight: 700; color: #38bdf8; }
 
-    /* 리포트 및 인사이트 박스 */
     .insight-card {
         background: rgba(255, 255, 255, 0.02);
         border: 1px solid rgba(255, 255, 255, 0.06);
@@ -79,18 +77,17 @@ st.markdown(
     [data-testid="stMetric"] {
         background: rgba(255, 255, 255, 0.02) !important;
         border: 1px solid rgba(255, 255, 255, 0.06) !important;
-        padding: 14px !important;
+        padding: 12px !important;
         border-radius: 12px !important;
     }
     [data-testid="stMetricLabel"] { font-size: 12px !important; color: #94a3b8 !important; }
-    [data-testid="stMetricValue"] { font-size: 20px !important; font-weight: 700 !important; }
+    [data-testid="stMetricValue"] { font-size: 19px !important; font-weight: 700 !important; }
     </style>
 """,
     unsafe_allow_html=True,
 )
 
 
-# 종목코드 매핑
 @st.cache_data(ttl=3600)
 def get_krx_listing():
   return fdr.StockListing("KRX")
@@ -113,7 +110,6 @@ def resolve_stock_code(query):
   return None, None
 
 
-# 수급 크롤러
 def fetch_investor_naver(code):
   url = f"https://finance.naver.com/item/frgn.naver?code={code}"
   headers = {
@@ -151,7 +147,6 @@ def fetch_investor_naver(code):
   return pd.DataFrame(rows)
 
 
-# 펀더멘털 & 애널리스트 리포트 & 기업 전망 크롤러
 def fetch_fundamental_and_consensus(code):
   url = f"https://finance.naver.com/item/main.naver?code={code}"
   headers = {
@@ -167,7 +162,6 @@ def fetch_fundamental_and_consensus(code):
       "목표주가": None,
       "ROE": None,
       "기업개요": "기업 정보 준비 중",
-      "컨센서스_매출": [],
       "리포트_목록": [],
   }
   try:
@@ -191,12 +185,10 @@ def fetch_fundamental_and_consensus(code):
     if target_tag and target_tag.text.strip():
       data["목표주가"] = float(target_tag.text.replace(",", ""))
 
-    # 기업 개요 및 향후 사업 방향
     summary_tag = soup.select_one("div.summary_info p")
     if summary_tag:
       data["기업개요"] = summary_tag.text.strip()
 
-    # ROE 파싱
     cop_table = soup.select_one("div.section.cop_analysis table")
     if cop_table:
       for tr in cop_table.select("tbody tr"):
@@ -213,7 +205,6 @@ def fetch_fundamental_and_consensus(code):
                 continue
           break
 
-    # 최신 증권사 리포트 크롤링
     report_url = (
         f"https://finance.naver.com/item/research.naver?code={code}"
     )
@@ -242,7 +233,6 @@ def fetch_fundamental_and_consensus(code):
   return data
 
 
-# 공매도 크롤러
 def fetch_short_selling(code):
   url = f"https://finance.naver.com/item/short_selling.naver?code={code}"
   headers = {
@@ -270,7 +260,6 @@ def fetch_short_selling(code):
   return short_data
 
 
-# 뉴스 크롤러
 def fetch_news(keyword):
   url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+주식&hl=ko&gl=KR&ceid=KR:ko"
   news_list = []
@@ -288,7 +277,6 @@ def fetch_news(keyword):
   return news_list
 
 
-# 빠른 랭킹 점수 계산
 def calculate_quick_score(row):
   score = 50
   chg = row.get("ChagesRatio", 0)
@@ -318,7 +306,6 @@ def calculate_quick_score(row):
   return int(max(10, min(98, score)))
 
 
-# 정밀 팩터 채점 알고리즘
 def evaluate_pro_quant_score(df, df_inv, fund, short):
   score = 0
   logs = []
@@ -409,7 +396,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
   score += max(0, min(25, supply_score))
 
-  # 3. 밸류 & 퀄리티 (ROE & 컨센서스)
+  # 3. 밸류 & 퀄리티
   analyst_score = 0
   if fund["목표주가"] and fund["목표주가"] > 0:
     upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
@@ -538,16 +525,16 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# 메인 헤더
+# 메인 헤더 & 레이아웃
 # ====================================================
 st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:4px;">QUANT INSIGHT ENGINE</div>
-            <h2 style="margin:0; font-size:24px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">QUANT INSIGHT ENGINE</div>
+            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
-        <div style="font-size: 28px;">🐽📊</div>
+        <div style="font-size: 26px;">🐽📊</div>
     </div>
 """,
     unsafe_allow_html=True,
@@ -558,11 +545,11 @@ main_col, rank_col = st.columns([7, 3])
 # 1. 오른쪽 시장 랭킹
 with rank_col:
   st.markdown(
-      "<div style='font-size:16px; font-weight:700; margin-bottom:12px;'"
+      "<div style='font-size:15px; font-weight:700; margin-bottom:10px;'"
       ">🏆 실시간 시장 퀀트 랭킹</div>",
       unsafe_allow_html=True,
   )
-  with st.spinner("시장 주도주 스캔 중..."):
+  with st.spinner("시장 랭킹 집계 중..."):
     krx_all = get_krx_listing()
     active_krx = krx_all[
         (krx_all["Volume"] > 0) & (krx_all["Amount"] >= 5000000000)
@@ -594,7 +581,7 @@ with rank_col:
             columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
         ),
         use_container_width=True,
-        height=500,
+        height=480,
     )
   with rank_tab2:
     st.dataframe(
@@ -602,7 +589,7 @@ with rank_col:
             columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
         ),
         use_container_width=True,
-        height=500,
+        height=480,
     )
 
 # 2. 왼쪽 메인 정밀 분석
@@ -624,9 +611,7 @@ with main_col:
     if not code:
       st.error(f"'{search_input}' 종목을 찾을 수 없습니다.")
     else:
-      with st.spinner(
-          f"[{stock_name}]의 펀더멘털 및 컨센서스를 정밀 분석 중..."
-      ):
+      with st.spinner(f"[{stock_name}] 정밀 퀀트 분석 중..."):
         end_dt = datetime.today()
         start_dt = end_dt - timedelta(days=365)
         df = fdr.DataReader(code, start_dt.strftime("%Y-%m-%d"))
@@ -710,52 +695,43 @@ with main_col:
               df, df_inv, fund, short
           )
 
+          # =========================================================
+          # [정밀 타점 산출 로직 개선] 2차 목표가가 항상 더 높도록 보정
+          # =========================================================
           entry_1 = round(latest_price * 0.99, -2)
           entry_2 = round(df["MA20"].iloc[-1], -2)
-          stop_loss = round(low_20 * 0.97, -2)
-          target_1 = (
-              fund["목표주가"]
-              if fund["목표주가"]
-              else round(high_20 * 1.05, -2)
-          )
-          target_2 = round(latest_price * 1.15, -2)
 
-          # 종합 진단 카드
-          st.markdown(
-              f"""
-                <div class="score-container">
-                    <div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>
-                    <div style="font-size: 46px; color: #38bdf8; font-weight: 800; margin: 4px 0;">{total_score}<span style="font-size:20px; color:#64748b;"> / 100</span></div>
-                    <div style="font-size: 15px; font-weight: 600; color: #f1f5f9;">{grade_text} <span style="color:#eab308;">{stars}</span></div>
-                    
-                    <div class="target-grid">
-                        <div class="target-item">
-                            <div class="target-title">1차 진입 (현재가 부근)</div>
-                            <div class="target-val">{entry_1:,.0f}원</div>
-                        </div>
-                        <div class="target-item">
-                            <div class="target-title">2차 진입 (눌림목)</div>
-                            <div class="target-val">{entry_2:,.0f}원</div>
-                        </div>
-                        <div class="target-item">
-                            <div class="target-title">1차 목표 (단기 저항)</div>
-                            <div class="target-val">{target_1:,.0f}원</div>
-                        </div>
-                        <div class="target-item">
-                            <div class="target-title">2차 목표 (추세 확장)</div>
-                            <div class="target-val">{target_2:,.0f}원</div>
-                        </div>
-                        <div class="target-item">
-                            <div class="target-title">손절 기준선</div>
-                            <div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div>
-                        </div>
-                    </div>
-                </div>
-                """,
-              unsafe_allow_html=True,
-          )
+          # 1차 목표가: 단기 20일 고점 돌파선 또는 현재가 +6~8% 중 높은 값
+          t1_calc = max(high_20 * 1.02, latest_price * 1.07)
+          target_1 = round(t1_calc, -2)
 
-          # 정갈한 탭 메뉴 구성
+          # 2차 목표가: 애널리스트 목표가가 1차보다 높으면 사용, 아니면 1차 대비 최소 +8% 이상 확장
+          if fund["목표주가"] and fund["목표주가"] > target_1 * 1.05:
+            target_2 = round(fund["목표주가"], -2)
+          else:
+            target_2 = round(target_1 * 1.10, -2)
+
+          # 손절 기준선: 20일 최저점 -2% 또는 현재가 -6% 중 적정 지지선
+          stop_loss = round(min(low_20 * 0.98, latest_price * 0.94), -2)
+
+          # HTML 렌더링 정상화 (한 줄 구성으로 깨짐 방지)
+          target_grid_html = (
+              f'<div class="score-container">'
+              f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>'
+              f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
+              f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
+              f'<div class="target-grid">'
+              f'<div class="target-item"><div class="target-title">1차 진입 (현재가)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
+              f'<div class="target-item"><div class="target-title">2차 진입 (눌림목)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+              f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
+              f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
+              f'<div class="target-item"><div class="target-title">손절 기준선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+              f"</div>"
+              f"</div>"
+          )
+          st.markdown(target_grid_html, unsafe_allow_html=True)
+
+          # 정갈한 탭 메뉴
           t1, t2, t3, t4, t5 = st.tabs([
               "차트 & 가격",
               "외인/기관 수급",
