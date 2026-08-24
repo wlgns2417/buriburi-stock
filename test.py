@@ -245,74 +245,6 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [차티스트 정통 추세선 작도 알고리즘]
-# ====================================================
-def calculate_chartist_trendlines(df):
-    highs = df["High"].values
-    lows = df["Low"].values
-    closes = df["Close"].values
-    n = len(df)
-
-    lookback = min(80, n)
-    start_idx = n - lookback
-
-    sub_highs = highs[start_idx:]
-    sub_lows = lows[start_idx:]
-
-    # 상승 추세선
-    min_idx_rel = int(np.argmin(sub_lows[:lookback - 10]))
-    p1_low_idx = start_idx + min_idx_rel
-    p1_low_val = lows[p1_low_idx]
-
-    best_up_slope = None
-    for i in range(p1_low_idx + 6, n - 2):
-        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
-            slope = (lows[i] - p1_low_val) / (i - p1_low_idx)
-            if slope > 0:
-                valid = True
-                for k in range(p1_low_idx, n):
-                    line_val = p1_low_val + slope * (k - p1_low_idx)
-                    if closes[k] < line_val * 0.96:
-                        valid = False
-                        break
-                if valid:
-                    best_up_slope = slope
-                    break
-
-    # 하락 추세선
-    max_idx_rel = int(np.argmax(sub_highs[:lookback - 10]))
-    p1_high_idx = start_idx + max_idx_rel
-    p1_high_val = highs[p1_high_idx]
-
-    best_down_slope = None
-    for i in range(p1_high_idx + 6, n - 2):
-        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
-            slope = (highs[i] - p1_high_val) / (i - p1_high_idx)
-            if slope < 0:
-                valid = True
-                for k in range(p1_high_idx, n):
-                    line_val = p1_high_val + slope * (k - p1_high_idx)
-                    if closes[k] > line_val * 1.04:
-                        valid = False
-                        break
-                if valid:
-                    best_down_slope = slope
-                    break
-
-    up_line = [None] * n
-    if best_up_slope is not None:
-        for k in range(p1_low_idx, n):
-            up_line[k] = p1_low_val + best_up_slope * (k - p1_low_idx)
-
-    down_line = [None] * n
-    if best_down_slope is not None:
-        for k in range(p1_high_idx, n):
-            down_line[k] = p1_high_val + best_down_slope * (k - p1_high_idx)
-
-    return up_line, down_line
-
-
-# ====================================================
 # [기관 공인 4대 팩터 정밀 퀀트 채점 엔진 (100점 만점)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
@@ -486,9 +418,8 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 공인 멀티팩터 퀀트 점수 랭킹 (재무 우량성 + 유동성 + 추세 안정성)
+    # 2. 공인 멀티팩터 퀀트 점수 랭킹
     marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
-    # 안정적 추세(3~7% 상승 우대, 20% 이상 급등 과열 감점)
     trend_factor = np.where(chg > 20, 15 - (chg - 20) * 1.5, np.where(chg > 0, 22 + chg * 1.2, 18 + chg * 2.0))
     quality_factor = ((marcap_log - 10.5) * 6).clip(lower=5, upper=25)
     liquidity_factor = ((amount_log - 8.5) * 6).clip(lower=5, upper=25)
@@ -648,9 +579,6 @@ with main_col:
                     bins = np.linspace(price_min, price_max, 13)
                     v_counts, _ = np.histogram(df["Close"], bins=bins, weights=df["Volume"])
 
-                    # 차티스트 정통 상승/하락 추세선 작도
-                    up_trend, down_trend = calculate_chartist_trendlines(df)
-
                     df_inv = fetch_investor_naver(code)
                     fund = fetch_fundamental_and_consensus(code)
                     short = fetch_short_selling(code)
@@ -706,7 +634,7 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 정통 추세선 & 매물대", "외인/기관 수급", "전망 & 애널리스트", "퀀트 채점표", "뉴스 브리핑"])
+                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "퀀트 채점표", "뉴스 브리핑"])
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
@@ -734,17 +662,6 @@ with main_col:
                         fig.add_trace(go.Scatter(
                             x=df.index, y=df['MA60'], line=dict(color='#10b981', width=1.3), name="60일선"
                         ), row=1, col=1)
-
-                        if any(v is not None for v in up_trend):
-                            fig.add_trace(go.Scatter(
-                                x=df.index, y=up_trend, mode="lines",
-                                line=dict(color="#22c55e", width=2.2), name="상승 지지선"
-                            ), row=1, col=1)
-                        if any(v is not None for v in down_trend):
-                            fig.add_trace(go.Scatter(
-                                x=df.index, y=down_trend, mode="lines",
-                                line=dict(color="#f43f5e", width=2.2), name="하락 저항선"
-                            ), row=1, col=1)
 
                         bin_centers = 0.5 * (bins[:-1] + bins[1:])
                         fig.add_trace(go.Bar(
