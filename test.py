@@ -46,13 +46,6 @@ st.markdown(
         border-radius: 8px; 
         margin-top: 15px; 
     }
-    .rank-card {
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
-        padding: 15px;
-        margin-bottom: 15px;
-    }
     [data-testid="stMetric"] {
         background: rgba(255, 255, 255, 0.03);
         border: 1px solid rgba(255, 255, 255, 0.08);
@@ -211,10 +204,9 @@ def fetch_news(keyword):
   return news_list
 
 
-# 단일 종목 고속 스캔 퀀트 채점 (랭킹용)
+# 단일 종목 고속 스캔 퀀트 채점 (사이드 랭킹용)
 def calculate_quick_score(row):
   score = 50
-  # 전일대비 등락률
   chg = row.get("ChagesRatio", 0)
   if chg >= 5.0:
     score += 15
@@ -225,8 +217,7 @@ def calculate_quick_score(row):
   else:
     score -= 8
 
-  # 거래대금 규모
-  amt = row.get("Amount", 0) / 100000000  # 억
+  amt = row.get("Amount", 0) / 100000000
   if amt >= 1000:
     score += 20
   elif amt >= 300:
@@ -234,8 +225,7 @@ def calculate_quick_score(row):
   elif amt < 50:
     score -= 10
 
-  # 시가총액 안정성
-  marcap = row.get("Marcap", 0) / 100000000  # 억
+  marcap = row.get("Marcap", 0) / 100000000
   if marcap >= 50000:
     score += 10
   elif marcap >= 10000:
@@ -244,14 +234,14 @@ def calculate_quick_score(row):
   return int(max(10, min(98, score)))
 
 
-# 메인 상세 퀀트 채점 알고리즘
+# 메인 상세 퀀트 채점
 def evaluate_pro_quant_score(df, df_inv, fund, short):
   score = 0
   logs = []
   latest = df.iloc[-1]
   prev = df.iloc[-2]
 
-  # 1. 기술적 지표 & 추세 (20점)
+  # 1. 기술적 지표 (20점)
   tech_score = 0
   if latest["MA5"] > latest["MA20"] > latest["MA60"]:
     tech_score += 12
@@ -428,7 +418,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# 메인 헤더
+# 메인 상단 헤더
 # ====================================================
 st.markdown(
     """
@@ -443,26 +433,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 레이아웃 분할: [왼쪽 70% : 메인 정밀 분석] / [오른쪽 30% : 상위/하위 20위 랭킹]
 main_col, rank_col = st.columns([7, 3])
 
-# ====================================================
-# 1. 오른쪽 사이드: 상위 TOP 20 & 하위 TOP 20 랭킹
-# ====================================================
+# 1. 오른쪽 랭킹
 with rank_col:
   st.markdown("### 🏆 시장 퀀트 랭킹")
-
-  with st.spinner("시장 주도주 & 소외주 스캔 중..."):
+  with st.spinner("시장 주도주 스캔 중..."):
     krx_all = get_krx_listing()
     active_krx = krx_all[
         (krx_all["Volume"] > 0) & (krx_all["Amount"] >= 5000000000)
     ].copy()
-
-    # 점수 계산
     active_krx["점수"] = active_krx.apply(calculate_quick_score, axis=1)
-    active_krx["거래대금(억)"] = (
-        active_krx["Amount"] / 100000000
-    ).round(0)
     active_krx["등락률"] = active_krx["ChagesRatio"].apply(
         lambda x: f"{x:+.2f}%"
     )
@@ -483,12 +464,7 @@ with rank_col:
   rank_tab1, rank_tab2 = st.tabs(
       ["🔥 상위 TOP 20", "❄️ 하위 TOP 20"]
   )
-
   with rank_tab1:
-    st.markdown(
-        "<small>수급·거래대금·상승 모멘텀 최상위</small>",
-        unsafe_allow_html=True,
-    )
     st.dataframe(
         top_20.rename(
             columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
@@ -496,12 +472,7 @@ with rank_col:
         use_container_width=True,
         height=520,
     )
-
   with rank_tab2:
-    st.markdown(
-        "<small>단기 급락·거래량 실종 위험 종목</small>",
-        unsafe_allow_html=True,
-    )
     st.dataframe(
         bottom_20.rename(
             columns={"Name": "종목명", "Close": "현재가", "등락률": "등락"}
@@ -510,28 +481,26 @@ with rank_col:
         height=520,
     )
 
-# ====================================================
-# 2. 왼쪽 메인: 7대 정밀 분석 화면
-# ====================================================
+# 2. 왼쪽 메인 정밀 분석
 with main_col:
   col_s1, col_s2 = st.columns([4, 1])
   search_input = col_s1.text_input(
       "🔍 분석할 종목명 또는 종목코드",
-      value="LG전자",
-      placeholder="예: LG전자, 삼성전자, 000660, 현대차",
+      value="",  # 기본값을 빈칸으로 설정!
+      placeholder="예: 삼성전자, 현대차, SK하이닉스, 000660 등 입력",
   )
   analyze_btn = col_s2.button(
       "🚀 정밀 분석", type="primary", use_container_width=True
   )
 
-  if search_input:
+  if search_input.strip():
     code, stock_name = resolve_stock_code(search_input)
 
     if not code:
       st.error(f"'{search_input}' 종목을 찾을 수 없습니다.")
     else:
       with st.spinner(
-          f"부리부리 대마왕이 [{stock_name}]의 7차원 데이터를 정밀 채점 중..."
+          f"부리부리 대마왕이 [{stock_name}]의 데이터를 정밀 채점 중..."
       ):
         end_dt = datetime.today()
         start_dt = end_dt - timedelta(days=365)
@@ -601,11 +570,6 @@ with main_col:
               if not df_inv.empty
               else 0
           )
-          inst_20d = (
-              df_inv["기관순매수금액"].head(20).sum()
-              if not df_inv.empty
-              else 0
-          )
           for_rate = (
               df_inv["외인보유율"].iloc[0] if not df_inv.empty else 0.0
           )
@@ -624,7 +588,6 @@ with main_col:
           )
           target_2 = round(latest_price * 1.15, -2)
 
-          # 종합 점수 박스
           st.markdown(
               f"""
                 <div class="score-box">
@@ -654,7 +617,6 @@ with main_col:
 
           st.divider()
 
-          # 세부 탭
           t1, t2, t3, t4, t5 = st.tabs([
               "① 주가 & 차트",
               "② 외인/기관 수급",
@@ -797,3 +759,10 @@ with main_col:
             st.subheader(f"📰 [{stock_name}] 주요 뉴스")
             for item in news_items:
               st.markdown(f"- 🐽 [{item['title']}]({item['link']})")
+  else:
+    # 검색어가 없을 때 뜨는 초기 대기 카드
+    st.info(
+        "💡 상단 검색창에 분석하고자 하는 **종목명(예: 삼성전자, 현대차)** 또는"
+        " **6자리 종목코드**를 입력하신 후 엔터를 누르시거나 [🚀 정밀 분석]"
+        " 버튼을 눌러주세요부리!"
+    )
