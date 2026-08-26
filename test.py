@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(
-    page_title="부리부리 퀀트 작전실",
+    page_title="주식분석 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -527,7 +527,7 @@ st.markdown(
     <div class="header-card">
         <div>
             <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL QUANT ENGINE</div>
-            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
+            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부룩이의 종합 주식 작전실</h2>
         </div>
         <div style="font-size: 26px;">🐽📊</div>
     </div>
