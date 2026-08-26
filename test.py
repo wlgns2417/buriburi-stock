@@ -9,15 +9,8 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-# Google GenAI 최신 SDK 연동 시도 (미설치 시 내장 퀀트 엔진 자동 Fallback)
-try:
-    from google import genai
-    HAS_GENAI = True
-except ImportError:
-    HAS_GENAI = False
-
 st.set_page_config(
-    page_title="부리부리 AI 퀀트 작전실",
+    page_title="부리부리 퀀트 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -80,13 +73,13 @@ st.markdown(
         color: #cbd5e1;
     }
 
-    .ai-chat-box {
-        background: rgba(16, 185, 129, 0.04);
-        border: 1px solid rgba(16, 185, 129, 0.2);
-        border-radius: 12px;
-        padding: 18px;
-        margin-bottom: 16px;
-        line-height: 1.7;
+    .ai-brief-box {
+        background: linear-gradient(135deg, rgba(56, 189, 248, 0.05) 0%, rgba(30, 41, 59, 0.3) 100%);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 14px;
+        padding: 20px 24px;
+        margin-bottom: 18px;
+        line-height: 1.8;
         font-size: 14px;
         color: #e2e8f0;
     }
@@ -106,10 +99,6 @@ st.markdown(
 
 if "selected_stock" not in st.session_state:
     st.session_state.selected_stock = ""
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "gemini_api_key" not in st.session_state:
-    st.session_state.gemini_api_key = ""
 
 
 @st.cache_data(ttl=3600)
@@ -435,7 +424,7 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 거래대금 상위 25종목 대상 정확한 365일 데이터로 채점
+    # 2. 거래대금 상위 25종목 대상 종합 평가
     candidates = df_active.sort_values(by="Amount", ascending=False).head(25)
     scored_items = []
     
@@ -507,87 +496,27 @@ def generate_all_market_rankings():
 
 
 # ====================================================
-# [AI 퀀트 애널리스트 브리핑 & 질의응답 엔진]
+# [즉시 로딩 AI 퀀트 브리핑 생성기]
 # ====================================================
-def generate_ai_quant_response(stock_name, code, score, grade, targets, fund, df_inv, user_query=None):
-    context = (
-        f"종목: {stock_name} ({code})\n"
-        f"퀀트 종합 점수: {score}/100점 ({grade})\n"
-        f"현재가: {targets['current']:,.0f}원\n"
-        f"1차 진입가(5일선 눌림): {targets['entry_1']:,.0f}원\n"
-        f"2차 진입가(매물대 지지): {targets['entry_2']:,.0f}원\n"
-        f"1차 목표가(단기 저항): {targets['target_1']:,.0f}원\n"
-        f"2차 목표가(컨센서스): {targets['target_2']:,.0f}원\n"
-        f"정밀 손절선: {targets['stop_loss']:,.0f}원\n"
-        f"기업 개요: {fund.get('기업개요', '')}\n"
-        f"ROE: {fund.get('ROE', 'N/A')}%, PER: {fund.get('PER', 'N/A')}배, PBR: {fund.get('PBR', 'N/A')}배\n"
-        f"최근 5일 외인 순매수: {targets['for_5d']:+.1f}억원, 기관 순매수: {targets['inst_5d']:+.1f}억원\n"
+def generate_instant_ai_brief(stock_name, score, grade, targets, fund):
+    verdict = (
+        "적극 매수 고려 가능 (주도주 추세 형성)"
+        if score >= 70
+        else ("분할 매수 및 눌림목 지지 확인 필요" if score >= 50 else "리스크 관리 및 섣부른 진입 자제")
     )
-
-    api_key = st.session_state.gemini_api_key or ""
     
-    # 1. Google Gemini API 키가 있는 경우
-    if HAS_GENAI and api_key.strip():
-        try:
-            client = genai.Client(api_key=api_key.strip())
-            prompt = (
-                f"당신은 최고 실력의 월가 퀀트 헤지펀드 매니저이자 주식 트레이더입니다.\n"
-                f"아래의 퀀트 분석 데이터를 기반으로 사용자에게 전문가적이며 명쾌한 한국어로 답변하세요.\n\n"
-                f"[분석 데이터]\n{context}\n\n"
-            )
-            if user_query:
-                prompt += f"[사용자 질문]\n{user_query}\n\n위 데이터에 근거하여 명확하고 구체적인 가격과 수치를 포함해 답변하세요."
-            else:
-                prompt += "이 종목이 왜 유망하거나 주의해야 하는지, 그리고 왜 지금 제시된 가격대에 진입 및 손절해야 하는지 3가지 핵심 포인트로 브리핑하세요."
+    upside_text = ""
+    if targets.get("target_2") and targets.get("target_2") > targets["current"]:
+        upside = ((targets["target_2"] - targets["current"]) / targets["current"]) * 100
+        upside_text = f" (상승 여력: {upside:+.1f}%)"
 
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            pass
-
-    # 2. API 키가 없거나 실패 시: 정밀 퀀트 로직 기반 자동 추론 브리핑
-    if user_query:
-        if "진입" in user_query or "매수" in user_query:
-            return (
-                f"💡 **[{stock_name}] 진입 전략 분석:**\n\n"
-                f"- 현재가({targets['current']:,.0f}원)를 무리하게 추격 매수하기보다, **1차 눌림목인 {targets['entry_1']:,.0f}원(5일 이동평균선 지지선)**에 분할 매수를 시작하는 것이 안전합니다.\n"
-                f"- 지수가 조정을 받을 경우 **2차 강력 매물대 지지선인 {targets['entry_2']:,.0f}원**에서 비중을 확대하세요.\n"
-                f"- 직전 최다 거래량 매물대가 붕괴되는 **{targets['stop_loss']:,.0f}원 이탈 시 즉시 손절**로 자산을 보호해야 합니다."
-            )
-        elif "목표" in user_query or "얼마" in user_query:
-            return (
-                f"🎯 **[{stock_name}] 목표가 가이드:**\n\n"
-                f"- **1차 단기 목표가:** **{targets['target_1']:,.0f}원** (최근 20일 고점 매물벽 구간으로 50% 분할 익절 권장)\n"
-                f"- **2차 최종 목표가:** **{targets['target_2']:,.0f}원** (기관 컨센서스 및 추세 확장선 도달 시 전량 익절)"
-            )
-        elif "수급" in user_query or "외인" in user_query or "기관" in user_query:
-            return (
-                f"📊 **[{stock_name}] 수급 현황 브리핑:**\n\n"
-                f"- 최근 5영업일 동안 **외국인은 {targets['for_5d']:+.1f}억원**, **기관은 {targets['inst_5d']:+.1f}억원**의 누적 순매수를 기록했습니다.\n"
-                f"- {'메이저 주포의 쌍끌이 매집세가 확인되어 추세가 견고합니다.' if targets['for_5d'] > 0 and targets['inst_5d'] > 0 else '주포들의 수급 이탈 및 관망세가 나타나고 있으므로 지지선 확인이 필수적입니다.'}"
-            )
-        else:
-            return (
-                f"🤖 **[{stock_name}] 퀀트 종합 진단:**\n\n"
-                f"종합 점수는 **{score}점({grade})**입니다. ROE는 {fund.get('ROE', 'N/A')}%, PER은 {fund.get('PER', 'N/A')}배로 자본 효율성이 평가되었으며, "
-                f"제시된 1차 진입선({targets['entry_1']:,.0f}원)과 손절선({targets['stop_loss']:,.0f}원)을 철저히 준수하는 트레이딩을 권장합니다."
-            )
-    else:
-        verdict = "적극 매수 검토 가능" if score >= 70 else ("분할 매수 및 눌림목 관망" if score >= 50 else "리스크 관리 및 진입 유보")
-        return (
-            f"### 🤖 AI 퀀트 애널리스트 핵심 브리핑\n\n"
-            f"1. **종합 퀀트 진단 ({score}점 / {grade}):**\n"
-            f"   - 본 종목은 현재 **{verdict}** 구간에 위치해 있습니다.\n"
-            f"   - ROE({fund.get('ROE', 'N/A')}%)와 PER({fund.get('PER', 'N/A')}배)를 감안할 때 펀더멘털 안전마진과 수급 모멘텀이 상호 검증되었습니다.\n\n"
-            f"2. **가격 타점 & 전략적 진입 근거:**\n"
-            f"   - **1차 진입선({targets['entry_1']:,.0f}원):** 단기 5일 이평선 지지력 확인 구간입니다.\n"
-            f"   - **2차 진입선({targets['entry_2']:,.0f}원):** 60일 누적 최다 거래량 매물대(POC) 상단으로 기관의 손익분기 방어선입니다.\n\n"
-            f"3. **리스크 관리 & 손절선({targets['stop_loss']:,.0f}원):**\n"
-            f"   - 해당 가격은 핵심 매물대 바닥을 하향 이탈하여 추세가 붕괴되는 자리이므로 엄격한 스탑로스가 요구됩니다."
-        )
+    return f"""
+#### 🤖 AI 퀀트 애널리스트 실시간 정밀 브리핑
+* **종합 진단 ({score}점 / {grade}):** 현재 본 종목은 **{verdict}** 상태입니다. ROE {fund.get('ROE', 'N/A')}%, PER {fund.get('PER', 'N/A')}배 수준으로 실적 및 밸류에이션이 반영되어 있습니다.
+* **진입 타점 및 근거:** 현재가 부근 추격 매수보다는 **1차 5일선 지지선({targets['entry_1']:,.0f}원)** 또는 **2차 매물대 바닥선({targets['entry_2']:,.0f}원)**에서 분할 매수하는 것이 통계적으로 유리합니다.
+* **목표가 및 익절 라인:** **1차 목표가 {targets['target_1']:,.0f}원**(직전 저항선)에서 일부 차익 실현 후, **2차 목표가 {targets['target_2']:,.0f}원**{upside_text}을 최종 상단으로 설정합니다.
+* **리스크 관리 손절선:** **{targets['stop_loss']:,.0f}원** 하향 이탈 시 매물대 지지가 깨지는 자리이므로 비중 축소 또는 스탑로스를 권장합니다.
+"""
 
 
 # ====================================================
@@ -597,10 +526,10 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">AI-POWERED QUANT ENGINE</div>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL QUANT ENGINE</div>
             <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
-        <div style="font-size: 26px;">🐽🤖📊</div>
+        <div style="font-size: 26px;">🐽📊</div>
     </div>
 """,
     unsafe_allow_html=True,
@@ -750,7 +679,7 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # 정밀 타점 공식
+                    # 정밀 타점 계산
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
 
@@ -783,8 +712,6 @@ with main_col:
                         "target_1": target_1,
                         "target_2": target_2,
                         "stop_loss": stop_loss,
-                        "for_5d": for_5d,
-                        "inst_5d": inst_5d
                     }
 
                     target_grid_html = (
@@ -803,62 +730,17 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    t_ai, t1, t2, t3, t4, t5 = st.tabs([
-                        "🤖 AI 퀀트 챗봇",
+                    # 즉시 로딩 AI 브리핑 카드
+                    ai_brief_text = generate_instant_ai_brief(stock_name, total_score, grade_text, target_dict, fund)
+                    st.markdown(f'<div class="ai-brief-box">{ai_brief_text}</div>', unsafe_allow_html=True)
+
+                    t1, t2, t3, t4, t5 = st.tabs([
                         "차트 & 매물대 프로파일",
                         "외인/기관 수급",
                         "전망 & 애널리스트",
                         "종합 팩터 채점표",
                         "뉴스 브리핑"
                     ])
-
-                    # ====================================================
-                    # [AI 퀀트 챗봇 탭]
-                    # ====================================================
-                    with t_ai:
-                        st.markdown("#### 🤖 AI 퀀트 애널리스트 실시간 리포트")
-                        
-                        # 자동 AI 브리핑 출력
-                        auto_brief = generate_ai_quant_response(stock_name, code, total_score, grade_text, target_dict, fund, df_inv)
-                        st.markdown(f'<div class="ai-chat-box">{auto_brief}</div>', unsafe_allow_html=True)
-
-                        st.divider()
-                        st.markdown("##### 💬 종목에 대해 무엇이든 물어보세요부리!")
-                        
-                        # 추천 질문 칩
-                        q_col1, q_col2, q_col3 = st.columns(3)
-                        if q_col1.button("📌 왜 지금 진입선에 사야 해?", use_container_width=True):
-                            st.session_state.current_q = "왜 지금 1차/2차 진입선 가격대에 사야 하나요?"
-                        if q_col2.button("🎯 목표가 도달 가능성과 근거는?", use_container_width=True):
-                            st.session_state.current_q = "1차 및 2차 목표가에 도달할 가능성과 구체적 근거를 설명해줘."
-                        if q_col3.button("⚠️ 가장 주의해야 할 리스크는?", use_container_width=True):
-                            st.session_state.current_q = "현재 이 종목에서 가장 주의해야 할 수급/재무적 리스크는 뭐야?"
-
-                        user_chat_input = st.text_input(
-                            "AI 챗봇 질문 입력",
-                            value=st.session_state.get("current_q", ""),
-                            placeholder="예: 지금 당장 시장가로 사도 돼? 손절선 기준이 왜 저 가격이야?",
-                            key="ai_user_input"
-                        )
-
-                        if st.button("🚀 AI 답변 요청", type="primary"):
-                            if user_chat_input.strip():
-                                with st.spinner("AI 퀀트 매니저가 데이터 분석 후 답변 작성 중..."):
-                                    ans = generate_ai_quant_response(stock_name, code, total_score, grade_text, target_dict, fund, df_inv, user_query=user_chat_input)
-                                    st.session_state.chat_history.append((user_chat_input, ans))
-                                    st.session_state.current_q = ""
-
-                        # 대화 기록 렌더링
-                        if st.session_state.chat_history:
-                            for q, a in reversed(st.session_state.chat_history):
-                                st.markdown(f"**🙋‍♂️ 질문:** {q}")
-                                st.markdown(f'<div class="ai-chat-box">🤖 **답변:**\n\n{a}</div>', unsafe_allow_html=True)
-
-                        # 선택적 Gemini API Key 설정
-                        with st.expander("🔑 (선택 사항) Google Gemini API Key 설정"):
-                            k_input = st.text_input("Gemini API Key를 입력하시면 더 정교한 LLM 추론이 활성화됩니다.", value=st.session_state.gemini_api_key, type="password")
-                            if k_input != st.session_state.gemini_api_key:
-                                st.session_state.gemini_api_key = k_input
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
