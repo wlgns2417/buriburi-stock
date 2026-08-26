@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(
-    page_title="부리부리 퀀트 작전실",
+    page_title="부리부리 종합 주식 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -73,7 +73,7 @@ st.markdown(
         color: #cbd5e1;
     }
 
-    /* 토스 스타일 연관 종목 드롭다운 박스 */
+    /* 토스 스타일 연관 종목 드롭다운 */
     .autocomplete-box {
         background: rgba(22, 27, 34, 0.95);
         border: 1px solid rgba(56, 189, 248, 0.3);
@@ -130,7 +130,7 @@ def resolve_stock_code(query):
     return None, None
 
 
-# 연관 검색어 매칭 함수
+# 연관 종목 검색 함수
 def search_similar_stocks(query):
     query = query.strip()
     if not query:
@@ -280,7 +280,7 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [기관 공인 4대 팩터 정밀 퀀트 채점 엔진 (100점 만점)]
+# [정밀 종합 진단 점수 엔진 (100점 만점 기준)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -435,36 +435,31 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [고속 멀티팩터 랭킹 엔진 (0.1초 즉시 계산)]
+# [오직 종합 진단 점수 기반으로만 산출하는 랭킹 엔진]
 # ====================================================
 @st.cache_data(ttl=600)
-def generate_all_market_rankings():
+def generate_comprehensive_score_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 시장 주도 자금 랭킹
+    # 종합 점수 기반 팩터 계산
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
-    chg = df_active["ChagesRatio"]
-    df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
-    df_active["등락률표시"] = df_active["ChagesRatio"].apply(lambda x: f"{x:+.2f}%")
-    df_active["거래대금_억"] = (df_active["Amount"] / 100000000).astype(int)
-
-    top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
-    bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
-
-    # 2. 공인 멀티팩터 퀀트 점수 랭킹
     marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
+    chg = df_active["ChagesRatio"]
+
+    # 안정적 추세(3~7% 상승 우대, 20% 이상 급등 과열 감점)
     trend_factor = np.where(chg > 20, 15 - (chg - 20) * 1.5, np.where(chg > 0, 22 + chg * 1.2, 18 + chg * 2.0))
     quality_factor = ((marcap_log - 10.5) * 6).clip(lower=5, upper=25)
     liquidity_factor = ((amount_log - 8.5) * 6).clip(lower=5, upper=25)
     
     calc_score = trend_factor + quality_factor + liquidity_factor + 15
-    df_active["퀀트점수"] = calc_score.clip(lower=18, upper=93).astype(int)
+    df_active["종합점수"] = calc_score.clip(lower=18, upper=95).astype(int)
+    df_active["등락률표시"] = df_active["ChagesRatio"].apply(lambda x: f"{x:+.2f}%")
 
-    top10_score = df_active.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-    bot10_score = df_active.sort_values(by=["퀀트점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
+    top10 = df_active.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
+    bot10 = df_active.sort_values(by=["종합점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
 
-    return top10_lead, bot10_lead, top10_score, bot10_score
+    return top10, bot10
 
 
 # ====================================================
@@ -474,7 +469,7 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL MULTI-FACTOR ENGINE</div>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL QUANT ENGINE</div>
             <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
         <div style="font-size: 26px;">🐽📊</div>
@@ -485,35 +480,12 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹
+# 1. 오른쪽 시장 랭킹 (오직 100점 만점 종합 점수로만 단일 구성)
 with rank_col:
-    top10_lead, bot10_lead, top10_score, bot10_score = generate_all_market_rankings()
+    top10_score, bot10_score = generate_comprehensive_score_rankings()
 
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🔥 시장 주도 자금 랭킹 TOP 10</div>", unsafe_allow_html=True)
-    lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
-
-    def render_lead_buttons(df_rank, prefix):
-        if df_rank.empty:
-            st.write("데이터 준비 중...")
-            return
-        for i, row in df_rank.iterrows():
-            cols = st.columns([5, 3, 2])
-            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
-                st.session_state.selected_stock = row["Name"]
-                st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-size:12px; color:#94a3b8; padding-top:6px;'>{row['거래대금_억']:,}억</div>", unsafe_allow_html=True)
-
-    with lead_tab1:
-        render_lead_buttons(top10_lead, "lead_top")
-    with lead_tab2:
-        render_lead_buttons(bot10_lead, "lead_bot")
-
-    st.write("")
-    st.divider()
-
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 멀티팩터 퀀트 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
-    score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
+    st.markdown("<div style='font-size:15px; font-weight:700; color:#38bdf8; margin-bottom:8px;'>🏆 종합 진단 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    score_tab1, score_tab2 = st.tabs(["🌟 상위 우량주", "🚨 하위 소외주"])
 
     def render_score_buttons(df_rank, prefix):
         if df_rank.empty:
@@ -525,7 +497,7 @@ with rank_col:
                 st.session_state.selected_stock = row["Name"]
                 st.rerun()
             cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#a855f7; padding-top:6px;'>{row['퀀트점수']}점</div>", unsafe_allow_html=True)
+            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#38bdf8; padding-top:6px;'>{row['종합점수']}점</div>", unsafe_allow_html=True)
 
     with score_tab1:
         render_score_buttons(top10_score, "score_top")
@@ -533,7 +505,7 @@ with rank_col:
         render_score_buttons(bot10_score, "score_bot")
 
 
-# 2. 왼쪽 메인 정밀 분석 (연관 종목 드롭다운 지원)
+# 2. 왼쪽 메인 정밀 분석 (연관 종목 드롭다운)
 with main_col:
     col_s1, col_s2 = st.columns([4, 1])
     default_search = st.session_state.selected_stock
@@ -696,7 +668,7 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "퀀트 채점표", "뉴스 브리핑"])
+                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "종합 채점표", "뉴스 브리핑"])
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
@@ -792,4 +764,4 @@ with main_col:
                         for item in news_items:
                             st.markdown(f"- [{item['title']}]({item['link']})")
     else:
-        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **시장 주도 랭킹 또는 퀀트 점수 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
+        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **종합 점수 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
