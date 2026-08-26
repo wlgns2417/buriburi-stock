@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(
-    page_title="주식 분석&작전실",
+    page_title="부리부리 퀀트 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -43,51 +43,6 @@ st.markdown(
         margin-bottom: 20px;
     }
     
-    /* 일주일 점수 변동 미니 칩 스타일 */
-    .history-chips {
-        display: flex;
-        justify-content: center;
-        gap: 6px;
-        margin: 10px 0 14px 0;
-        flex-wrap: wrap;
-    }
-    .history-item {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 8px;
-        padding: 4px 10px;
-        font-size: 11px;
-        color: #94a3b8;
-    }
-    .history-today {
-        background: rgba(56, 189, 248, 0.12);
-        border: 1px solid rgba(56, 189, 248, 0.4);
-        color: #38bdf8;
-        font-weight: 700;
-    }
-
-    /* 토스증권 스타일 AI 변동성 분석 카드 */
-    .toss-ai-card {
-        background: linear-gradient(135deg, rgba(30, 41, 59, 0.6) 0%, rgba(15, 23, 42, 0.8) 100%);
-        border: 1px solid rgba(56, 189, 248, 0.3);
-        border-radius: 14px;
-        padding: 18px 22px;
-        margin-bottom: 18px;
-        line-height: 1.75;
-        font-size: 14px;
-    }
-    .toss-badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 20px;
-        font-size: 12px;
-        font-weight: 700;
-        margin-bottom: 10px;
-    }
-    .toss-badge-up { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
-    .toss-badge-down { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
-    .toss-badge-flat { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
-
     .target-grid {
         display: flex;
         justify-content: space-between;
@@ -118,6 +73,24 @@ st.markdown(
         color: #cbd5e1;
     }
 
+    /* 토스 스타일 유사 종목 검색 드롭다운 카드 */
+    .autocomplete-box {
+        background: rgba(22, 27, 34, 0.95);
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        border-radius: 14px;
+        padding: 12px 16px;
+        margin-bottom: 15px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .autocomplete-header {
+        font-size: 12px;
+        color: #94a3b8;
+        font-weight: 600;
+        margin-bottom: 8px;
+        display: flex;
+        justify-content: space-between;
+    }
+
     [data-testid="stMetric"] {
         background: rgba(255, 255, 255, 0.02) !important;
         border: 1px solid rgba(255, 255, 255, 0.06) !important;
@@ -143,30 +116,38 @@ def get_krx_listing():
 def resolve_stock_code(query):
     query = query.strip()
     krx = get_krx_listing()
-    
     if query.isdigit():
-        code_str = query.zfill(6)
-        matched = krx[krx["Code"].astype(str).str.zfill(6) == code_str]
+        matched = krx[krx["Code"] == query]
         if not matched.empty:
-            return code_str, matched.iloc[0]["Name"]
-        return code_str, code_str
-
+            return query, matched.iloc[0]["Name"]
+        return query, query
     matched = krx[krx["Name"] == query]
     if not matched.empty:
-        return str(matched.iloc[0]["Code"]).zfill(6), query
-
-    matched_start = krx[krx["Name"].str.startswith(query)]
-    if not matched_start.empty:
-        return str(matched_start.iloc[0]["Code"]).zfill(6), matched_start.iloc[0]["Name"]
-
-    matched_part = krx[krx["Name"].str.contains(query, case=False)]
+        return matched.iloc[0]["Code"], query
+    matched_part = krx[krx["Name"].str.contains(query, case=False, na=False)]
     if not matched_part.empty:
-        return str(matched_part.iloc[0]["Code"]).zfill(6), matched_part.iloc[0]["Name"]
-
+        return matched_part.iloc[0]["Code"], matched_part.iloc[0]["Name"]
     return None, None
 
 
-@st.cache_data(ttl=1800)
+# 유사 종목 검색 매칭 함수
+def search_similar_stocks(query):
+    query = query.strip()
+    if not query:
+        return pd.DataFrame()
+    krx = get_krx_listing()
+    if query.isdigit():
+        matched = krx[krx["Code"].str.startswith(query)].copy()
+    else:
+        matched = krx[krx["Name"].str.contains(query, case=False, na=False)].copy()
+    
+    if matched.empty:
+        return pd.DataFrame()
+    
+    # 거래대금 및 시가총액 순 정렬 상위 6개
+    return matched.sort_values(by="Amount", ascending=False).head(6)
+
+
 def fetch_investor_naver(code):
     url = f"https://finance.naver.com/item/frgn.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -198,7 +179,6 @@ def fetch_investor_naver(code):
     return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=1800)
 def fetch_fundamental_and_consensus(code):
     url = f"https://finance.naver.com/item/main.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -264,7 +244,6 @@ def fetch_fundamental_and_consensus(code):
     return data
 
 
-@st.cache_data(ttl=1800)
 def fetch_short_selling(code):
     url = f"https://finance.naver.com/item/short_selling.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -284,7 +263,6 @@ def fetch_short_selling(code):
     return short_data
 
 
-@st.cache_data(ttl=900)
 def fetch_news(keyword):
     url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+주식&hl=ko&gl=KR&ceid=KR:ko"
     news_list = []
@@ -303,7 +281,7 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [종합 퀀트 점수 산출 함수 (100점 만점)]
+# [기관 공인 4대 팩터 정밀 퀀트 채점 엔진 (100점 만점)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -311,120 +289,136 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 1. Quality 팩터 (25점)
-    q_score = 0
-    if fund.get("ROE") is not None:
-        if fund["ROE"] >= 15.0:
-            q_score += 15
-            logs.append(("Quality: 고수익성 자본 효율 (ROE 15%↑)", "+15점", f"ROE {fund['ROE']:.2f}%"))
-        elif fund["ROE"] >= 8.0:
-            q_score += 8
-            logs.append(("Quality: 안정적 수익 창출 (ROE 8%↑)", "+8점", f"ROE {fund['ROE']:.2f}%"))
-        elif fund["ROE"] < 0:
-            q_score -= 10
-            logs.append(("Quality: 영업 적자 기업", "-10점", f"ROE {fund['ROE']:.2f}%"))
-    else:
-        q_score += 5
-
-    if fund.get("PER") is not None and fund["PER"] > 0:
-        q_score += 10
-        logs.append(("Quality: 순이익 흑자 기업", "+10점", f"PER {fund['PER']:.2f}배"))
-    elif fund.get("PER") is not None and fund["PER"] < 0:
-        q_score -= 5
-        logs.append(("Quality: 당기순손실 지속", "-5점", "PER 음수"))
-    score += max(0, min(25, q_score))
-
-    # 2. Value 팩터 (25점)
-    v_score = 0
-    if fund.get("PER") is not None and fund.get("업종PER") is not None:
-        if 0 < fund["PER"] <= fund["업종PER"] * 0.7:
-            v_score += 12
-            logs.append(("Value: 업종 대비 30% 이상 저평가", "+12점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
-        elif 0 < fund["PER"] <= fund["업종PER"]:
-            v_score += 6
-            logs.append(("Value: 업종 평균 대비 저평가", "+6점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
-        elif fund["PER"] > fund["업종PER"] * 1.5:
-            v_score -= 6
-            logs.append(("Value: 업종 대비 고평가 부담", "-6점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
-
-    if fund.get("PBR") is not None:
-        if 0 < fund["PBR"] < 0.9:
-            v_score += 6
-            logs.append(("Value: 장부가치 하회 (청산가치 안전마진)", "+6점", f"PBR {fund['PBR']}배 (< 0.9)"))
-        elif fund["PBR"] > 4.0:
-            v_score -= 3
-            logs.append(("Value: 자산 대비 고평가", "-3점", f"PBR {fund['PBR']}배"))
-
-    if fund.get("목표주가") and fund["목표주가"] > 0:
-        upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
-        if upside >= 20.0:
-            v_score += 7
-            logs.append(("Value: 애널리스트 상승여력 풍부", "+7점", f"목표가 {fund['목표주가']:,.0f}원 (상승여력 {upside:+.1f}%)"))
-        elif upside < 0:
-            v_score -= 6
-            logs.append(("Value: 목표주가 초과 과열", "-6점", f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회"))
-    score += max(0, min(25, v_score))
-
-    # 3. Momentum 팩터 (25점)
-    m_score = 0
+    # 1. 기술적 추세 팩터 (25점)
+    tech_score = 0
     if latest["MA5"] > latest["MA20"] > latest["MA60"]:
-        m_score += 10
-        logs.append(("Momentum: 완전 정배열 (5>20>60)", "+10점", "단·중기 우상향 추세"))
+        tech_score += 12
+        logs.append(("이평선 완전 정배열 (5>20>60)", "+12점", "단기·중기 완벽한 기관 선호 상승 추세"))
     elif latest["Close"] > latest["MA20"]:
-        m_score += 5
-        logs.append(("Momentum: 20일선 지지 안착", "+5점", "단기 지지선 유지"))
+        tech_score += 6
+        logs.append(("20일선 지지 안착", "+6점", "단기 지지선 반등 흐름 유지"))
     else:
-        m_score -= 8
-        logs.append(("Momentum: 20일선 하회 역배열", "-8점", "단기 하락 추세 지속"))
+        tech_score -= 6
+        logs.append(("20일선 하회 역배열", "-6점", "단기 하락 추세 지속"))
 
-    high_52w = df["High"].max()
-    dist_high = ((latest["Close"] - high_52w) / high_52w) * 100
-    if dist_high >= -6.0:
-        m_score += 10
-        logs.append(("Momentum: 52주 신고가 주도주", "+10점", f"최고가 대비 {dist_high:.1f}% 위치"))
-    elif dist_high <= -30.0:
-        m_score -= 8
-        logs.append(("Momentum: 장기 낙폭 과대 역배열", "-8점", f"최고가 대비 {dist_high:.1f}% 하락"))
+    bb_b = latest["BB_%b"]
+    if 0.75 <= bb_b <= 1.05:
+        tech_score += 7
+        logs.append(("볼린저 밴드라이딩 모멘텀", "+7점", "강한 추세 확장 구간 진입"))
+    elif bb_b < 0.2:
+        tech_score -= 4
+        logs.append(("볼린저 하단 이탈 경계", "-4점", "하방 압력 과도"))
 
-    rsi = latest["RSI"]
-    if 45 <= rsi <= 65:
-        m_score += 5
-        logs.append(("Momentum: 건전한 추세 지속 구간", "+5점", f"RSI {rsi:.1f}"))
-    elif rsi > 75:
-        m_score -= 5
-        logs.append(("Momentum: 단기 과매수 과열 경보", "-5점", f"RSI {rsi:.1f}"))
-    score += max(0, min(25, m_score))
+    if latest["MACD_HIST"] > 0 and prev["MACD_HIST"] <= 0:
+        tech_score += 6
+        logs.append(("MACD 골든크로스 발생", "+6점", "상승 모멘텀 전환 신호 포착"))
+    elif latest["MACD"] > latest["MACD_SIGNAL"]:
+        tech_score += 3
+        logs.append(("MACD 시그널 상회", "+3점", "매수 우위 흐름 지속"))
+    score += max(0, min(25, tech_score))
 
-    # 4. Smart Money 팩터 (25점)
-    s_score = 0
+    # 2. 스마트 머니 & 수급 팩터 (25점)
+    supply_score = 0
     if not df_inv.empty:
         for_5d_amt = df_inv["외인순매수금액"].head(5).sum()
         inst_5d_amt = df_inv["기관순매수금액"].head(5).sum()
         if for_5d_amt > 0 and inst_5d_amt > 0:
-            s_score += 12
-            logs.append(("Smart Money: 외인·기관 쌍끌이 동반 매집", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입"))
+            supply_score += 12
+            logs.append(("외인·기관 쌍끌이 동반 순매수", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입"))
         elif for_5d_amt > 0 or inst_5d_amt > 0:
-            s_score += 6
-            logs.append(("Smart Money: 메이저 주포 순매수", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억)"))
+            supply_score += 6
+            logs.append(("메이저 주포 수급 유입", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억) 순매수"))
         else:
-            s_score -= 6
-            logs.append(("Smart Money: 외인·기관 동반 이탈", "-6점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 매도"))
+            supply_score -= 5
+            logs.append(("외인·기관 동반 매도세", "-5점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 이탈"))
+
+        if len(df_inv) >= 10 and df_inv["외인보유율"].iloc[0] > df_inv["외인보유율"].iloc[9]:
+            supply_score += 5
+            logs.append(("외국인 지분율 확대", "+5점", f"현재 외인 지분율 {df_inv['외인보유율'].iloc[0]:.2f}%"))
 
     mfi = latest["MFI"]
     if 50 <= mfi <= 75:
-        s_score += 8
-        logs.append(("Smart Money: MFI 자금 유입 가속", "+8점", f"MFI {mfi:.1f}"))
+        supply_score += 5
+        logs.append(("MFI 스마트 머니 유입", "+5점", f"MFI {mfi:.1f} (대량 매집 진행)"))
     elif mfi > 80:
-        s_score -= 4
-        logs.append(("Smart Money: MFI 극단 과열", "-4점", f"MFI {mfi:.1f}"))
+        supply_score -= 4
+        logs.append(("MFI 단기 과열 경계", "-4점", f"MFI {mfi:.1f}"))
 
-    if short.get("공매도비중", 0) < 3.0:
-        s_score += 5
-        logs.append(("Risk Control: 공매도 안전지대", "+5점", f"공매도 비중 {short.get('공매도비중', 0):.2f}%"))
-    elif short.get("공매도비중", 0) >= 10.0:
-        s_score -= 8
-        logs.append(("Risk Control: 공매도 타깃 주의", "-8점", f"공매도 비중 {short.get('공매도비중', 0):.2f}%"))
-    score += max(0, min(25, s_score))
+    if latest["OBV"] > df["OBV"].tail(20).mean():
+        supply_score += 3
+        logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
+    score += max(0, min(25, supply_score))
+
+    # 3. 밸류 & 퀄리티 팩터 (25점)
+    analyst_score = 0
+    if fund["목표주가"] and fund["목표주가"] > 0:
+        upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
+        if upside >= 25.0:
+            analyst_score += 10
+            logs.append(("목표가 괴리율 매력", "+10점", f"목표가 {fund['목표주가']:,.0f}원 (상승여력 {upside:+.1f}%)"))
+        elif upside >= 10.0:
+            analyst_score += 6
+            logs.append(("상승여력 유효", "+6점", f"목표가 {fund['목표주가']:,.0f}원 (상승여력 {upside:+.1f}%)"))
+        elif upside < 0:
+            analyst_score -= 6
+            logs.append(("목표가 초과 고평가", "-6점", f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회"))
+
+    if fund["ROE"] is not None:
+        if fund["ROE"] >= 15.0:
+            analyst_score += 8
+            logs.append(("고수익 퀄리티 (ROE 15%↑)", "+8점", f"ROE {fund['ROE']:.2f}% (우수한 자본 효율성)"))
+        elif fund["ROE"] >= 8.0:
+            analyst_score += 4
+            logs.append(("안정적 자본 효율성", "+4점", f"ROE {fund['ROE']:.2f}% (안정적 이익 창출)"))
+        elif fund["ROE"] < 0:
+            analyst_score -= 8
+            logs.append(("ROE 마이너스 적자 기업", "-8점", f"ROE {fund['ROE']:.2f}%"))
+
+    if fund["PER"] is not None:
+        if fund["PER"] < 0:
+            analyst_score -= 5
+            logs.append(("실적 적자", "-5점", "PER 음수"))
+        elif fund["업종PER"] and fund["PER"] <= fund["업종PER"] * 0.7:
+            analyst_score += 4
+            logs.append(("업종 대비 저평가", "+4점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
+
+    if fund["PBR"] and fund["PBR"] < 0.9:
+        analyst_score += 3
+        logs.append(("저PBR 자산 가치주", "+3점", f"PBR {fund['PBR']}배로 장부가치 하회"))
+    score += max(0, min(25, analyst_score))
+
+    # 4. 가격 모멘텀 & 리스크 팩터 (25점)
+    m_score = 0
+    rsi = latest["RSI"]
+    if 45 <= rsi <= 65:
+        m_score += 10
+        logs.append(("이상적 RSI 구간", "+10점", f"RSI {rsi:.1f} (과열 없는 안정적 추세)"))
+    elif 30 <= rsi < 45:
+        m_score += 5
+        logs.append(("바닥권 반등 구간", "+5점", f"RSI {rsi:.1f}"))
+    elif rsi > 75:
+        m_score -= 6
+        logs.append(("단기 과매수 과열 경계", "-6점", f"RSI {rsi:.1f}"))
+
+    high_52w = df["High"].max()
+    dist_high = ((latest["Close"] - high_52w) / high_52w) * 100
+    if dist_high >= -7.0:
+        m_score += 10
+        logs.append(("52주 신고가 근접 (12M 모멘텀)", "+10점", f"최고가 대비 {dist_high:.1f}% 위치 (강한 주도력)"))
+    elif dist_high <= -35.0:
+        m_score -= 6
+        logs.append(("장기 낙폭 과대 역배열", "-6점", f"최고가 대비 {dist_high:.1f}% 하락"))
+
+    if short["공매도비중"] >= 15.0:
+        m_score -= 8
+        logs.append(("공매도 폭탄 경보", "-8점", f"공매도 비중 {short['공매도비중']:.2f}% (하방 압력 과도)"))
+    elif short["공매도비중"] >= 7.0:
+        m_score -= 4
+        logs.append(("공매도 경계", "-4점", f"공매도 비중 {short['공매도비중']:.2f}%"))
+    else:
+        m_score += 5
+
+    score += max(0, min(25, m_score))
 
     final_score = int(max(10, min(100, score)))
     if final_score >= 85:
@@ -442,30 +436,13 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [일주일(5영업일) 점수 변동 히스토리 연산 함수]
+# [고속 멀티팩터 랭킹 엔진]
 # ====================================================
-def calculate_score_history(df, df_inv, fund, short):
-    history = []
-    # 최근 5영업일 시점별 퀀트 점수 산출
-    for offset in [4, 3, 2, 1, 0]:
-        sub_df = df.iloc[: len(df) - offset]
-        sub_inv = df_inv.iloc[offset:] if not df_inv.empty and len(df_inv) > offset else df_inv
-        sc, _, _, _ = evaluate_pro_quant_score(sub_df, sub_inv, fund, short)
-        
-        date_str = sub_df.index[-1].strftime("%m/%d") if hasattr(sub_df.index[-1], 'strftime') else f"D-{offset}"
-        history.append((date_str, sc, offset == 0))
-    return history
-
-
-# ====================================================
-# [100% 일치 실시간 랭킹 엔진]
-# ====================================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def generate_all_market_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 시장 주도 자금 랭킹
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     chg = df_active["ChagesRatio"]
     df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
@@ -475,125 +452,18 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 거래대금 상위 25종목 대상 정확한 365일 데이터로 채점
-    candidates = df_active.sort_values(by="Amount", ascending=False).head(25)
-    scored_items = []
+    marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
+    trend_factor = np.where(chg > 20, 15 - (chg - 20) * 1.5, np.where(chg > 0, 22 + chg * 1.2, 18 + chg * 2.0))
+    quality_factor = ((marcap_log - 10.5) * 6).clip(lower=5, upper=25)
+    liquidity_factor = ((amount_log - 8.5) * 6).clip(lower=5, upper=25)
     
-    end_s = datetime.today().strftime("%Y-%m-%d")
-    start_s = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+    calc_score = trend_factor + quality_factor + liquidity_factor + 15
+    df_active["퀀트점수"] = calc_score.clip(lower=18, upper=93).astype(int)
 
-    for _, row in candidates.iterrows():
-        c_code = str(row["Code"]).zfill(6)
-        c_name = row["Name"]
-        c_close = row["Close"]
-        c_chg_str = f"{row['ChagesRatio']:+.2f}%"
-
-        try:
-            c_df = fdr.DataReader(c_code, start_s, end_s)
-            if len(c_df) < 60:
-                continue
-
-            c_df["MA5"] = c_df["Close"].rolling(5).mean()
-            c_df["MA20"] = c_df["Close"].rolling(20).mean()
-            c_df["MA60"] = c_df["Close"].rolling(60).mean()
-            c_df["STD20"] = c_df["Close"].rolling(20).std()
-            c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
-            c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
-            c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
-
-            exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
-            exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
-            c_df["MACD"] = exp12 - exp26
-            c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
-            c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
-
-            delta = c_df["Close"].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-
-            tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
-            rmf = tp * c_df["Volume"]
-            pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
-            neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
-            c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
-
-            c_inv = fetch_investor_naver(c_code)
-            c_fund = fetch_fundamental_and_consensus(c_code)
-            c_short = fetch_short_selling(c_code)
-
-            real_score, _, _, _ = evaluate_pro_quant_score(c_df, c_inv, c_fund, c_short)
-
-            scored_items.append({
-                "Code": c_code,
-                "Name": c_name,
-                "Close": c_close,
-                "등락률표시": c_chg_str,
-                "종합점수": real_score,
-                "Amount": row["Amount"],
-                "RawChg": row["ChagesRatio"]
-            })
-        except Exception:
-            continue
-
-    df_scored = pd.DataFrame(scored_items)
-    if not df_scored.empty:
-        top10_score = df_scored.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-        bot10_score = df_scored.sort_values(by=["종합점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
-    else:
-        top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
+    top10_score = df_active.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
+    bot10_score = df_active.sort_values(by=["퀀트점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
 
     return top10_lead, bot10_lead, top10_score, bot10_score
-
-
-# ====================================================
-# [토스증권 스타일 AI 주가 변동 원인 브리핑]
-# ====================================================
-def generate_toss_style_ai_comment(stock_name, ret_1d, df_inv, news_items, total_score):
-    badge_cls = "toss-badge-up" if ret_1d >= 2.0 else ("toss-badge-down" if ret_1d <= -2.0 else "toss-badge-flat")
-    status_title = (
-        f"🔥 오늘 주가가 {ret_1d:+.2f}% 급등했어요!"
-        if ret_1d >= 3.0
-        else (f"📈 오늘 주가가 {ret_1d:+.2f}% 상승 흐름이에요" if ret_1d > 0
-        else (f"📉 오늘 주가가 {ret_1d:+.2f}% 하락 조정을 받았어요" if ret_1d <= -3.0
-        else f"⚖️ 오늘 주가가 {ret_1d:+.2f}% 보합권에서 숨고르기 중이에요"))
-    )
-
-    supply_reason = "개인 투자자 중심의 수급 공방이 펼쳐지고 있어요."
-    if not df_inv.empty and len(df_inv) >= 1:
-        today_for = df_inv["외인순매수금액"].iloc[0]
-        today_inst = df_inv["기관순매수금액"].iloc[0]
-        if today_for > 10 and today_inst > 10:
-            supply_reason = f"**외국인({today_for:+.1f}억)**과 **기관({today_inst:+.1f}억)**이 쌍끌이로 순매수하며 주가를 강하게 견인했어요."
-        elif today_for > 10:
-            supply_reason = f"**외국인 투자자({today_for:+.1f}억)**의 집중적인 매수 유입이 주가 상승을 이끌었어요."
-        elif today_inst > 10:
-            supply_reason = f"**국내 기관({today_inst:+.1f}억)**의 저가 매수세가 유입되며 주가를 방어했어요."
-        elif today_for < -10 and today_inst < -10:
-            supply_reason = f"**외국인({today_for:+.1f}억)**과 **기관({today_inst:+.1f}억)**의 동반 차익 매물이 쏟아지며 하방 압력을 높였어요."
-        elif today_for < -10:
-            supply_reason = f"**외국인({today_for:+.1f}억)**의 비중 축소 매도가 나오며 주가가 조정을 받았어요."
-        elif today_inst < -10:
-            supply_reason = f"**기관({today_inst:+.1f}억)**의 단기 실현 매도가 이어졌어요."
-
-    top_news = news_items[0]["title"] if news_items else "관련 주요 공시 및 섹터 테마 동향을 모니터링 중이에요."
-
-    if ret_1d >= 5.0:
-        conclusion = "단기 상승 탄력이 매우 강하지만, 추격 매수보다는 5일선 눌림목 지지 가격대를 기다려 분할 진입하는 것이 안전해요."
-    elif ret_1d <= -5.0:
-        conclusion = "단기 낙폭이 커진 상태예요. 아래 제시된 매물대 하단 손절 기준선을 반드시 확인하고 섣부른 물타기는 자제하세요."
-    else:
-        conclusion = "추세를 탐색하는 안정적 구간이에요. 수급의 연속성과 퀀트 종합 점수 추이를 확인하세요."
-
-    return f"""
-<div class="toss-ai-card">
-    <div class="toss-badge {badge_cls}">🤖 토스 AI 주가 변동 브리핑</div>
-    <div style="font-size:16px; font-weight:800; color:#f8fafc; margin-bottom:8px;">{status_title}</div>
-    <div style="color:#cbd5e1; margin-bottom:6px;">• <b>수급 주체:</b> {supply_reason}</div>
-    <div style="color:#cbd5e1; margin-bottom:6px;">• <b>시장 이슈:</b> 최근 주요 뉴스로 <i>"{top_news}"</i> 등이 확인되고 있어요.</div>
-    <div style="color:#38bdf8; font-weight:600; margin-top:8px;">💡 <b>AI 코멘트:</b> {conclusion}</div>
-</div>
-"""
 
 
 # ====================================================
@@ -603,10 +473,10 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">AI-POWERED QUANT DASHBOARD</div>
-            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부룩이의 종합 주식 작전실</h2>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL MULTI-FACTOR ENGINE</div>
+            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
-        <div style="font-size: 26px;">🐽🤖📊</div>
+        <div style="font-size: 26px;">🐽📊</div>
     </div>
 """,
     unsafe_allow_html=True,
@@ -614,32 +484,9 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 랭킹 (종합 점수 랭킹 상단 배치)
+# 1. 오른쪽 시장 랭킹
 with rank_col:
     top10_lead, bot10_lead, top10_score, bot10_score = generate_all_market_rankings()
-
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🏆 100점 만점 종합 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
-    score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
-
-    def render_score_buttons(df_rank, prefix):
-        if df_rank.empty:
-            st.write("데이터 준비 중...")
-            return
-        for i, row in df_rank.iterrows():
-            cols = st.columns([5, 3, 2])
-            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
-                st.session_state.selected_stock = row["Name"]
-                st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#a855f7; padding-top:6px;'>{row['종합점수']}점</div>", unsafe_allow_html=True)
-
-    with score_tab1:
-        render_score_buttons(top10_score, "score_top")
-    with score_tab2:
-        render_score_buttons(bot10_score, "score_bot")
-
-    st.write("")
-    st.divider()
 
     st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🔥 시장 주도 자금 랭킹 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
@@ -661,29 +508,83 @@ with rank_col:
     with lead_tab2:
         render_lead_buttons(bot10_lead, "lead_bot")
 
+    st.write("")
+    st.divider()
 
-# 2. 왼쪽 메인 정밀 분석
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 멀티팩터 퀀트 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
+
+    def render_score_buttons(df_rank, prefix):
+        if df_rank.empty:
+            st.write("데이터 준비 중...")
+            return
+        for i, row in df_rank.iterrows():
+            cols = st.columns([5, 3, 2])
+            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
+                st.session_state.selected_stock = row["Name"]
+                st.rerun()
+            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
+            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#a855f7; padding-top:6px;'>{row['퀀트점수']}점</div>", unsafe_allow_html=True)
+
+    with score_tab1:
+        render_score_buttons(top10_score, "score_top")
+    with score_tab2:
+        render_score_buttons(bot10_score, "score_bot")
+
+
+# 2. 왼쪽 메인 정밀 분석 (토스 스타일 스마트 실시간 검색창)
 with main_col:
     col_s1, col_s2 = st.columns([4, 1])
     default_search = st.session_state.selected_stock
     search_input = col_s1.text_input(
         "종목 검색",
         value=default_search,
-        placeholder="종목명(예: 한국전력, 알테오젠, 삼성전자) 또는 6자리 코드 입력",
+        placeholder="종목명(예: 현대, 삼성, 카카오) 또는 6자리 코드 입력",
         label_visibility="collapsed"
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
 
+    # 검색창에 텍스트가 입력되면 실시간 매칭 종목 박스 노출 (토스 스타일)
+    if search_input.strip() and search_input != st.session_state.selected_stock:
+        sim_df = search_similar_stocks(search_input)
+        if not sim_df.empty:
+            st.markdown(
+                """
+                <div class="autocomplete-box">
+                    <div class="autocomplete-header">
+                        <span>🔍 연관 종목 검색 결과 (클릭 시 즉시 분석)</span>
+                        <span>실시간 현재가 / 등락률</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            for idx, srow in sim_df.iterrows():
+                ac_cols = st.columns([5, 3, 2])
+                # 종목명 버튼
+                if ac_cols[0].button(f"🏢 {srow['Name']} ({srow['Code']})", key=f"ac_{srow['Code']}", use_container_width=True):
+                    st.session_state.selected_stock = srow["Name"]
+                    st.rerun()
+                
+                # 가격 및 등락률 색상
+                chg_val = srow.get("ChagesRatio", 0.0)
+                chg_color = "#ef4444" if chg_val > 0 else ("#38bdf8" if chg_val < 0 else "#94a3b8")
+                ac_cols[1].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; padding-top:6px;'>{srow['Close']:,}원</div>", unsafe_allow_html=True)
+                ac_cols[2].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; color:{chg_color}; padding-top:6px;'>{chg_val:+.2f}%</div>", unsafe_allow_html=True)
+
     if search_input != st.session_state.selected_stock:
         st.session_state.selected_stock = search_input
 
-    if search_input.strip():
-        code, stock_name = resolve_stock_code(search_input)
+    # 분석 대상 종목 확정 및 정밀 분석 실행
+    current_target = st.session_state.selected_stock.strip() or search_input.strip()
+
+    if current_target:
+        code, stock_name = resolve_stock_code(current_target)
 
         if not code:
-            st.error(f"'{search_input}' 종목을 찾을 수 없습니다.")
+            st.error(f"'{current_target}' 종목을 찾을 수 없습니다.")
         else:
-            with st.spinner(f"[{stock_name} ({code})] 정밀 퀀트 분석 중..."):
+            with st.spinner(f"[{stock_name}] 정밀 퀀트 분석 중..."):
                 end_dt = datetime.today()
                 start_dt = end_dt - timedelta(days=365)
                 df = fdr.DataReader(code, start_dt.strftime("%Y-%m-%d"))
@@ -708,7 +609,7 @@ with main_col:
                     tr3 = (df["Low"] - df["Close"].shift(1)).abs()
                     df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
                     df["ATR14"] = df["TR"].rolling(14).mean()
-                    atr_val = df["ATR14"].iloc[-1] if not pd.isna(df["ATR14"].iloc[-1]) else latest_price * 0.02
+                    atr_val = df["ATR14"].iloc[-1] if not pd.isna(df["ATR14"].iloc[-1]) else latest_price * 0.03
 
                     exp12 = df["Close"].ewm(span=12, adjust=False).mean()
                     exp26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -737,12 +638,10 @@ with main_col:
                     high_20 = df["High"].tail(20).max()
                     low_20 = df["Low"].tail(20).min()
 
+                    # 매물대 프로파일
                     price_min, price_max = df["Low"].min(), df["High"].max()
                     bins = np.linspace(price_min, price_max, 13)
                     v_counts, _ = np.histogram(df["Close"], bins=bins, weights=df["Volume"])
-                    max_bin_idx = int(np.argmax(v_counts))
-                    poc_price_low = bins[max_bin_idx]
-                    poc_price_high = bins[max_bin_idx + 1]
 
                     df_inv = fetch_investor_naver(code)
                     fund = fetch_fundamental_and_consensus(code)
@@ -756,70 +655,50 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # 일주일 점수 변동 히스토리 계산
-                    score_history = calculate_score_history(df, df_inv, fund, short)
-
-                    # 정밀 타점 계산
+                    # 실전 매매 타점
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
 
-                    target_e1 = min(latest_price * 0.985, max(ma5_val, today_open * 0.99))
-                    entry_1 = round(target_e1, -2) if latest_price >= 10000 else round(target_e1)
+                    entry_1 = round(latest_price * 0.99, -2)
 
-                    if poc_price_high < latest_price * 0.98:
-                        target_e2 = max(poc_price_high, ma20_val)
+                    if (latest_price - ma20_val) / ma20_val > 0.15:
+                        entry_2 = round(max(ma5_val, today_open * 0.98), -2)
                     else:
-                        target_e2 = ma20_val if ma20_val < entry_1 else latest_price * 0.94
+                        entry_2 = round(ma20_val, -2)
                     
-                    if target_e2 >= entry_1:
-                        target_e2 = entry_1 * 0.96
-                    entry_2 = round(target_e2, -2) if latest_price >= 10000 else round(target_e2)
+                    if entry_2 >= entry_1:
+                        entry_2 = round(latest_price * 0.95, -2)
 
-                    target_1 = round(max(high_20, latest_price * 1.05), -2) if latest_price >= 10000 else round(max(high_20, latest_price * 1.05))
+                    t1_calc = max(high_20 * 1.02, latest_price * 1.06)
+                    target_1 = round(t1_calc, -2)
 
-                    if fund["목표주가"] and fund["목표주가"] > target_1:
-                        target_2 = round(fund["목표주가"], -2) if latest_price >= 10000 else round(fund["목표주가"])
+                    if fund["목표주가"] and fund["목표주가"] > target_1 * 1.05:
+                        target_2 = round(fund["목표주가"], -2)
                     else:
-                        target_2 = round(target_1 * 1.08, -2) if latest_price >= 10000 else round(target_1 * 1.08)
+                        target_2 = round(target_1 * 1.08, -2)
 
-                    stop_calc = min(entry_2 - atr_val, low_20 * 0.98)
-                    stop_loss = round(stop_calc, -2) if latest_price >= 10000 else round(stop_calc)
-
-                    # 일주일 점수 변동 칩 HTML 생성
-                    history_chips_html = "".join([
-                        f'<div class="history-item {"history-today" if is_today else ""}">{d}: <b>{s}점</b></div>'
-                        for d, s, is_today in score_history
-                    ])
+                    if (latest_price - low_20) / low_20 > 0.20:
+                        stop_loss = round(min(today_open * 0.96, latest_price * 0.93), -2)
+                    else:
+                        stop_loss = round(max(low_20 * 0.98, latest_price - (atr_val * 1.8)), -2)
 
                     target_grid_html = (
                         f'<div class="score-container">'
                         f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>'
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
-                        f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 6px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
-                        f'<div style="font-size:11px; color:#64748b; margin-bottom:2px;">최근 1주일 퀀트 점수 변동 추이</div>'
-                        f'<div class="history-chips">{history_chips_html}</div>'
+                        f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
-                        f'<div class="target-item"><div class="target-title">1차 진입 (5일선 눌림)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (매물대 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">1차 진입 (현재가)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 진입 (눌림목)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 목표 (컨센서스)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">정밀 손절선 (매물대 이탈)</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
                         f'</div>'
                         f'</div>'
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    # 토스증권 스타일 AI 주가 변동 원인 브리핑 카드 출력
-                    toss_ai_html = generate_toss_style_ai_comment(stock_name, ret_1d, df_inv, news_items, total_score)
-                    st.markdown(toss_ai_html, unsafe_allow_html=True)
-
-                    t1, t2, t3, t4, t5 = st.tabs([
-                        "차트 & 매물대 프로파일",
-                        "외인/기관 수급",
-                        "전망 & 애널리스트",
-                        "종합 팩터 채점표",
-                        "뉴스 브리핑"
-                    ])
+                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "퀀트 채점표", "뉴스 브리핑"])
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
@@ -909,11 +788,10 @@ with main_col:
                             st.write("최근 등록된 증권사 분석 리포트가 없습니다.")
 
                     with t4:
-                        st.markdown("### 📋 종합 퀀트 팩터 채점 상세 내역")
-                        st.dataframe(pd.DataFrame(logs, columns=["평가 팩터", "가감점", "상세 내용"]), use_container_width=True)
+                        st.dataframe(pd.DataFrame(logs, columns=["평가 항목", "가감점", "상세 내용"]), use_container_width=True)
 
                     with t5:
                         for item in news_items:
                             st.markdown(f"- [{item['title']}]({item['link']})")
     else:
-        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **종합 점수 랭킹 또는 시장 주도 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
+        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **시장 주도 랭킹 또는 퀀트 점수 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
