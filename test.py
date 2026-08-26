@@ -98,17 +98,29 @@ def get_krx_listing():
 def resolve_stock_code(query):
     query = query.strip()
     krx = get_krx_listing()
+    # 1. 6자리 종목코드 정확 매칭
     if query.isdigit():
-        matched = krx[krx["Code"] == query]
+        code_str = query.zfill(6)
+        matched = krx[krx["Code"] == code_str]
         if not matched.empty:
-            return query, matched.iloc[0]["Name"]
-        return query, query
+            return code_str, matched.iloc[0]["Name"]
+        return code_str, code_str
+
+    # 2. 종목명 정확 매칭
     matched = krx[krx["Name"] == query]
     if not matched.empty:
-        return matched.iloc[0]["Code"], query
+        return str(matched.iloc[0]["Code"]).zfill(6), query
+
+    # 3. 종목명 시작 부분 매칭 우선
+    matched_start = krx[krx["Name"].str.startswith(query)]
+    if not matched_start.empty:
+        return str(matched_start.iloc[0]["Code"]).zfill(6), matched_start.iloc[0]["Name"]
+
+    # 4. 종목명 포함 부분 매칭
     matched_part = krx[krx["Name"].str.contains(query, case=False)]
     if not matched_part.empty:
-        return matched_part.iloc[0]["Code"], matched_part.iloc[0]["Name"]
+        return str(matched_part.iloc[0]["Code"]).zfill(6), matched_part.iloc[0]["Name"]
+
     return None, None
 
 
@@ -253,30 +265,30 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 1. Quality & Profitability 팩터 (25점 만점 - Piotroski F-Score 기반)
+    # 1. Quality 팩터 (25점)
     q_score = 0
     if fund["ROE"] is not None:
         if fund["ROE"] >= 15.0:
             q_score += 15
-            logs.append(("Quality: 고수익성 자본 효율 (ROE 15%↑)", "+15점", f"ROE {fund['ROE']:.2f}% (월가 상위 퀄리티)"))
+            logs.append(("Quality: 고수익성 자본 효율 (ROE 15%↑)", "+15점", f"ROE {fund['ROE']:.2f}%"))
         elif fund["ROE"] >= 8.0:
             q_score += 8
-            logs.append(("Quality: 안정적 수익 창출 (ROE 8%↑)", "+8점", f"ROE {fund['ROE']:.2f}% (적정 자본 효율성)"))
+            logs.append(("Quality: 안정적 수익 창출 (ROE 8%↑)", "+8점", f"ROE {fund['ROE']:.2f}%"))
         elif fund["ROE"] < 0:
             q_score -= 10
-            logs.append(("Quality: 영업 적자 기업", "-10점", f"ROE {fund['ROE']:.2f}% (적자 지속 페널티)"))
+            logs.append(("Quality: 영업 적자 기업", "-10점", f"ROE {fund['ROE']:.2f}%"))
     else:
         q_score += 5
 
     if fund["PER"] is not None and fund["PER"] > 0:
         q_score += 10
-        logs.append(("Quality: 순이익 흑자 기업", "+10점", f"PER {fund['PER']:.2f}배 (흑자 구조)"))
+        logs.append(("Quality: 순이익 흑자 기업", "+10점", f"PER {fund['PER']:.2f}배"))
     elif fund["PER"] is not None and fund["PER"] < 0:
         q_score -= 5
-        logs.append(("Quality: 당기순손실 지속", "-5점", "PER 음수 기업"))
+        logs.append(("Quality: 당기순손실 지속", "-5점", "PER 음수"))
     score += max(0, min(25, q_score))
 
-    # 2. Value & Margin of Safety 팩터 (25점 만점 - Magic Formula 기반)
+    # 2. Value 팩터 (25점)
     v_score = 0
     if fund["PER"] is not None and fund["업종PER"] is not None:
         if 0 < fund["PER"] <= fund["업종PER"] * 0.7:
@@ -307,14 +319,14 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
             logs.append(("Value: 목표주가 초과 과열", "-6점", f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회"))
     score += max(0, min(25, v_score))
 
-    # 3. Momentum & Trend 팩터 (25점 만점 - AQR 12-1M Momentum 기반)
+    # 3. Momentum 팩터 (25점)
     m_score = 0
     if latest["MA5"] > latest["MA20"] > latest["MA60"]:
         m_score += 10
-        logs.append(("Momentum: 기관 선호 완전 정배열 (5>20>60)", "+10점", "단·중기 완벽한 우상향 추세"))
+        logs.append(("Momentum: 완전 정배열 (5>20>60)", "+10점", "단·중기 우상향 추세"))
     elif latest["Close"] > latest["MA20"]:
         m_score += 5
-        logs.append(("Momentum: 20일선 지지 안착", "+5점", "단기 지지선 반등 흐름 유지"))
+        logs.append(("Momentum: 20일선 지지 안착", "+5점", "단기 지지선 유지"))
     else:
         m_score -= 8
         logs.append(("Momentum: 20일선 하회 역배열", "-8점", "단기 하락 추세 지속"))
@@ -323,49 +335,49 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     dist_high = ((latest["Close"] - high_52w) / high_52w) * 100
     if dist_high >= -6.0:
         m_score += 10
-        logs.append(("Momentum: 52주 신고가 영역 주도주", "+10점", f"최고가 대비 {dist_high:.1f}% 위치 (강력한 상대강도)"))
+        logs.append(("Momentum: 52주 신고가 주도주", "+10점", f"최고가 대비 {dist_high:.1f}% 위치"))
     elif dist_high <= -30.0:
         m_score -= 8
-        logs.append(("Momentum: 장기 낙폭 과대 역배열", "-8점", f"최고가 대비 {dist_high:.1f}% 하락 (모멘텀 부재)"))
+        logs.append(("Momentum: 장기 낙폭 과대 역배열", "-8점", f"최고가 대비 {dist_high:.1f}% 하락"))
 
     rsi = latest["RSI"]
     if 45 <= rsi <= 65:
         m_score += 5
-        logs.append(("Momentum: 건전한 추세 지속 구간", "+5점", f"RSI {rsi:.1f} (과열 없는 안정적 흐름)"))
+        logs.append(("Momentum: 건전한 추세 지속 구간", "+5점", f"RSI {rsi:.1f}"))
     elif rsi > 75:
         m_score -= 5
-        logs.append(("Momentum: 단기 과매수 과열 경보", "-5점", f"RSI {rsi:.1f} (단기 차익 실현 경계)"))
+        logs.append(("Momentum: 단기 과매수 과열 경보", "-5점", f"RSI {rsi:.1f}"))
     score += max(0, min(25, m_score))
 
-    # 4. Smart Money & Risk 팩터 (25점 만점 - Flow & Short-Selling 기반)
+    # 4. Smart Money 팩터 (25점)
     s_score = 0
     if not df_inv.empty:
         for_5d_amt = df_inv["외인순매수금액"].head(5).sum()
         inst_5d_amt = df_inv["기관순매수금액"].head(5).sum()
         if for_5d_amt > 0 and inst_5d_amt > 0:
             s_score += 12
-            logs.append(("Smart Money: 외인·기관 쌍끌이 동반 매집", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 순유입"))
+            logs.append(("Smart Money: 외인·기관 쌍끌이 동반 매집", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입"))
         elif for_5d_amt > 0 or inst_5d_amt > 0:
             s_score += 6
-            logs.append(("Smart Money: 메이저 주포 순매수 유입", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억) 순매수"))
+            logs.append(("Smart Money: 메이저 주포 순매수", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억)"))
         else:
             s_score -= 6
-            logs.append(("Smart Money: 외인·기관 동반 이탈", "-6점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 순매도"))
+            logs.append(("Smart Money: 외인·기관 동반 이탈", "-6점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 매도"))
 
     mfi = latest["MFI"]
     if 50 <= mfi <= 75:
         s_score += 8
-        logs.append(("Smart Money: MFI 자금 유입 가속", "+8점", f"MFI {mfi:.1f} (거래량 수반 매집)"))
+        logs.append(("Smart Money: MFI 자금 유입 가속", "+8점", f"MFI {mfi:.1f}"))
     elif mfi > 80:
         s_score -= 4
         logs.append(("Smart Money: MFI 극단 과열", "-4점", f"MFI {mfi:.1f}"))
 
     if short["공매도비중"] < 3.0:
         s_score += 5
-        logs.append(("Risk Control: 공매도 안전지대", "+5점", f"공매도 비중 {short['공매도비중']:.2f}% (< 3%)"))
+        logs.append(("Risk Control: 공매도 안전지대", "+5점", f"공매도 비중 {short['공매도비중']:.2f}%"))
     elif short["공매도비중"] >= 10.0:
         s_score -= 8
-        logs.append(("Risk Control: 공매도 폭탄 주의", "-8점", f"공매도 비중 {short['공매도비중']:.2f}% (하방 타깃)"))
+        logs.append(("Risk Control: 공매도 타깃 주의", "-8점", f"공매도 비중 {short['공매도비중']:.2f}%"))
     score += max(0, min(25, s_score))
 
     final_score = int(max(10, min(100, score)))
@@ -526,7 +538,7 @@ with main_col:
                     tr3 = (df["Low"] - df["Close"].shift(1)).abs()
                     df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
                     df["ATR14"] = df["TR"].rolling(14).mean()
-                    atr_val = df["ATR14"].iloc[-1] if not pd.isna(df["ATR14"].iloc[-1]) else latest_price * 0.03
+                    atr_val = df["ATR14"].iloc[-1] if not pd.isna(df["ATR14"].iloc[-1]) else latest_price * 0.02
 
                     exp12 = df["Close"].ewm(span=12, adjust=False).mean()
                     exp26 = df["Close"].ewm(span=26, adjust=False).mean()
@@ -571,32 +583,32 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # 실전 매매 타점
-                    ma5_val = df["MA5"].iloc[-1]
+                    # =========================================================
+                    # [명확한 실전 타점 공식 적용]
+                    # =========================================================
                     ma20_val = df["MA20"].iloc[-1]
-
-                    entry_1 = round(latest_price * 0.99, -2)
-
-                    if (latest_price - ma20_val) / ma20_val > 0.15:
-                        entry_2 = round(max(ma5_val, today_open * 0.98), -2)
-                    else:
-                        entry_2 = round(ma20_val, -2)
                     
-                    if entry_2 >= entry_1:
-                        entry_2 = round(latest_price * 0.95, -2)
+                    # 1차 진입가: 현재가 기준 -0.5%
+                    entry_1 = round(latest_price * 0.995, -2) if latest_price >= 10000 else round(latest_price * 0.995)
 
-                    t1_calc = max(high_20 * 1.02, latest_price * 1.06)
-                    target_1 = round(t1_calc, -2)
-
-                    if fund["목표주가"] and fund["목표주가"] > target_1 * 1.05:
-                        target_2 = round(fund["목표주가"], -2)
+                    # 2차 진입가: 20일선 눌림목 (현재가보다 낮고 10% 이내 지지선)
+                    if 0 < (latest_price - ma20_val) / latest_price <= 0.10:
+                        entry_2 = round(ma20_val, -2) if latest_price >= 10000 else round(ma20_val)
                     else:
-                        target_2 = round(target_1 * 1.08, -2)
+                        entry_2 = round(latest_price * 0.965, -2) if latest_price >= 10000 else round(latest_price * 0.965)
 
-                    if (latest_price - low_20) / low_20 > 0.20:
-                        stop_loss = round(min(today_open * 0.96, latest_price * 0.93), -2)
+                    # 1차 목표가: 최근 20일 최고가 저항선
+                    target_1 = round(max(high_20, latest_price * 1.05), -2) if latest_price >= 10000 else round(max(high_20, latest_price * 1.05))
+
+                    # 2차 목표가: 애널리스트 목표가 (없으면 1차 대비 +8%)
+                    if fund["목표주가"] and fund["목표주가"] > target_1:
+                        target_2 = round(fund["목표주가"], -2) if latest_price >= 10000 else round(fund["목표주가"])
                     else:
-                        stop_loss = round(max(low_20 * 0.98, latest_price - (atr_val * 1.8)), -2)
+                        target_2 = round(target_1 * 1.08, -2) if latest_price >= 10000 else round(target_1 * 1.08)
+
+                    # 정밀 손절선: 20일 최저점 - ATR 1.0배수 (추세 붕괴선)
+                    stop_loss_calc = min(low_20 - atr_val, latest_price * 0.94)
+                    stop_loss = round(stop_loss_calc, -2) if latest_price >= 10000 else round(stop_loss_calc)
 
                     target_grid_html = (
                         f'<div class="score-container">'
@@ -604,11 +616,11 @@ with main_col:
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
                         f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
-                        f'<div class="target-item"><div class="target-title">1차 진입 (현재가)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (눌림목)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">1차 진입 (현재가 부근)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 진입 (눌림목 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 목표 (컨센서스)</div><div class="target-val">{target_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">정밀 손절선 (추세 이탈)</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
                         f'</div>'
                         f'</div>'
                     )
