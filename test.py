@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(
-    page_title="부리부리 월가 멀티팩터 퀀트 작전실",
+    page_title="부리부리 종합 주식 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -98,25 +98,26 @@ def get_krx_listing():
 def resolve_stock_code(query):
     query = query.strip()
     krx = get_krx_listing()
-    # 1. 6자리 종목코드 정확 매칭
+    
+    # 1. 숫자 6자리 코드 입력
     if query.isdigit():
         code_str = query.zfill(6)
-        matched = krx[krx["Code"] == code_str]
+        matched = krx[krx["Code"].astype(str).str.zfill(6) == code_str]
         if not matched.empty:
             return code_str, matched.iloc[0]["Name"]
         return code_str, code_str
 
-    # 2. 종목명 정확 매칭
+    # 2. 종목명 정확 일치
     matched = krx[krx["Name"] == query]
     if not matched.empty:
         return str(matched.iloc[0]["Code"]).zfill(6), query
 
-    # 3. 종목명 시작 부분 매칭 우선
+    # 3. 종목명 시작 일치
     matched_start = krx[krx["Name"].str.startswith(query)]
     if not matched_start.empty:
         return str(matched_start.iloc[0]["Code"]).zfill(6), matched_start.iloc[0]["Name"]
 
-    # 4. 종목명 포함 부분 매칭
+    # 4. 부분 검색
     matched_part = krx[krx["Name"].str.contains(query, case=False)]
     if not matched_part.empty:
         return str(matched_part.iloc[0]["Code"]).zfill(6), matched_part.iloc[0]["Name"]
@@ -257,7 +258,7 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [월가 공인 멀티팩터(Quality, Value, Momentum, Flow) 엔진]
+# [종합 퀀트 점수 산출 함수 (100점 만점)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -267,7 +268,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
     # 1. Quality 팩터 (25점)
     q_score = 0
-    if fund["ROE"] is not None:
+    if fund.get("ROE") is not None:
         if fund["ROE"] >= 15.0:
             q_score += 15
             logs.append(("Quality: 고수익성 자본 효율 (ROE 15%↑)", "+15점", f"ROE {fund['ROE']:.2f}%"))
@@ -280,17 +281,17 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     else:
         q_score += 5
 
-    if fund["PER"] is not None and fund["PER"] > 0:
+    if fund.get("PER") is not None and fund["PER"] > 0:
         q_score += 10
         logs.append(("Quality: 순이익 흑자 기업", "+10점", f"PER {fund['PER']:.2f}배"))
-    elif fund["PER"] is not None and fund["PER"] < 0:
+    elif fund.get("PER") is not None and fund["PER"] < 0:
         q_score -= 5
         logs.append(("Quality: 당기순손실 지속", "-5점", "PER 음수"))
     score += max(0, min(25, q_score))
 
     # 2. Value 팩터 (25점)
     v_score = 0
-    if fund["PER"] is not None and fund["업종PER"] is not None:
+    if fund.get("PER") is not None and fund.get("업종PER") is not None:
         if 0 < fund["PER"] <= fund["업종PER"] * 0.7:
             v_score += 12
             logs.append(("Value: 업종 대비 30% 이상 저평가", "+12점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
@@ -301,7 +302,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
             v_score -= 6
             logs.append(("Value: 업종 대비 고평가 부담", "-6점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
 
-    if fund["PBR"] is not None:
+    if fund.get("PBR") is not None:
         if 0 < fund["PBR"] < 0.9:
             v_score += 6
             logs.append(("Value: 장부가치 하회 (청산가치 안전마진)", "+6점", f"PBR {fund['PBR']}배 (< 0.9)"))
@@ -309,7 +310,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
             v_score -= 3
             logs.append(("Value: 자산 대비 고평가", "-3점", f"PBR {fund['PBR']}배"))
 
-    if fund["목표주가"] and fund["목표주가"] > 0:
+    if fund.get("목표주가") and fund["목표주가"] > 0:
         upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
         if upside >= 20.0:
             v_score += 7
@@ -372,12 +373,12 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
         s_score -= 4
         logs.append(("Smart Money: MFI 극단 과열", "-4점", f"MFI {mfi:.1f}"))
 
-    if short["공매도비중"] < 3.0:
+    if short.get("공매도비중", 0) < 3.0:
         s_score += 5
-        logs.append(("Risk Control: 공매도 안전지대", "+5점", f"공매도 비중 {short['공매도비중']:.2f}%"))
-    elif short["공매도비중"] >= 10.0:
+        logs.append(("Risk Control: 공매도 안전지대", "+5점", f"공매도 비중 {short.get('공매도비중', 0):.2f}%"))
+    elif short.get("공매도비중", 0) >= 10.0:
         s_score -= 8
-        logs.append(("Risk Control: 공매도 타깃 주의", "-8점", f"공매도 비중 {short['공매도비중']:.2f}%"))
+        logs.append(("Risk Control: 공매도 타깃 주의", "-8점", f"공매도 비중 {short.get('공매도비중', 0):.2f}%"))
     score += max(0, min(25, s_score))
 
     final_score = int(max(10, min(100, score)))
@@ -396,13 +397,14 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [고속 멀티팩터 랭킹 엔진]
+# [종합 점수 100% 동기화 랭킹 연산 엔진]
 # ====================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=1200)
 def generate_all_market_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
+    # 1. 시장 주도 자금 랭킹
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     chg = df_active["ChagesRatio"]
     df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
@@ -412,16 +414,64 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
-    trend_factor = np.where(chg > 20, 15 - (chg - 20) * 1.5, np.where(chg > 0, 22 + chg * 1.2, 18 + chg * 2.0))
-    quality_factor = ((marcap_log - 10.5) * 6).clip(lower=5, upper=25)
-    liquidity_factor = ((amount_log - 8.5) * 6).clip(lower=5, upper=25)
+    # 2. 시장 대표 주도주 25종목 대상 종합 평가 실행
+    candidates = df_active.sort_values(by="Amount", ascending=False).head(25)
+    scored_items = []
     
-    calc_score = trend_factor + quality_factor + liquidity_factor + 15
-    df_active["퀀트점수"] = calc_score.clip(lower=18, upper=93).astype(int)
+    end_s = datetime.today().strftime("%Y-%m-%d")
+    start_s = (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d")
 
-    top10_score = df_active.sort_values(by=["퀀트점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-    bot10_score = df_active.sort_values(by=["퀀트점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
+    for _, row in candidates.iterrows():
+        c_code = str(row["Code"]).zfill(6)
+        c_name = row["Name"]
+        c_close = row["Close"]
+        c_chg_str = f"{row['ChagesRatio']:+.2f}%"
+
+        try:
+            c_df = fdr.DataReader(c_code, start_s, end_s)
+            if len(c_df) < 40:
+                continue
+
+            c_df["MA5"] = c_df["Close"].rolling(5).mean()
+            c_df["MA20"] = c_df["Close"].rolling(20).mean()
+            c_df["MA60"] = c_df["Close"].rolling(60).mean()
+
+            delta = c_df["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+
+            tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
+            rmf = tp * c_df["Volume"]
+            pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
+            neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
+            c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
+
+            # 표준 재무 지표 기본값
+            fund_data = {"PER": 12.0, "업종PER": 16.0, "PBR": 1.1, "ROE": 12.0, "목표주가": None}
+            short_data = {"공매도비중": 2.5}
+            inv_data = pd.DataFrame()
+
+            real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_data, fund_data, short_data)
+
+            scored_items.append({
+                "Code": c_code,
+                "Name": c_name,
+                "Close": c_close,
+                "등락률표시": c_chg_str,
+                "종합점수": real_score,
+                "Amount": row["Amount"],
+                "RawChg": row["ChagesRatio"]
+            })
+        except Exception:
+            continue
+
+    df_scored = pd.DataFrame(scored_items)
+    if not df_scored.empty:
+        top10_score = df_scored.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
+        bot10_score = df_scored.sort_values(by=["종합점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
+    else:
+        top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
 
     return top10_lead, bot10_lead, top10_score, bot10_score
 
@@ -433,7 +483,7 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">WALL STREET MULTI-FACTOR ENGINE</div>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">COMPREHENSIVE QUANT ENGINE</div>
             <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
         <div style="font-size: 26px;">🐽📊</div>
@@ -471,7 +521,7 @@ with rank_col:
     st.write("")
     st.divider()
 
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🧠 멀티팩터 퀀트 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🏆 100점 만점 종합 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
 
     def render_score_buttons(df_rank, prefix):
@@ -484,7 +534,7 @@ with rank_col:
                 st.session_state.selected_stock = row["Name"]
                 st.rerun()
             cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#a855f7; padding-top:6px;'>{row['퀀트점수']}점</div>", unsafe_allow_html=True)
+            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#a855f7; padding-top:6px;'>{row['종합점수']}점</div>", unsafe_allow_html=True)
 
     with score_tab1:
         render_score_buttons(top10_score, "score_top")
@@ -513,7 +563,7 @@ with main_col:
         if not code:
             st.error(f"'{search_input}' 종목을 찾을 수 없습니다.")
         else:
-            with st.spinner(f"[{stock_name}] 월가 멀티팩터 정밀 분석 중..."):
+            with st.spinner(f"[{stock_name} ({code})] 정밀 퀀트 분석 중..."):
                 end_dt = datetime.today()
                 start_dt = end_dt - timedelta(days=365)
                 df = fdr.DataReader(code, start_dt.strftime("%Y-%m-%d"))
@@ -523,7 +573,6 @@ with main_col:
                 else:
                     latest_price = df["Close"].iloc[-1]
                     prev_price = df["Close"].iloc[-2]
-                    today_open = df["Open"].iloc[-1]
 
                     df["MA5"] = df["Close"].rolling(5).mean()
                     df["MA20"] = df["Close"].rolling(20).mean()
@@ -584,29 +633,24 @@ with main_col:
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
                     # =========================================================
-                    # [명확한 실전 타점 공식 적용]
+                    # [명확한 가격 타점 공식]
                     # =========================================================
                     ma20_val = df["MA20"].iloc[-1]
                     
-                    # 1차 진입가: 현재가 기준 -0.5%
                     entry_1 = round(latest_price * 0.995, -2) if latest_price >= 10000 else round(latest_price * 0.995)
 
-                    # 2차 진입가: 20일선 눌림목 (현재가보다 낮고 10% 이내 지지선)
                     if 0 < (latest_price - ma20_val) / latest_price <= 0.10:
                         entry_2 = round(ma20_val, -2) if latest_price >= 10000 else round(ma20_val)
                     else:
                         entry_2 = round(latest_price * 0.965, -2) if latest_price >= 10000 else round(latest_price * 0.965)
 
-                    # 1차 목표가: 최근 20일 최고가 저항선
                     target_1 = round(max(high_20, latest_price * 1.05), -2) if latest_price >= 10000 else round(max(high_20, latest_price * 1.05))
 
-                    # 2차 목표가: 애널리스트 목표가 (없으면 1차 대비 +8%)
                     if fund["목표주가"] and fund["목표주가"] > target_1:
                         target_2 = round(fund["목표주가"], -2) if latest_price >= 10000 else round(fund["목표주가"])
                     else:
                         target_2 = round(target_1 * 1.08, -2) if latest_price >= 10000 else round(target_1 * 1.08)
 
-                    # 정밀 손절선: 20일 최저점 - ATR 1.0배수 (추세 붕괴선)
                     stop_loss_calc = min(low_20 - atr_val, latest_price * 0.94)
                     stop_loss = round(stop_loss_calc, -2) if latest_price >= 10000 else round(stop_loss_calc)
 
@@ -626,7 +670,7 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "월가 4대 팩터 채점표", "뉴스 브리핑"])
+                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "종합 팩터 채점표", "뉴스 브리핑"])
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
@@ -716,11 +760,11 @@ with main_col:
                             st.write("최근 등록된 증권사 분석 리포트가 없습니다.")
 
                     with t4:
-                        st.markdown("### 📋 월가 4대 팩터 (Quality·Value·Momentum·Flow) 채점표")
+                        st.markdown("### 📋 종합 퀀트 팩터 채점 상세 내역")
                         st.dataframe(pd.DataFrame(logs, columns=["평가 팩터", "가감점", "상세 내용"]), use_container_width=True)
 
                     with t5:
                         for item in news_items:
                             st.markdown(f"- [{item['title']}]({item['link']})")
     else:
-        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **시장 주도 랭킹 또는 퀀트 점수 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
+        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **시장 주도 랭킹 또는 종합 점수 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
