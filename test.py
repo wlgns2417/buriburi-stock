@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 st.set_page_config(
-    page_title="주식분석 작전실",
+    page_title="부리부리 종합 주식 작전실",
     page_icon="🐽",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -43,6 +43,51 @@ st.markdown(
         margin-bottom: 20px;
     }
     
+    /* 일주일 점수 변동 미니 칩 스타일 */
+    .history-chips {
+        display: flex;
+        justify-content: center;
+        gap: 6px;
+        margin: 10px 0 14px 0;
+        flex-wrap: wrap;
+    }
+    .history-item {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        padding: 4px 10px;
+        font-size: 11px;
+        color: #94a3b8;
+    }
+    .history-today {
+        background: rgba(56, 189, 248, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.4);
+        color: #38bdf8;
+        font-weight: 700;
+    }
+
+    /* 토스증권 스타일 AI 변동성 분석 카드 */
+    .toss-ai-card {
+        background: linear-gradient(135deg, rgba(30, 41, 59, 0.6) 0%, rgba(15, 23, 42, 0.8) 100%);
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        border-radius: 14px;
+        padding: 18px 22px;
+        margin-bottom: 18px;
+        line-height: 1.75;
+        font-size: 14px;
+    }
+    .toss-badge {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 20px;
+        font-size: 12px;
+        font-weight: 700;
+        margin-bottom: 10px;
+    }
+    .toss-badge-up { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .toss-badge-down { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }
+    .toss-badge-flat { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
+
     .target-grid {
         display: flex;
         justify-content: space-between;
@@ -71,17 +116,6 @@ st.markdown(
         line-height: 1.6;
         font-size: 14px;
         color: #cbd5e1;
-    }
-
-    .ai-brief-box {
-        background: linear-gradient(135deg, rgba(56, 189, 248, 0.05) 0%, rgba(30, 41, 59, 0.3) 100%);
-        border: 1px solid rgba(56, 189, 248, 0.25);
-        border-radius: 14px;
-        padding: 20px 24px;
-        margin-bottom: 18px;
-        line-height: 1.8;
-        font-size: 14px;
-        color: #e2e8f0;
     }
 
     [data-testid="stMetric"] {
@@ -250,6 +284,7 @@ def fetch_short_selling(code):
     return short_data
 
 
+@st.cache_data(ttl=900)
 def fetch_news(keyword):
     url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+주식&hl=ko&gl=KR&ceid=KR:ko"
     news_list = []
@@ -407,6 +442,22 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
+# [일주일(5영업일) 점수 변동 히스토리 연산 함수]
+# ====================================================
+def calculate_score_history(df, df_inv, fund, short):
+    history = []
+    # 최근 5영업일 시점별 퀀트 점수 산출
+    for offset in [4, 3, 2, 1, 0]:
+        sub_df = df.iloc[: len(df) - offset]
+        sub_inv = df_inv.iloc[offset:] if not df_inv.empty and len(df_inv) > offset else df_inv
+        sc, _, _, _ = evaluate_pro_quant_score(sub_df, sub_inv, fund, short)
+        
+        date_str = sub_df.index[-1].strftime("%m/%d") if hasattr(sub_df.index[-1], 'strftime') else f"D-{offset}"
+        history.append((date_str, sc, offset == 0))
+    return history
+
+
+# ====================================================
 # [100% 일치 실시간 랭킹 엔진]
 # ====================================================
 @st.cache_data(ttl=1800)
@@ -424,7 +475,7 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 거래대금 상위 25종목 대상 종합 평가
+    # 2. 거래대금 상위 25종목 대상 정확한 365일 데이터로 채점
     candidates = df_active.sort_values(by="Amount", ascending=False).head(25)
     scored_items = []
     
@@ -496,26 +547,52 @@ def generate_all_market_rankings():
 
 
 # ====================================================
-# [즉시 로딩 AI 퀀트 브리핑 생성기]
+# [토스증권 스타일 AI 주가 변동 원인 브리핑]
 # ====================================================
-def generate_instant_ai_brief(stock_name, score, grade, targets, fund):
-    verdict = (
-        "적극 매수 고려 가능 (주도주 추세 형성)"
-        if score >= 70
-        else ("분할 매수 및 눌림목 지지 확인 필요" if score >= 50 else "리스크 관리 및 섣부른 진입 자제")
+def generate_toss_style_ai_comment(stock_name, ret_1d, df_inv, news_items, total_score):
+    badge_cls = "toss-badge-up" if ret_1d >= 2.0 else ("toss-badge-down" if ret_1d <= -2.0 else "toss-badge-flat")
+    status_title = (
+        f"🔥 오늘 주가가 {ret_1d:+.2f}% 급등했어요!"
+        if ret_1d >= 3.0
+        else (f"📈 오늘 주가가 {ret_1d:+.2f}% 상승 흐름이에요" if ret_1d > 0
+        else (f"📉 오늘 주가가 {ret_1d:+.2f}% 하락 조정을 받았어요" if ret_1d <= -3.0
+        else f"⚖️ 오늘 주가가 {ret_1d:+.2f}% 보합권에서 숨고르기 중이에요"))
     )
-    
-    upside_text = ""
-    if targets.get("target_2") and targets.get("target_2") > targets["current"]:
-        upside = ((targets["target_2"] - targets["current"]) / targets["current"]) * 100
-        upside_text = f" (상승 여력: {upside:+.1f}%)"
+
+    supply_reason = "개인 투자자 중심의 수급 공방이 펼쳐지고 있어요."
+    if not df_inv.empty and len(df_inv) >= 1:
+        today_for = df_inv["외인순매수금액"].iloc[0]
+        today_inst = df_inv["기관순매수금액"].iloc[0]
+        if today_for > 10 and today_inst > 10:
+            supply_reason = f"**외국인({today_for:+.1f}억)**과 **기관({today_inst:+.1f}억)**이 쌍끌이로 순매수하며 주가를 강하게 견인했어요."
+        elif today_for > 10:
+            supply_reason = f"**외국인 투자자({today_for:+.1f}억)**의 집중적인 매수 유입이 주가 상승을 이끌었어요."
+        elif today_inst > 10:
+            supply_reason = f"**국내 기관({today_inst:+.1f}억)**의 저가 매수세가 유입되며 주가를 방어했어요."
+        elif today_for < -10 and today_inst < -10:
+            supply_reason = f"**외국인({today_for:+.1f}억)**과 **기관({today_inst:+.1f}억)**의 동반 차익 매물이 쏟아지며 하방 압력을 높였어요."
+        elif today_for < -10:
+            supply_reason = f"**외국인({today_for:+.1f}억)**의 비중 축소 매도가 나오며 주가가 조정을 받았어요."
+        elif today_inst < -10:
+            supply_reason = f"**기관({today_inst:+.1f}억)**의 단기 실현 매도가 이어졌어요."
+
+    top_news = news_items[0]["title"] if news_items else "관련 주요 공시 및 섹터 테마 동향을 모니터링 중이에요."
+
+    if ret_1d >= 5.0:
+        conclusion = "단기 상승 탄력이 매우 강하지만, 추격 매수보다는 5일선 눌림목 지지 가격대를 기다려 분할 진입하는 것이 안전해요."
+    elif ret_1d <= -5.0:
+        conclusion = "단기 낙폭이 커진 상태예요. 아래 제시된 매물대 하단 손절 기준선을 반드시 확인하고 섣부른 물타기는 자제하세요."
+    else:
+        conclusion = "추세를 탐색하는 안정적 구간이에요. 수급의 연속성과 퀀트 종합 점수 추이를 확인하세요."
 
     return f"""
-#### 🤖 AI 퀀트 애널리스트 실시간 정밀 브리핑
-* **종합 진단 ({score}점 / {grade}):** 현재 본 종목은 **{verdict}** 상태입니다. ROE {fund.get('ROE', 'N/A')}%, PER {fund.get('PER', 'N/A')}배 수준으로 실적 및 밸류에이션이 반영되어 있습니다.
-* **진입 타점 및 근거:** 현재가 부근 추격 매수보다는 **1차 5일선 지지선({targets['entry_1']:,.0f}원)** 또는 **2차 매물대 바닥선({targets['entry_2']:,.0f}원)**에서 분할 매수하는 것이 통계적으로 유리합니다.
-* **목표가 및 익절 라인:** **1차 목표가 {targets['target_1']:,.0f}원**(직전 저항선)에서 일부 차익 실현 후, **2차 목표가 {targets['target_2']:,.0f}원**{upside_text}을 최종 상단으로 설정합니다.
-* **리스크 관리 손절선:** **{targets['stop_loss']:,.0f}원** 하향 이탈 시 매물대 지지가 깨지는 자리이므로 비중 축소 또는 스탑로스를 권장합니다.
+<div class="toss-ai-card">
+    <div class="toss-badge {badge_cls}">🤖 토스 AI 주가 변동 브리핑</div>
+    <div style="font-size:16px; font-weight:800; color:#f8fafc; margin-bottom:8px;">{status_title}</div>
+    <div style="color:#cbd5e1; margin-bottom:6px;">• <b>수급 주체:</b> {supply_reason}</div>
+    <div style="color:#cbd5e1; margin-bottom:6px;">• <b>시장 이슈:</b> 최근 주요 뉴스로 <i>"{top_news}"</i> 등이 확인되고 있어요.</div>
+    <div style="color:#38bdf8; font-weight:600; margin-top:8px;">💡 <b>AI 코멘트:</b> {conclusion}</div>
+</div>
 """
 
 
@@ -526,10 +603,10 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL QUANT ENGINE</div>
-            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부룩이의 종합 주식 작전실</h2>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">AI-POWERED QUANT DASHBOARD</div>
+            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
-        <div style="font-size: 26px;">🐽📊</div>
+        <div style="font-size: 26px;">🐽🤖📊</div>
     </div>
 """,
     unsafe_allow_html=True,
@@ -537,7 +614,7 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 랭킹
+# 1. 오른쪽 랭킹 (종합 점수 랭킹 상단 배치)
 with rank_col:
     top10_lead, bot10_lead, top10_score, bot10_score = generate_all_market_rankings()
 
@@ -679,6 +756,9 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
+                    # 일주일 점수 변동 히스토리 계산
+                    score_history = calculate_score_history(df, df_inv, fund, short)
+
                     # 정밀 타점 계산
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
@@ -705,20 +785,19 @@ with main_col:
                     stop_calc = min(entry_2 - atr_val, low_20 * 0.98)
                     stop_loss = round(stop_calc, -2) if latest_price >= 10000 else round(stop_calc)
 
-                    target_dict = {
-                        "current": latest_price,
-                        "entry_1": entry_1,
-                        "entry_2": entry_2,
-                        "target_1": target_1,
-                        "target_2": target_2,
-                        "stop_loss": stop_loss,
-                    }
+                    # 일주일 점수 변동 칩 HTML 생성
+                    history_chips_html = "".join([
+                        f'<div class="history-item {"history-today" if is_today else ""}">{d}: <b>{s}점</b></div>'
+                        for d, s, is_today in score_history
+                    ])
 
                     target_grid_html = (
                         f'<div class="score-container">'
                         f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>'
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
-                        f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
+                        f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 6px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
+                        f'<div style="font-size:11px; color:#64748b; margin-bottom:2px;">최근 1주일 퀀트 점수 변동 추이</div>'
+                        f'<div class="history-chips">{history_chips_html}</div>'
                         f'<div class="target-grid">'
                         f'<div class="target-item"><div class="target-title">1차 진입 (5일선 눌림)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">2차 진입 (매물대 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
@@ -730,9 +809,9 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    # 즉시 로딩 AI 브리핑 카드
-                    ai_brief_text = generate_instant_ai_brief(stock_name, total_score, grade_text, target_dict, fund)
-                    st.markdown(f'<div class="ai-brief-box">{ai_brief_text}</div>', unsafe_allow_html=True)
+                    # 토스증권 스타일 AI 주가 변동 원인 브리핑 카드 출력
+                    toss_ai_html = generate_toss_style_ai_comment(stock_name, ret_1d, df_inv, news_items, total_score)
+                    st.markdown(toss_ai_html, unsafe_allow_html=True)
 
                     t1, t2, t3, t4, t5 = st.tabs([
                         "차트 & 매물대 프로파일",
