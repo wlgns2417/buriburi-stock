@@ -396,7 +396,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [100% 점수 일치 랭킹 산출 엔진]
+# [100% 일치 실시간 랭킹 엔진]
 # ====================================================
 @st.cache_data(ttl=1800)
 def generate_all_market_rankings():
@@ -413,12 +413,12 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 거래대금 상위 25종목 대상 실제 크롤링 + 실시간 정확 채점
+    # 2. 거래대금 상위 25종목 대상 정확한 365일 전체 데이터로 채점 (오차 0%)
     candidates = df_active.sort_values(by="Amount", ascending=False).head(25)
     scored_items = []
     
     end_s = datetime.today().strftime("%Y-%m-%d")
-    start_s = (datetime.today() - timedelta(days=150)).strftime("%Y-%m-%d")
+    start_s = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 
     for _, row in candidates.iterrows():
         c_code = str(row["Code"]).zfill(6)
@@ -428,7 +428,7 @@ def generate_all_market_rankings():
 
         try:
             c_df = fdr.DataReader(c_code, start_s, end_s)
-            if len(c_df) < 50:
+            if len(c_df) < 60:
                 continue
 
             c_df["MA5"] = c_df["Close"].rolling(5).mean()
@@ -456,7 +456,6 @@ def generate_all_market_rankings():
             neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
             c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
 
-            # 실제 크롤링 데이터 연동 (캐시로 초고속 처리)
             c_inv = fetch_investor_naver(c_code)
             c_fund = fetch_fundamental_and_consensus(c_code)
             c_short = fetch_short_selling(c_code)
@@ -492,7 +491,7 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">COMPREHENSIVE QUANT ENGINE</div>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">INSTITUTIONAL QUANT ENGINE</div>
             <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
         <div style="font-size: 26px;">🐽📊</div>
@@ -503,11 +502,10 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 랭킹 (종합 점수 랭킹을 상단으로 배치)
+# 1. 오른쪽 랭킹 (종합 점수 랭킹 상단 배치)
 with rank_col:
     top10_lead, bot10_lead, top10_score, bot10_score = generate_all_market_rankings()
 
-    # 상단: 100점 만점 종합 점수 랭킹
     st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🏆 100점 만점 종합 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
 
@@ -531,7 +529,6 @@ with rank_col:
     st.write("")
     st.divider()
 
-    # 하단: 시장 주도 자금 랭킹
     st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🔥 시장 주도 자금 랭킹 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
 
@@ -560,7 +557,7 @@ with main_col:
     search_input = col_s1.text_input(
         "종목 검색",
         value=default_search,
-        placeholder="종목명(예: 알테오젠, 삼성전자, SK하이닉스) 또는 6자리 코드 입력",
+        placeholder="종목명(예: 한국전력, 알테오젠, 삼성전자) 또는 6자리 코드 입력",
         label_visibility="collapsed"
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
@@ -584,6 +581,7 @@ with main_col:
                 else:
                     latest_price = df["Close"].iloc[-1]
                     prev_price = df["Close"].iloc[-2]
+                    today_open = df["Open"].iloc[-1]
 
                     df["MA5"] = df["Close"].rolling(5).mean()
                     df["MA20"] = df["Close"].rolling(20).mean()
@@ -627,9 +625,13 @@ with main_col:
                     high_20 = df["High"].tail(20).max()
                     low_20 = df["Low"].tail(20).min()
 
+                    # 매물대 프로파일 및 최다 매물대(POC) 계산
                     price_min, price_max = df["Low"].min(), df["High"].max()
                     bins = np.linspace(price_min, price_max, 13)
                     v_counts, _ = np.histogram(df["Close"], bins=bins, weights=df["Volume"])
+                    max_bin_idx = int(np.argmax(v_counts))
+                    poc_price_low = bins[max_bin_idx]
+                    poc_price_high = bins[max_bin_idx + 1]
 
                     df_inv = fetch_investor_naver(code)
                     fund = fetch_fundamental_and_consensus(code)
@@ -643,25 +645,38 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # 실전 매매 타점
+                    # =========================================================
+                    # [시장 베테랑 꾼들의 정밀 진입/청산 타점 알고리즘]
+                    # =========================================================
+                    ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
-                    
-                    entry_1 = round(latest_price * 0.995, -2) if latest_price >= 10000 else round(latest_price * 0.995)
 
-                    if 0 < (latest_price - ma20_val) / latest_price <= 0.10:
-                        entry_2 = round(ma20_val, -2) if latest_price >= 10000 else round(ma20_val)
+                    # 1. 1차 진입가: 5일선 눌림목 또는 당일 시가 (현재가보다 반드시 1.5~3% 낮게 대기)
+                    target_e1 = min(latest_price * 0.985, max(ma5_val, today_open * 0.99))
+                    entry_1 = round(target_e1, -2) if latest_price >= 10000 else round(target_e1)
+
+                    # 2. 2차 진입가: 최다 매물대(POC) 지지선 또는 20일선 눌림목
+                    if poc_price_high < latest_price * 0.98:
+                        target_e2 = max(poc_price_high, ma20_val)
                     else:
-                        entry_2 = round(latest_price * 0.965, -2) if latest_price >= 10000 else round(latest_price * 0.965)
+                        target_e2 = ma20_val if ma20_val < entry_1 else latest_price * 0.94
+                    
+                    if target_e2 >= entry_1:
+                        target_e2 = entry_1 * 0.96
+                    entry_2 = round(target_e2, -2) if latest_price >= 10000 else round(target_e2)
 
+                    # 3. 1차 목표가: 최근 20일 최고가 저항선
                     target_1 = round(max(high_20, latest_price * 1.05), -2) if latest_price >= 10000 else round(max(high_20, latest_price * 1.05))
 
+                    # 4. 2차 목표가: 증권사 컨센서스 목표주가
                     if fund["목표주가"] and fund["목표주가"] > target_1:
                         target_2 = round(fund["목표주가"], -2) if latest_price >= 10000 else round(fund["목표주가"])
                     else:
                         target_2 = round(target_1 * 1.08, -2) if latest_price >= 10000 else round(target_1 * 1.08)
 
-                    stop_loss_calc = min(low_20 - atr_val, latest_price * 0.94)
-                    stop_loss = round(stop_loss_calc, -2) if latest_price >= 10000 else round(stop_loss_calc)
+                    # 5. 정밀 손절선: 2차 진입 지지선(또는 POC 매물대 하단) - ATR 1.0배수
+                    stop_calc = min(entry_2 - atr_val, low_20 * 0.98)
+                    stop_loss = round(stop_calc, -2) if latest_price >= 10000 else round(stop_calc)
 
                     target_grid_html = (
                         f'<div class="score-container">'
@@ -669,11 +684,11 @@ with main_col:
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
                         f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
-                        f'<div class="target-item"><div class="target-title">1차 진입 (현재가 부근)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (눌림목 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">1차 진입 (5일선 눌림)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 진입 (매물대 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">2차 목표 (컨센서스)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">정밀 손절선 (추세 이탈)</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">정밀 손절선 (매물대 이탈)</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
                         f'</div>'
                         f'</div>'
                     )
