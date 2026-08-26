@@ -99,7 +99,6 @@ def resolve_stock_code(query):
     query = query.strip()
     krx = get_krx_listing()
     
-    # 1. 숫자 6자리 코드 입력
     if query.isdigit():
         code_str = query.zfill(6)
         matched = krx[krx["Code"].astype(str).str.zfill(6) == code_str]
@@ -107,17 +106,14 @@ def resolve_stock_code(query):
             return code_str, matched.iloc[0]["Name"]
         return code_str, code_str
 
-    # 2. 종목명 정확 일치
     matched = krx[krx["Name"] == query]
     if not matched.empty:
         return str(matched.iloc[0]["Code"]).zfill(6), query
 
-    # 3. 종목명 시작 일치
     matched_start = krx[krx["Name"].str.startswith(query)]
     if not matched_start.empty:
         return str(matched_start.iloc[0]["Code"]).zfill(6), matched_start.iloc[0]["Name"]
 
-    # 4. 부분 검색
     matched_part = krx[krx["Name"].str.contains(query, case=False)]
     if not matched_part.empty:
         return str(matched_part.iloc[0]["Code"]).zfill(6), matched_part.iloc[0]["Name"]
@@ -125,6 +121,7 @@ def resolve_stock_code(query):
     return None, None
 
 
+@st.cache_data(ttl=1800)
 def fetch_investor_naver(code):
     url = f"https://finance.naver.com/item/frgn.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -156,6 +153,7 @@ def fetch_investor_naver(code):
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=1800)
 def fetch_fundamental_and_consensus(code):
     url = f"https://finance.naver.com/item/main.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -221,6 +219,7 @@ def fetch_fundamental_and_consensus(code):
     return data
 
 
+@st.cache_data(ttl=1800)
 def fetch_short_selling(code):
     url = f"https://finance.naver.com/item/short_selling.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -397,9 +396,9 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [종합 점수 100% 동기화 랭킹 연산 엔진]
+# [100% 점수 일치 랭킹 산출 엔진]
 # ====================================================
-@st.cache_data(ttl=1200)
+@st.cache_data(ttl=1800)
 def generate_all_market_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
@@ -414,12 +413,12 @@ def generate_all_market_rankings():
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-    # 2. 시장 대표 주도주 25종목 대상 종합 평가 실행
+    # 2. 거래대금 상위 25종목 대상 실제 크롤링 + 실시간 정확 채점
     candidates = df_active.sort_values(by="Amount", ascending=False).head(25)
     scored_items = []
     
     end_s = datetime.today().strftime("%Y-%m-%d")
-    start_s = (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d")
+    start_s = (datetime.today() - timedelta(days=150)).strftime("%Y-%m-%d")
 
     for _, row in candidates.iterrows():
         c_code = str(row["Code"]).zfill(6)
@@ -429,12 +428,22 @@ def generate_all_market_rankings():
 
         try:
             c_df = fdr.DataReader(c_code, start_s, end_s)
-            if len(c_df) < 40:
+            if len(c_df) < 50:
                 continue
 
             c_df["MA5"] = c_df["Close"].rolling(5).mean()
             c_df["MA20"] = c_df["Close"].rolling(20).mean()
             c_df["MA60"] = c_df["Close"].rolling(60).mean()
+            c_df["STD20"] = c_df["Close"].rolling(20).std()
+            c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
+            c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
+            c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
+
+            exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
+            exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
+            c_df["MACD"] = exp12 - exp26
+            c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
+            c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
 
             delta = c_df["Close"].diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -447,12 +456,12 @@ def generate_all_market_rankings():
             neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
             c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
 
-            # 표준 재무 지표 기본값
-            fund_data = {"PER": 12.0, "업종PER": 16.0, "PBR": 1.1, "ROE": 12.0, "목표주가": None}
-            short_data = {"공매도비중": 2.5}
-            inv_data = pd.DataFrame()
+            # 실제 크롤링 데이터 연동 (캐시로 초고속 처리)
+            c_inv = fetch_investor_naver(c_code)
+            c_fund = fetch_fundamental_and_consensus(c_code)
+            c_short = fetch_short_selling(c_code)
 
-            real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_data, fund_data, short_data)
+            real_score, _, _, _ = evaluate_pro_quant_score(c_df, c_inv, c_fund, c_short)
 
             scored_items.append({
                 "Code": c_code,
@@ -494,33 +503,11 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹
+# 1. 오른쪽 랭킹 (종합 점수 랭킹을 상단으로 배치)
 with rank_col:
     top10_lead, bot10_lead, top10_score, bot10_score = generate_all_market_rankings()
 
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🔥 시장 주도 자금 랭킹 TOP 10</div>", unsafe_allow_html=True)
-    lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
-
-    def render_lead_buttons(df_rank, prefix):
-        if df_rank.empty:
-            st.write("데이터 준비 중...")
-            return
-        for i, row in df_rank.iterrows():
-            cols = st.columns([5, 3, 2])
-            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
-                st.session_state.selected_stock = row["Name"]
-                st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-size:12px; color:#94a3b8; padding-top:6px;'>{row['거래대금_억']:,}억</div>", unsafe_allow_html=True)
-
-    with lead_tab1:
-        render_lead_buttons(top10_lead, "lead_top")
-    with lead_tab2:
-        render_lead_buttons(bot10_lead, "lead_bot")
-
-    st.write("")
-    st.divider()
-
+    # 상단: 100점 만점 종합 점수 랭킹
     st.markdown("<div style='font-size:14px; font-weight:700; color:#a855f7; margin-bottom:6px;'>🏆 100점 만점 종합 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 고득점 우량주", "🚨 저득점 주의주"])
 
@@ -541,6 +528,30 @@ with rank_col:
     with score_tab2:
         render_score_buttons(bot10_score, "score_bot")
 
+    st.write("")
+    st.divider()
+
+    # 하단: 시장 주도 자금 랭킹
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🔥 시장 주도 자금 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
+
+    def render_lead_buttons(df_rank, prefix):
+        if df_rank.empty:
+            st.write("데이터 준비 중...")
+            return
+        for i, row in df_rank.iterrows():
+            cols = st.columns([5, 3, 2])
+            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
+                st.session_state.selected_stock = row["Name"]
+                st.rerun()
+            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
+            cols[2].markdown(f"<div style='text-align:center; font-size:12px; color:#94a3b8; padding-top:6px;'>{row['거래대금_억']:,}억</div>", unsafe_allow_html=True)
+
+    with lead_tab1:
+        render_lead_buttons(top10_lead, "lead_top")
+    with lead_tab2:
+        render_lead_buttons(bot10_lead, "lead_bot")
+
 
 # 2. 왼쪽 메인 정밀 분석
 with main_col:
@@ -549,7 +560,7 @@ with main_col:
     search_input = col_s1.text_input(
         "종목 검색",
         value=default_search,
-        placeholder="종목명(예: 삼성전자, 현대차, SK하이닉스) 또는 6자리 코드 입력",
+        placeholder="종목명(예: 알테오젠, 삼성전자, SK하이닉스) 또는 6자리 코드 입력",
         label_visibility="collapsed"
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
@@ -632,9 +643,7 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # =========================================================
-                    # [명확한 가격 타점 공식]
-                    # =========================================================
+                    # 실전 매매 타점
                     ma20_val = df["MA20"].iloc[-1]
                     
                     entry_1 = round(latest_price * 0.995, -2) if latest_price >= 10000 else round(latest_price * 0.995)
@@ -767,4 +776,4 @@ with main_col:
                         for item in news_items:
                             st.markdown(f"- [{item['title']}]({item['link']})")
     else:
-        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **시장 주도 랭킹 또는 종합 점수 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
+        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **종합 점수 랭킹 또는 시장 주도 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
