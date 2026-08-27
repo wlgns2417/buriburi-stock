@@ -107,7 +107,7 @@ if "selected_stock" not in st.session_state:
     st.session_state.selected_stock = ""
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=600)
 def get_krx_listing():
     return fdr.StockListing("KRX")
 
@@ -129,7 +129,6 @@ def resolve_stock_code(query):
     return None, None
 
 
-# 초고속 실시간 단일 현재가 패칭 함수 (0.05초)
 def fetch_realtime_price(code, fallback_price):
     url = f"https://finance.naver.com/item/main.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -138,8 +137,7 @@ def fetch_realtime_price(code, fallback_price):
         soup = BeautifulSoup(res.text, "html.parser")
         p_tag = soup.select_one(".no_today .no_down .blind, .no_today .no_up .blind, .no_today span.blind")
         if p_tag and p_tag.text.strip():
-            rt_p = float(p_tag.text.replace(",", ""))
-            return rt_p
+            return float(p_tag.text.replace(",", ""))
     except Exception:
         pass
     return fallback_price
@@ -451,12 +449,12 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 # ====================================================
 # [100% 점수 일치 종합점수 TOP10 & 주도주 연산 엔진]
 # ====================================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def generate_accurate_dual_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 우측 상단 종합점수 TOP 10 (정밀 다중 팩터 채점)
+    # 우측 상단 종합점수 TOP 10
     sample_pool = df_active.sort_values(by="Amount", ascending=False).head(35)
     score_list = []
 
@@ -615,7 +613,9 @@ with main_col:
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
     refresh_btn = col_s3.button("⚡ 시세 갱신", use_container_width=True)
 
+    # 시세 갱신 시 캐시 메모리를 리셋하여 우측 랭킹 시세까지 실시간 갱신
     if refresh_btn:
+        st.cache_data.clear()
         st.rerun()
 
     # 연관 종목 드롭다운
