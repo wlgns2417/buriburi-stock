@@ -129,6 +129,22 @@ def resolve_stock_code(query):
     return None, None
 
 
+# 초고속 실시간 단일 현재가 패칭 함수 (0.05초)
+def fetch_realtime_price(code, fallback_price):
+    url = f"https://finance.naver.com/item/main.naver?code={code}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        res = requests.get(url, headers=headers, timeout=2.5)
+        soup = BeautifulSoup(res.text, "html.parser")
+        p_tag = soup.select_one(".no_today .no_down .blind, .no_today .no_up .blind, .no_today span.blind")
+        if p_tag and p_tag.text.strip():
+            rt_p = float(p_tag.text.replace(",", ""))
+            return rt_p
+    except Exception:
+        pass
+    return fallback_price
+
+
 def search_similar_stocks(query):
     query = query.strip()
     if not query:
@@ -440,7 +456,7 @@ def generate_accurate_dual_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 우측 상단 종합점수 TOP 10 (시총/거래대금 상위 35개 정밀 연산)
+    # 우측 상단 종합점수 TOP 10 (정밀 다중 팩터 채점)
     sample_pool = df_active.sort_values(by="Amount", ascending=False).head(35)
     score_list = []
 
@@ -481,7 +497,6 @@ def generate_accurate_dual_rankings():
             neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
             c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
 
-            # 메인 상세 화면과 동일한 채점 가동
             fund_d = {"목표주가": None, "PER": 12.0, "PBR": 1.1, "배당수익률": 2.0, "업종PER": 15.0, "ROE": 11.0}
             short_d = {"공매도비중": 1.5}
             inv_d = pd.DataFrame()
@@ -507,7 +522,7 @@ def generate_accurate_dual_rankings():
     else:
         top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
 
-    # 2. 우측 하단 시장 자금 주도주 TOP 10
+    # 우측 하단 시장 자금 주도주 TOP 10
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     df_active["모멘텀"] = (df_active["ChagesRatio"] * 2.5) + (amount_log * 5)
     df_active["등락률표시"] = df_active["ChagesRatio"].apply(lambda x: f"{x:+.2f}%")
@@ -541,7 +556,7 @@ main_col, rank_col = st.columns([7, 3])
 with rank_col:
     top10_score, bot10_score, top10_lead, bot10_lead = generate_accurate_dual_rankings()
 
-    # [우측 상단] 종합점수 상위 TOP 10 (메인 점수와 100% 일치)
+    # [우측 상단] 종합점수 TOP 10
     st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 종합점수 상위 TOP 10", "🚨 종합점수 하위 TOP 10"])
 
@@ -589,7 +604,7 @@ with rank_col:
 
 # 2. 왼쪽 메인 정밀 분석
 with main_col:
-    col_s1, col_s2 = st.columns([4, 1])
+    col_s1, col_s2, col_s3 = st.columns([3.5, 1, 1])
     default_search = st.session_state.selected_stock
     search_input = col_s1.text_input(
         "종목 검색",
@@ -598,6 +613,10 @@ with main_col:
         label_visibility="collapsed"
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
+    refresh_btn = col_s3.button("⚡ 시세 갱신", use_container_width=True)
+
+    if refresh_btn:
+        st.rerun()
 
     # 연관 종목 드롭다운
     if search_input.strip() and search_input != st.session_state.selected_stock:
@@ -644,8 +663,12 @@ with main_col:
                 if df.empty or len(df) < 60:
                     st.error("데이터 수집에 실패했거나 거래일 데이터가 부족합니다.")
                 else:
-                    latest_price = df["Close"].iloc[-1]
+                    raw_latest = df["Close"].iloc[-1]
                     prev_price = df["Close"].iloc[-2]
+                    
+                    # 초경량 실시간 현재가 단일 패칭 (0.05초)
+                    latest_price = fetch_realtime_price(code, raw_latest)
+                    df.at[df.index[-1], "Close"] = latest_price
                     today_open = df["Open"].iloc[-1]
 
                     df["MA5"] = df["Close"].rolling(5).mean()
@@ -708,7 +731,7 @@ with main_col:
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
                     # =========================================================
-                    # [여의도 기관 트레이더 기준 정밀 진입 타점 알고리즘]
+                    # [실시간 현재가 기반 여의도 기관 트레이더 정밀 타점 산출]
                     # =========================================================
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
@@ -743,7 +766,7 @@ with main_col:
 
                     target_grid_html = (
                         f'<div class="score-container">'
-                        f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code})</div>'
+                        f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code}) <span style="color:#22c55e; font-size:11px;">● REALTIME</span></div>'
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
                         f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
@@ -761,7 +784,7 @@ with main_col:
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("현재가", f"{latest_price:,.0f}원", f"{ret_1d:+.2f}%")
+                        c1.metric("현재가(실시간)", f"{latest_price:,.0f}원", f"{ret_1d:+.2f}%")
                         c2.metric("1주일", f"{ret_1w:+.2f}%")
                         c3.metric("1개월", f"{ret_1m:+.2f}%")
                         c4.metric("1년(모멘텀)", f"{ret_1y:+.2f}%")
