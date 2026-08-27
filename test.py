@@ -278,7 +278,7 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [사진 첨부 4대 다중 팩터 + 추세 추종 정밀 퀀트 채점 엔진]
+# [정밀 퀀트 채점 엔진 (100점 만점)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -286,7 +286,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     latest = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # 1. 모멘텀 및 추세 추종 팩터 (25점)
+    # 1. 기술적 추세 팩터 (25점)
     tech_score = 0
     if latest["MA5"] > latest["MA20"] > latest["MA60"]:
         tech_score += 12
@@ -346,7 +346,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
         logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
     score += max(0, min(25, supply_score))
 
-    # 3. 밸류 & 퀄리티 팩터 (PER, PBR, ROE, 25점)
+    # 3. 밸류 & 퀄리티 팩터 (25점)
     analyst_score = 0
     if fund["목표주가"] and fund["목표주가"] > 0:
         upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
@@ -384,7 +384,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
         logs.append(("저PBR 자산 가치주", "+3점", f"PBR {fund['PBR']}배로 장부가치 하회"))
     score += max(0, min(25, analyst_score))
 
-    # 4. 가격 모멘텀 & 과열 리스크 관리 (25점)
+    # 4. 가격 모멘텀 & 리스크 관리 (25점)
     m_score = 0
     rsi = latest["RSI"]
     if 45 <= rsi <= 65:
@@ -433,14 +433,14 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [우측 상단 퀀트 종합 점수 & 우측 하단 시장 주도주 연산 엔진]
+# [우측 상단 종합점수 TOP10 & 우측 하단 시장 주도주 연산 엔진]
 # ====================================================
 @st.cache_data(ttl=600)
 def generate_dual_market_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 우측 상단: 퀀트 다중 팩터 종합 점수 랭킹
+    # 1. 우측 상단: 종합점수 랭킹
     marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     chg = df_active["ChagesRatio"]
@@ -457,7 +457,7 @@ def generate_dual_market_rankings():
     top10_score = df_active.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
     bot10_score = df_active.sort_values(by=["종합점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
 
-    # 2. 우측 하단: 시장 자금 주도주 랭킹
+    # 2. 우측 하단: 시장 주도주 랭킹
     df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
@@ -483,12 +483,12 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹 (상단: 종합점수 TOP10 / 하단: 주도주 TOP10)
+# 1. 오른쪽 시장 랭킹 (상단: 종합점수 상위 TOP 10 / 하단: 시장 자금 주도주 TOP 10)
 with rank_col:
     top10_score, bot10_score, top10_lead, bot10_lead = generate_dual_market_rankings()
 
-    # [우측 상단] 퀀트 종합 점수 랭킹
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 퀀트 팩터 종합 점수 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    # [우측 상단] 종합점수 상위 TOP 10
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 상위 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 상위 우량주", "🚨 하위 주의주"])
 
     def render_score_buttons(df_rank, prefix):
@@ -511,8 +511,8 @@ with rank_col:
     st.write("")
     st.divider()
 
-    # [우측 하단] 시장 자금 주도주 랭킹
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#f59e0b; margin-bottom:6px;'>🔥 시장 자금 주도주 랭킹 TOP 10</div>", unsafe_allow_html=True)
+    # [우측 하단] 시장 자금 주도주 TOP 10
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#f59e0b; margin-bottom:6px;'>🔥 시장 자금 주도주 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
 
     def render_lead_buttons(df_rank, prefix):
@@ -533,7 +533,7 @@ with rank_col:
         render_lead_buttons(bot10_lead, "lead_bot")
 
 
-# 2. 왼쪽 메인 정밀 분석 (연관 종목 드롭다운 및 실전 타점)
+# 2. 왼쪽 메인 정밀 분석
 with main_col:
     col_s1, col_s2 = st.columns([4, 1])
     default_search = st.session_state.selected_stock
@@ -545,7 +545,7 @@ with main_col:
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
 
-    # 검색어 입력 시 연관 종목 드롭다운 박스 노출 (토스 스타일)
+    # 검색어 입력 시 연관 종목 드롭다운 박스 노출
     if search_input.strip() and search_input != st.session_state.selected_stock:
         sim_df = search_similar_stocks(search_input)
         if not sim_df.empty:
@@ -654,27 +654,39 @@ with main_col:
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
                     # =========================================================
-                    # [개선된 실전 매매 타점 알고리즘 (현재가 -1% 단순 공식 완전 폐기)]
+                    # [5일선 및 매물대 지지/저항 기반 정밀 매매 타점 산출]
                     # =========================================================
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
 
-                    # 1차 진입가: 5일선 눌림목 또는 당일 시가 기준 지지선 (-2.5% ~ -4% 실질 눌림목)
-                    if latest_price > ma5_val:
-                        entry_1 = round(max(ma5_val, latest_price * 0.97), -2)
-                    else:
-                        entry_1 = round(latest_price * 0.965, -2)
-
-                    # 2차 진입가: 20일 이동평균선 또는 주요 지지선
-                    if (latest_price - ma20_val) / ma20_val > 0.15:
-                        entry_2 = round(entry_1 * 0.95, -2)
-                    else:
-                        entry_2 = round(ma20_val, -2)
+                    # 1. 매물대 지지선 도출 (현재가 아래에서 가장 거래량이 집중된 매물대)
+                    bin_centers = 0.5 * (bins[:-1] + bins[1:])
+                    support_bins = [
+                        (center, count) for center, count in zip(bin_centers, v_counts)
+                        if center <= latest_price * 0.99
+                    ]
                     
-                    if entry_2 >= entry_1:
-                        entry_2 = round(entry_1 * 0.95, -2)
+                    if support_bins:
+                        # 하단 매물대 중 최다 거래량 매물대 중심 가격
+                        poc_support = max(support_bins, key=lambda x: x[1])[0]
+                    else:
+                        poc_support = latest_price * 0.95
 
-                    # 목표가
+                    # 2. 1차 진입선: 5일선 지지선 기준
+                    if latest_price >= ma5_val:
+                        entry_1 = round(ma5_val, -2)
+                    else:
+                        # 주가가 5일선 아래에 위치할 경우 5일선 회복 근접선 또는 2% 눌림 지지선
+                        entry_1 = round(min(ma5_val, latest_price * 0.98), -2)
+
+                    # 3. 2차 진입선: 매물대 핵심 지지선 및 20일선 복합 지지 구간
+                    candidate_entry2 = min(poc_support, ma20_val)
+                    if candidate_entry2 < entry_1 * 0.99:
+                        entry_2 = round(candidate_entry2, -2)
+                    else:
+                        entry_2 = round(entry_1 * 0.96, -2)
+
+                    # 4. 1·2차 목표가 산출 (매물대 상단 저항선 및 고점 반영)
                     t1_calc = max(high_20 * 1.02, latest_price * 1.06)
                     target_1 = round(t1_calc, -2)
 
@@ -683,11 +695,9 @@ with main_col:
                     else:
                         target_2 = round(target_1 * 1.08, -2)
 
-                    # 손절 기준선
-                    if (latest_price - low_20) / low_20 > 0.20:
-                        stop_loss = round(min(today_open * 0.95, latest_price * 0.92), -2)
-                    else:
-                        stop_loss = round(max(low_20 * 0.98, latest_price - (atr_val * 1.8)), -2)
+                    # 5. 정밀 손절선 산출 (핵심 매물대 하단 및 20일 저점 이탈선)
+                    stop_candidate = min(entry_2 * 0.96, low_20 * 0.98, latest_price - (atr_val * 1.8))
+                    stop_loss = round(max(stop_candidate, latest_price * 0.91), -2)
 
                     target_grid_html = (
                         f'<div class="score-container">'
@@ -695,8 +705,8 @@ with main_col:
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
                         f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
-                        f'<div class="target-item"><div class="target-title">1차 진입 (눌림목 지지)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (추세 지지선)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">1차 진입 (5일선 지지)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 진입 (매물대 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
@@ -726,6 +736,9 @@ with main_col:
 
                         fig.add_trace(go.Candlestick(
                             x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="주가"
+                        ), row=1, col=1)
+                        fig.add_trace(go.Scatter(
+                            x=df.index, y=df['MA5'], line=dict(color='#f59e0b', width=1.1, dash='dot'), name="5일선"
                         ), row=1, col=1)
                         fig.add_trace(go.Scatter(
                             x=df.index, y=df['MA20'], line=dict(color='#38bdf8', width=1.3), name="20일선"
@@ -801,4 +814,4 @@ with main_col:
                         for item in news_items:
                             st.markdown(f"- [{item['title']}]({item['link']})")
     else:
-        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **점수 랭킹 또는 주도주 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
+        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **종합점수 랭킹 또는 주도주 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
