@@ -278,7 +278,7 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [정밀 퀀트 채점 엔진 (100점 만점)]
+# [기관 공인 다중 팩터 정밀 퀀트 채점 엔진 (100점 만점)]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -433,7 +433,7 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [우측 상단 종합점수 TOP10 & 우측 하단 시장 주도주 연산 엔진]
+# [우측 상단 종합점수 TOP 10 & 우측 하단 주도주 연산 엔진]
 # ====================================================
 @st.cache_data(ttl=600)
 def generate_dual_market_rankings():
@@ -483,12 +483,12 @@ st.markdown(
 
 main_col, rank_col = st.columns([7, 3])
 
-# 1. 오른쪽 시장 랭킹 (상단: 종합점수 상위 TOP 10 / 하단: 시장 자금 주도주 TOP 10)
+# 1. 오른쪽 시장 랭킹
 with rank_col:
     top10_score, bot10_score, top10_lead, bot10_lead = generate_dual_market_rankings()
 
-    # [우측 상단] 종합점수 상위 TOP 10
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 상위 TOP 10</div>", unsafe_allow_html=True)
+    # [우측 상단] 종합점수 TOP 10
+    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 상위 우량주", "🚨 하위 주의주"])
 
     def render_score_buttons(df_rank, prefix):
@@ -511,7 +511,7 @@ with rank_col:
     st.write("")
     st.divider()
 
-    # [우측 하단] 시장 자금 주도주 TOP 10
+    # [우측 하단] 시장 주도주 랭킹
     st.markdown("<div style='font-size:14px; font-weight:700; color:#f59e0b; margin-bottom:6px;'>🔥 시장 자금 주도주 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
 
@@ -545,7 +545,6 @@ with main_col:
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
 
-    # 검색어 입력 시 연관 종목 드롭다운 박스 노출
     if search_input.strip() and search_input != st.session_state.selected_stock:
         sim_df = search_similar_stocks(search_input)
         if not sim_df.empty:
@@ -654,50 +653,41 @@ with main_col:
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
                     # =========================================================
-                    # [5일선 및 매물대 지지/저항 기반 정밀 매매 타점 산출]
+                    # [여의도 기관 트레이더 기준 정밀 진입 타점 알고리즘]
                     # =========================================================
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
 
-                    # 1. 매물대 지지선 도출 (현재가 아래에서 가장 거래량이 집중된 매물대)
-                    bin_centers = 0.5 * (bins[:-1] + bins[1:])
-                    support_bins = [
-                        (center, count) for center, count in zip(bin_centers, v_counts)
-                        if center <= latest_price * 0.99
-                    ]
-                    
-                    if support_bins:
-                        # 하단 매물대 중 최다 거래량 매물대 중심 가격
-                        poc_support = max(support_bins, key=lambda x: x[1])[0]
-                    else:
-                        poc_support = latest_price * 0.95
-
-                    # 2. 1차 진입선: 5일선 지지선 기준
+                    # 1차 진입선: 5일선 지지선 기준 (현재가 대비 -1.5% ~ -3% 내외 정밀 타점)
                     if latest_price >= ma5_val:
-                        entry_1 = round(ma5_val, -2)
+                        entry_1 = round(max(ma5_val, latest_price * 0.98), -2)
                     else:
-                        # 주가가 5일선 아래에 위치할 경우 5일선 회복 근접선 또는 2% 눌림 지지선
-                        entry_1 = round(min(ma5_val, latest_price * 0.98), -2)
+                        entry_1 = round(latest_price * 0.985, -2)
 
-                    # 3. 2차 진입선: 매물대 핵심 지지선 및 20일선 복합 지지 구간
-                    candidate_entry2 = min(poc_support, ma20_val)
-                    if candidate_entry2 < entry_1 * 0.99:
-                        entry_2 = round(candidate_entry2, -2)
+                    # 2차 진입선: 1차 진입선 아래 -3% ~ -5% 내외의 실전 분할 매수 지지선
+                    # (20일선이 너무 멀리 있으면 직근 단기 변동성 ATR 지지선 활용)
+                    if (entry_1 - ma20_val) / entry_1 > 0.08:
+                        entry_2 = round(entry_1 - (atr_val * 1.2), -2)
                     else:
+                        entry_2 = round(min(ma20_val, entry_1 * 0.96), -2)
+
+                    # 2차 진입선 안전장치 (1차보다 3~5% 낮게 안정적 고정)
+                    if entry_2 >= entry_1 or (entry_1 - entry_2) / entry_1 > 0.07:
                         entry_2 = round(entry_1 * 0.96, -2)
 
-                    # 4. 1·2차 목표가 산출 (매물대 상단 저항선 및 고점 반영)
-                    t1_calc = max(high_20 * 1.02, latest_price * 1.06)
+                    # 1차 목표가: 최근 단기 저항선 또는 +5~7%
+                    t1_calc = max(high_20 * 1.01, latest_price * 1.05)
                     target_1 = round(t1_calc, -2)
 
-                    if fund["목표주가"] and fund["목표주가"] > target_1 * 1.05:
+                    # 2차 목표가: 1차 목표가 대비 +7~10% 추세 확장
+                    if fund["목표주가"] and fund["목표주가"] > target_1 * 1.04:
                         target_2 = round(fund["목표주가"], -2)
                     else:
                         target_2 = round(target_1 * 1.08, -2)
 
-                    # 5. 정밀 손절선 산출 (핵심 매물대 하단 및 20일 저점 이탈선)
-                    stop_candidate = min(entry_2 * 0.96, low_20 * 0.98, latest_price - (atr_val * 1.8))
-                    stop_loss = round(max(stop_candidate, latest_price * 0.91), -2)
+                    # 정밀 손절선: 2차 진입선 -3.5% 또는 ATR 1.8배수 지지선
+                    stop_candidate = min(entry_2 * 0.965, latest_price - (atr_val * 1.8))
+                    stop_loss = round(max(stop_candidate, latest_price * 0.92), -2)
 
                     target_grid_html = (
                         f'<div class="score-container">'
@@ -706,7 +696,7 @@ with main_col:
                         f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
                         f'<div class="target-item"><div class="target-title">1차 진입 (5일선 지지)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (매물대 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 진입 (눌림목 분할)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
@@ -715,7 +705,7 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "종합 팩터 채점표", "뉴스 브리핑"])
+                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "종합 채점표", "뉴스 브리핑"])
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
