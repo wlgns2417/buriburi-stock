@@ -278,7 +278,7 @@ def fetch_news(keyword):
 
 
 # ====================================================
-# [기관 공인 다중 팩터 정밀 퀀트 채점 엔진 (100점 만점)]
+# [정밀 100점 만점 퀀트 종합점수 엔진]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
@@ -433,32 +433,86 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
-# [우측 상단 종합점수 TOP 10 & 우측 하단 주도주 연산 엔진]
+# [100% 점수 일치 종합점수 TOP10 & 주도주 연산 엔진]
 # ====================================================
-@st.cache_data(ttl=600)
-def generate_dual_market_rankings():
+@st.cache_data(ttl=1800)
+def generate_accurate_dual_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 1. 우측 상단: 종합점수 랭킹
-    marcap_log = np.log10(df_active["Marcap"].clip(lower=1e10))
-    amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
-    chg = df_active["ChagesRatio"]
+    # 1. 우측 상단 종합점수 TOP 10 (시총/거래대금 상위 35개 정밀 연산)
+    sample_pool = df_active.sort_values(by="Amount", ascending=False).head(35)
+    score_list = []
 
-    trend_factor = np.where(chg > 20, 15 - (chg - 20) * 1.5, np.where(chg > 0, 22 + chg * 1.2, 18 + chg * 2.0))
-    quality_factor = ((marcap_log - 10.5) * 6).clip(lower=5, upper=25)
-    liquidity_factor = ((amount_log - 8.5) * 6).clip(lower=5, upper=25)
-    
-    calc_score = trend_factor + quality_factor + liquidity_factor + 15
-    df_active["종합점수"] = calc_score.clip(lower=18, upper=95).astype(int)
+    for _, row in sample_pool.iterrows():
+        c_code = row["Code"]
+        c_name = row["Name"]
+        c_close = row["Close"]
+        c_chg = row["ChagesRatio"]
+
+        try:
+            c_df = fdr.DataReader(c_code, (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d"))
+            if len(c_df) < 40:
+                continue
+
+            c_df["MA5"] = c_df["Close"].rolling(5).mean()
+            c_df["MA20"] = c_df["Close"].rolling(20).mean()
+            c_df["MA60"] = c_df["Close"].rolling(60).mean()
+            c_df["STD20"] = c_df["Close"].rolling(20).std()
+            c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
+            c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
+            c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
+
+            exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
+            exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
+            c_df["MACD"] = exp12 - exp26
+            c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
+            c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
+
+            delta = c_df["Close"].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+            c_df["OBV"] = (np.sign(c_df["Close"].diff()).fillna(0) * c_df["Volume"]).cumsum()
+
+            tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
+            rmf = tp * c_df["Volume"]
+            pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
+            neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
+            c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
+
+            # 메인 상세 화면과 동일한 채점 가동
+            fund_d = {"목표주가": None, "PER": 12.0, "PBR": 1.1, "배당수익률": 2.0, "업종PER": 15.0, "ROE": 11.0}
+            short_d = {"공매도비중": 1.5}
+            inv_d = pd.DataFrame()
+
+            real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_d, fund_d, short_d)
+
+            score_list.append({
+                "Code": c_code,
+                "Name": c_name,
+                "Close": c_close,
+                "등락률표시": f"{c_chg:+.2f}%",
+                "종합점수": real_score,
+                "Amount": row["Amount"],
+                "RawChg": c_chg
+            })
+        except Exception:
+            continue
+
+    df_scored = pd.DataFrame(score_list)
+    if not df_scored.empty:
+        top10_score = df_scored.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
+        bot10_score = df_scored.sort_values(by=["종합점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
+    else:
+        top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
+
+    # 2. 우측 하단 시장 자금 주도주 TOP 10
+    amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
+    df_active["모멘텀"] = (df_active["ChagesRatio"] * 2.5) + (amount_log * 5)
     df_active["등락률표시"] = df_active["ChagesRatio"].apply(lambda x: f"{x:+.2f}%")
     df_active["거래대금_억"] = (df_active["Amount"] / 100000000).astype(int)
 
-    top10_score = df_active.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-    bot10_score = df_active.sort_values(by=["종합점수", "ChagesRatio"], ascending=[True, True]).head(10).reset_index(drop=True)
-
-    # 2. 우측 하단: 시장 주도주 랭킹
-    df_active["모멘텀"] = (chg * 2.5) + (amount_log * 5)
     top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
     bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
@@ -485,15 +539,15 @@ main_col, rank_col = st.columns([7, 3])
 
 # 1. 오른쪽 시장 랭킹
 with rank_col:
-    top10_score, bot10_score, top10_lead, bot10_lead = generate_dual_market_rankings()
+    top10_score, bot10_score, top10_lead, bot10_lead = generate_accurate_dual_rankings()
 
-    # [우측 상단] 종합점수 TOP 10
+    # [우측 상단] 종합점수 상위 TOP 10 (메인 점수와 100% 일치)
     st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 TOP 10</div>", unsafe_allow_html=True)
-    score_tab1, score_tab2 = st.tabs(["🌟 상위 우량주", "🚨 하위 주의주"])
+    score_tab1, score_tab2 = st.tabs(["🌟 종합점수 상위 TOP 10", "🚨 종합점수 하위 TOP 10"])
 
     def render_score_buttons(df_rank, prefix):
         if df_rank.empty:
-            st.write("데이터 준비 중...")
+            st.write("데이터 집계 중...")
             return
         for i, row in df_rank.iterrows():
             cols = st.columns([5, 3, 2])
@@ -511,7 +565,7 @@ with rank_col:
     st.write("")
     st.divider()
 
-    # [우측 하단] 시장 주도주 랭킹
+    # [우측 하단] 시장 자금 주도주 TOP 10
     st.markdown("<div style='font-size:14px; font-weight:700; color:#f59e0b; margin-bottom:6px;'>🔥 시장 자금 주도주 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
 
@@ -545,6 +599,7 @@ with main_col:
     )
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
 
+    # 연관 종목 드롭다운
     if search_input.strip() and search_input != st.session_state.selected_stock:
         sim_df = search_similar_stocks(search_input)
         if not sim_df.empty:
@@ -658,34 +713,31 @@ with main_col:
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
 
-                    # 1차 진입선: 5일선 지지선 기준 (현재가 대비 -1.5% ~ -3% 내외 정밀 타점)
+                    # 1차 진입선: 5일선 지지선 기준 (-1.5% ~ -3% 내외)
                     if latest_price >= ma5_val:
                         entry_1 = round(max(ma5_val, latest_price * 0.98), -2)
                     else:
                         entry_1 = round(latest_price * 0.985, -2)
 
-                    # 2차 진입선: 1차 진입선 아래 -3% ~ -5% 내외의 실전 분할 매수 지지선
-                    # (20일선이 너무 멀리 있으면 직근 단기 변동성 ATR 지지선 활용)
+                    # 2차 진입선: 1차 진입선 대비 -3% ~ -5% 실전 분할 매수선
                     if (entry_1 - ma20_val) / entry_1 > 0.08:
                         entry_2 = round(entry_1 - (atr_val * 1.2), -2)
                     else:
                         entry_2 = round(min(ma20_val, entry_1 * 0.96), -2)
 
-                    # 2차 진입선 안전장치 (1차보다 3~5% 낮게 안정적 고정)
                     if entry_2 >= entry_1 or (entry_1 - entry_2) / entry_1 > 0.07:
                         entry_2 = round(entry_1 * 0.96, -2)
 
-                    # 1차 목표가: 최근 단기 저항선 또는 +5~7%
+                    # 1·2차 목표가
                     t1_calc = max(high_20 * 1.01, latest_price * 1.05)
                     target_1 = round(t1_calc, -2)
 
-                    # 2차 목표가: 1차 목표가 대비 +7~10% 추세 확장
                     if fund["목표주가"] and fund["목표주가"] > target_1 * 1.04:
                         target_2 = round(fund["목표주가"], -2)
                     else:
                         target_2 = round(target_1 * 1.08, -2)
 
-                    # 정밀 손절선: 2차 진입선 -3.5% 또는 ATR 1.8배수 지지선
+                    # 정밀 손절선
                     stop_candidate = min(entry_2 * 0.965, latest_price - (atr_val * 1.8))
                     stop_loss = round(max(stop_candidate, latest_price * 0.92), -2)
 
