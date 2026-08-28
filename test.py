@@ -292,6 +292,35 @@ def fetch_news(keyword):
 
 
 # ====================================================
+# [추세선 수학 모델 기반 지지 가격 산출 함수]
+# ====================================================
+def calculate_trend_support_price(df):
+    lows = df["Low"].values
+    highs = df["High"].values
+    n = len(df)
+    lookback = min(60, n)
+    start_idx = n - lookback
+    
+    sub_lows = lows[start_idx:]
+    min_idx_rel = int(np.argmin(sub_lows[:lookback - 8]))
+    p1_idx = start_idx + min_idx_rel
+    p1_val = lows[p1_idx]
+    
+    best_up_slope = None
+    for i in range(p1_idx + 5, n - 1):
+        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
+            slope = (lows[i] - p1_val) / (i - p1_idx)
+            if slope > 0:
+                best_up_slope = slope
+                break
+                
+    if best_up_slope is not None:
+        trend_val = p1_val + best_up_slope * (n - 1 - p1_idx)
+        return trend_val
+    return None
+
+
+# ====================================================
 # [정밀 100점 만점 퀀트 종합점수 엔진]
 # ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
@@ -613,7 +642,6 @@ with main_col:
     analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
     refresh_btn = col_s3.button("⚡ 시세 갱신", use_container_width=True)
 
-    # 시세 갱신 시 캐시 메모리를 리셋하여 우측 랭킹 시세까지 실시간 갱신
     if refresh_btn:
         st.cache_data.clear()
         st.rerun()
@@ -666,7 +694,6 @@ with main_col:
                     raw_latest = df["Close"].iloc[-1]
                     prev_price = df["Close"].iloc[-2]
                     
-                    # 초경량 실시간 현재가 단일 패칭 (0.05초)
                     latest_price = fetch_realtime_price(code, raw_latest)
                     df.at[df.index[-1], "Close"] = latest_price
                     today_open = df["Open"].iloc[-1]
@@ -731,27 +758,33 @@ with main_col:
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
                     # =========================================================
-                    # [실시간 현재가 기반 여의도 기관 트레이더 정밀 타점 산출]
+                    # [추세선 및 이평선 Confluence 기반 정밀 1·2차 진입선 산출]
                     # =========================================================
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
+                    trend_support = calculate_trend_support_price(df)
 
-                    # 1차 진입선: 5일선 지지선 기준 (-1.5% ~ -3% 내외)
-                    if latest_price >= ma5_val:
-                        entry_1 = round(max(ma5_val, latest_price * 0.98), -2)
+                    # 1. 1차 진입선: 상승 추세선 및 5일/20일 수렴 지지선 탐색
+                    candidates_1 = []
+                    if trend_support is not None and (latest_price * 0.92 <= trend_support <= latest_price * 0.985):
+                        candidates_1.append(trend_support)
+                    if latest_price > ma5_val:
+                        candidates_1.append(ma5_val)
+                    candidates_1.append(latest_price * 0.965)  # 최소 -3.5% 실전 눌림 기본값
+
+                    # 현재가와 너무 붙지 않도록 (-2.5% ~ -5% 사이의 지지선 확정)
+                    calc_entry1 = min(candidates_1)
+                    if (latest_price - calc_entry1) / latest_price < 0.025:
+                        calc_entry1 = latest_price * 0.965
+                    entry_1 = round(calc_entry1, -2)
+
+                    # 2. 2차 진입선: 20일 생명선 및 핵심 지지 매물대 (-5% ~ -8% 구간)
+                    if ma20_val < entry_1 * 0.98:
+                        entry_2 = round(max(ma20_val, entry_1 * 0.95), -2)
                     else:
-                        entry_1 = round(latest_price * 0.985, -2)
+                        entry_2 = round(entry_1 * 0.95, -2)
 
-                    # 2차 진입선: 1차 진입선 대비 -3% ~ -5% 실전 분할 매수선
-                    if (entry_1 - ma20_val) / entry_1 > 0.08:
-                        entry_2 = round(entry_1 - (atr_val * 1.2), -2)
-                    else:
-                        entry_2 = round(min(ma20_val, entry_1 * 0.96), -2)
-
-                    if entry_2 >= entry_1 or (entry_1 - entry_2) / entry_1 > 0.07:
-                        entry_2 = round(entry_1 * 0.96, -2)
-
-                    # 1·2차 목표가
+                    # 3. 1·2차 목표가
                     t1_calc = max(high_20 * 1.01, latest_price * 1.05)
                     target_1 = round(t1_calc, -2)
 
@@ -760,9 +793,9 @@ with main_col:
                     else:
                         target_2 = round(target_1 * 1.08, -2)
 
-                    # 정밀 손절선
+                    # 4. 정밀 손절선 (2차 진입선 이탈 또는 ATR 1.8배수 지지선)
                     stop_candidate = min(entry_2 * 0.965, latest_price - (atr_val * 1.8))
-                    stop_loss = round(max(stop_candidate, latest_price * 0.92), -2)
+                    stop_loss = round(max(stop_candidate, latest_price * 0.91), -2)
 
                     target_grid_html = (
                         f'<div class="score-container">'
@@ -770,8 +803,8 @@ with main_col:
                         f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
                         f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
                         f'<div class="target-grid">'
-                        f'<div class="target-item"><div class="target-title">1차 진입 (5일선 지지)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (눌림목 분할)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">1차 진입 (추세·5일선 눌림)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
+                        f'<div class="target-item"><div class="target-title">2차 진입 (20일선 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
                         f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
