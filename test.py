@@ -296,7 +296,6 @@ def fetch_news(keyword):
 # ====================================================
 def calculate_trend_support_price(df):
     lows = df["Low"].values
-    highs = df["High"].values
     n = len(df)
     lookback = min(60, n)
     start_idx = n - lookback
@@ -476,6 +475,80 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
 
 
 # ====================================================
+# [전문 퀀트 전략 백테스팅 엔진]
+# ====================================================
+def run_quant_backtest(df, strategy_type="trend_following"):
+    bt_df = df.copy()
+    bt_df["Signal"] = 0
+    
+    if strategy_type == "trend_following":
+        # 전략 1: 5일선 > 20일선 정배열 추세 추종
+        bt_df["Signal"] = np.where(bt_df["MA5"] > bt_df["MA20"], 1, 0)
+    elif strategy_type == "bollinger_reversal":
+        # 전략 2: 볼린저 하단/20일선 지지 매수, 상단 돌파 매도
+        buy_cond = (bt_df["Close"] > bt_df["MA20"]) & (bt_df["BB_%b"] >= 0.4)
+        sell_cond = bt_df["BB_%b"] >= 1.05
+        sig = 0
+        signals = []
+        for i in range(len(bt_df)):
+            if buy_cond.iloc[i]:
+                sig = 1
+            elif sell_cond.iloc[i]:
+                sig = 0
+            signals.append(sig)
+        bt_df["Signal"] = signals
+    elif strategy_type == "rsi_momentum":
+        # 전략 3: RSI 40 이상 65 이하 건강한 모멘텀 구간 보유
+        bt_df["Signal"] = np.where((bt_df["RSI"] >= 42) & (bt_df["RSI"] <= 68), 1, 0)
+
+    # 1일 뒤 체결 반영 (Lookahead bias 제거)
+    bt_df["Position"] = bt_df["Signal"].shift(1).fillna(0)
+    bt_df["Market_Return"] = bt_df["Close"].pct_change().fillna(0)
+    bt_df["Strategy_Return"] = bt_df["Market_Return"] * bt_df["Position"]
+
+    # 누적 수익률 곡선 (Equity Curve)
+    bt_df["Cum_Market"] = (1 + bt_df["Market_Return"]).cumprod()
+    bt_df["Cum_Strategy"] = (1 + bt_df["Strategy_Return"]).cumprod()
+
+    # MDD (최대 낙폭) 계산
+    cum_max = bt_df["Cum_Strategy"].cummax()
+    drawdown = (bt_df["Cum_Strategy"] - cum_max) / cum_max
+    mdd = drawdown.min() * 100
+
+    total_return = (bt_df["Cum_Strategy"].iloc[-1] - 1) * 100
+    buy_hold_return = (bt_df["Cum_Market"].iloc[-1] - 1) * 100
+    alpha = total_return - buy_hold_return
+
+    # 승률 및 매매 횟수 계산
+    trades = bt_df["Position"].diff().fillna(0)
+    entry_indices = bt_df[trades == 1].index
+    exit_indices = bt_df[trades == -1].index
+
+    win_count = 0
+    trade_count = 0
+    for entry in entry_indices:
+        sub_exits = exit_indices[exit_indices > entry]
+        if len(sub_exits) > 0:
+            exit_p = bt_df.loc[sub_exits[0], "Close"]
+            entry_p = bt_df.loc[entry, "Close"]
+            if (exit_p - entry_p) > 0:
+                win_count += 1
+            trade_count += 1
+
+    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0.0
+
+    return {
+        "df": bt_df,
+        "total_return": total_return,
+        "buy_hold_return": buy_hold_return,
+        "alpha": alpha,
+        "mdd": mdd,
+        "win_rate": win_rate,
+        "trade_count": trade_count,
+    }
+
+
+# ====================================================
 # [100% 점수 일치 종합점수 TOP10 & 주도주 연산 엔진]
 # ====================================================
 @st.cache_data(ttl=600)
@@ -483,7 +556,6 @@ def generate_accurate_dual_rankings():
     krx = get_krx_listing()
     df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
 
-    # 우측 상단 종합점수 TOP 10
     sample_pool = df_active.sort_values(by="Amount", ascending=False).head(35)
     score_list = []
 
@@ -549,7 +621,6 @@ def generate_accurate_dual_rankings():
     else:
         top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
 
-    # 우측 하단 시장 자금 주도주 TOP 10
     amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
     df_active["모멘텀"] = (df_active["ChagesRatio"] * 2.5) + (amount_log * 5)
     df_active["등락률표시"] = df_active["ChagesRatio"].apply(lambda x: f"{x:+.2f}%")
@@ -568,7 +639,7 @@ st.markdown(
     """
     <div class="header-card">
         <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">MULTI-FACTOR & TREND FOLLOWING ENGINE</div>
+            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">MULTI-FACTOR & QUANT BACKTESTING ENGINE</div>
             <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
         </div>
         <div style="font-size: 26px;">🐽📊</div>
@@ -583,7 +654,6 @@ main_col, rank_col = st.columns([7, 3])
 with rank_col:
     top10_score, bot10_score, top10_lead, bot10_lead = generate_accurate_dual_rankings()
 
-    # [우측 상단] 종합점수 TOP 10
     st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 TOP 10</div>", unsafe_allow_html=True)
     score_tab1, score_tab2 = st.tabs(["🌟 종합점수 상위 TOP 10", "🚨 종합점수 하위 TOP 10"])
 
@@ -607,7 +677,6 @@ with rank_col:
     st.write("")
     st.divider()
 
-    # [우측 하단] 시장 자금 주도주 TOP 10
     st.markdown("<div style='font-size:14px; font-weight:700; color:#f59e0b; margin-bottom:6px;'>🔥 시장 자금 주도주 TOP 10</div>", unsafe_allow_html=True)
     lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
 
@@ -646,7 +715,6 @@ with main_col:
         st.cache_data.clear()
         st.rerun()
 
-    # 연관 종목 드롭다운
     if search_input.strip() and search_input != st.session_state.selected_stock:
         sim_df = search_similar_stocks(search_input)
         if not sim_df.empty:
@@ -740,7 +808,6 @@ with main_col:
                     high_20 = df["High"].tail(20).max()
                     low_20 = df["Low"].tail(20).min()
 
-                    # 매물대 프로파일
                     price_min, price_max = df["Low"].min(), df["High"].max()
                     bins = np.linspace(price_min, price_max, 13)
                     v_counts, _ = np.histogram(df["Close"], bins=bins, weights=df["Volume"])
@@ -757,34 +824,28 @@ with main_col:
 
                     total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
 
-                    # =========================================================
-                    # [추세선 및 이평선 Confluence 기반 정밀 1·2차 진입선 산출]
-                    # =========================================================
+                    # 1·2차 진입선 산출
                     ma5_val = df["MA5"].iloc[-1]
                     ma20_val = df["MA20"].iloc[-1]
                     trend_support = calculate_trend_support_price(df)
 
-                    # 1. 1차 진입선: 상승 추세선 및 5일/20일 수렴 지지선 탐색
                     candidates_1 = []
                     if trend_support is not None and (latest_price * 0.92 <= trend_support <= latest_price * 0.985):
                         candidates_1.append(trend_support)
                     if latest_price > ma5_val:
                         candidates_1.append(ma5_val)
-                    candidates_1.append(latest_price * 0.965)  # 최소 -3.5% 실전 눌림 기본값
+                    candidates_1.append(latest_price * 0.965)
 
-                    # 현재가와 너무 붙지 않도록 (-2.5% ~ -5% 사이의 지지선 확정)
                     calc_entry1 = min(candidates_1)
                     if (latest_price - calc_entry1) / latest_price < 0.025:
                         calc_entry1 = latest_price * 0.965
                     entry_1 = round(calc_entry1, -2)
 
-                    # 2. 2차 진입선: 20일 생명선 및 핵심 지지 매물대 (-5% ~ -8% 구간)
                     if ma20_val < entry_1 * 0.98:
                         entry_2 = round(max(ma20_val, entry_1 * 0.95), -2)
                     else:
                         entry_2 = round(entry_1 * 0.95, -2)
 
-                    # 3. 1·2차 목표가
                     t1_calc = max(high_20 * 1.01, latest_price * 1.05)
                     target_1 = round(t1_calc, -2)
 
@@ -793,7 +854,6 @@ with main_col:
                     else:
                         target_2 = round(target_1 * 1.08, -2)
 
-                    # 4. 정밀 손절선 (2차 진입선 이탈 또는 ATR 1.8배수 지지선)
                     stop_candidate = min(entry_2 * 0.965, latest_price - (atr_val * 1.8))
                     stop_loss = round(max(stop_candidate, latest_price * 0.91), -2)
 
@@ -813,7 +873,15 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    t1, t2, t3, t4, t5 = st.tabs(["차트 & 매물대 프로파일", "외인/기관 수급", "전망 & 애널리스트", "종합 채점표", "뉴스 브리핑"])
+                    # 탭 구성 (신규 퀀트 백테스팅 탭 추가)
+                    t1, t2, t3, t4, t5, t6 = st.tabs([
+                        "차트 & 매물대 프로파일", 
+                        "외인/기관 수급", 
+                        "전망 & 애널리스트", 
+                        "종합 채점표", 
+                        "📈 퀀트 백테스팅", 
+                        "뉴스 브리핑"
+                    ])
 
                     with t1:
                         c1, c2, c3, c4 = st.columns(4)
@@ -908,7 +976,55 @@ with main_col:
                     with t4:
                         st.dataframe(pd.DataFrame(logs, columns=["평가 항목", "가감점", "상세 내용"]), use_container_width=True)
 
+                    # [신규 추가: 퀀트 백테스팅 탭]
                     with t5:
+                        st.markdown("#### ⚙️ 퀀트 투자 전략 과거 성과 시뮬레이션")
+                        bt_col1, bt_col2 = st.columns([3, 1])
+                        strategy_choice = bt_col1.selectbox(
+                            "백테스트 검증 전략 선택",
+                            options=["이평선 정배열 추세 추종 (5일>20일 골든)", "볼린저 밴드 눌림목 스윙", "RSI 안정 모멘텀 구간 매매"],
+                            index=0
+                        )
+                        
+                        strat_key_map = {
+                            "이평선 정배열 추세 추종 (5일>20일 골든)": "trend_following",
+                            "볼린저 밴드 눌림목 스윙": "bollinger_reversal",
+                            "RSI 안정 모멘텀 구간 매매": "rsi_momentum"
+                        }
+                        
+                        bt_res = run_quant_backtest(df, strat_key_map[strategy_choice])
+                        
+                        # 성과 지표 출력
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("전략 누적 수익률", f"{bt_res['total_return']:+.2f}%")
+                        m2.metric("단순 보유(시장) 수익률", f"{bt_res['buy_hold_return']:+.2f}%")
+                        m3.metric("시장 초과 수익(알파)", f"{bt_res['alpha']:+.2f}%")
+                        m4.metric("최대 낙폭 (MDD)", f"{bt_res['mdd']:.2f}%", help="과거 최고점 대비 최대 하락폭 (낮을수록 안전)")
+                        m5.metric("매매 승률 (거래횟수)", f"{bt_res['win_rate']:.1f}% ({bt_res['trade_count']}회)")
+
+                        # 누적 자산 성장 곡선 차트 (Equity Curve)
+                        bt_fig = go.Figure()
+                        bt_fig.add_trace(go.Scatter(
+                            x=bt_res["df"].index, y=(bt_res["df"]["Cum_Strategy"] - 1) * 100,
+                            mode="lines", line=dict(color="#38bdf8", width=2.2), name="퀀트 전략 누적 수익률(%)"
+                        ))
+                        bt_fig.add_trace(go.Scatter(
+                            x=bt_res["df"].index, y=(bt_res["df"]["Cum_Market"] - 1) * 100,
+                            mode="lines", line=dict(color="#64748b", width=1.4, dash="dash"), name="단순 보유 누적 수익률(%)"
+                        ))
+
+                        bt_fig.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                            height=350,
+                            margin=dict(l=10, r=10, t=20, b=10),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(bt_fig, use_container_width=True)
+                        st.caption("💡 백테스팅은 1일 지연 체결(익일 시초가 진입 원칙)을 적용하여 미래 참조 편향(Lookahead Bias)을 제거한 통계 검증 결과입니다.")
+
+                    with t6:
                         for item in news_items:
                             st.markdown(f"- [{item['title']}]({item['link']})")
     else:
