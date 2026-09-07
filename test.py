@@ -107,14 +107,28 @@ if "selected_stock" not in st.session_state:
     st.session_state.selected_stock = ""
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=900)
 def get_krx_listing():
-    return fdr.StockListing("KRX")
+    try:
+        df = fdr.StockListing("KRX")
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    try:
+        df = fdr.StockListing("KOSPI")
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["Code", "Name", "Close", "ChangesRatio", "Volume", "Amount", "Marcap"])
 
 
 def resolve_stock_code(query):
     query = query.strip()
     krx = get_krx_listing()
+    if krx.empty:
+        return (query, query) if query.isdigit() else (None, None)
     if query.isdigit():
         matched = krx[krx["Code"] == query]
         if not matched.empty:
@@ -123,7 +137,7 @@ def resolve_stock_code(query):
     matched = krx[krx["Name"] == query]
     if not matched.empty:
         return matched.iloc[0]["Code"], query
-    matched_part = krx[krx["Name"].str.contains(query, case=False, na=False)]
+    matched_part = krx[krx["Name"].astype(str).str.contains(query, case=False, na=False)]
     if not matched_part.empty:
         return matched_part.iloc[0]["Code"], matched_part.iloc[0]["Name"]
     return None, None
@@ -148,45 +162,51 @@ def search_similar_stocks(query):
     if not query:
         return pd.DataFrame()
     krx = get_krx_listing()
+    if krx.empty:
+        return pd.DataFrame()
     if query.isdigit():
-        matched = krx[krx["Code"].str.startswith(query)].copy()
+        matched = krx[krx["Code"].astype(str).str.startswith(query)].copy()
     else:
-        matched = krx[krx["Name"].str.contains(query, case=False, na=False)].copy()
+        matched = krx[krx["Name"].astype(str).str.contains(query, case=False, na=False)].copy()
     
     if matched.empty:
         return pd.DataFrame()
     
-    return matched.sort_values(by="Amount", ascending=False).head(5)
+    amt_col = "Amount" if "Amount" in matched.columns else "Volume"
+    return matched.sort_values(by=amt_col, ascending=False).head(5)
 
 
 def fetch_investor_naver(code):
     url = f"https://finance.naver.com/item/frgn.naver?code={code}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    res = requests.get(url, headers=headers, timeout=5)
-    soup = BeautifulSoup(res.text, "html.parser")
     rows = []
-    tables = soup.select("table.type2")
-    if len(tables) >= 2:
-        for tr in tables[1].select("tr"):
-            tds = tr.select("td")
-            if len(tds) >= 9 and tds[0].text.strip().replace(".", "").isdigit():
-                try:
-                    date = tds[0].text.strip()
-                    close = int(tds[1].text.strip().replace(",", ""))
-                    inst_net = int(tds[5].text.strip().replace(",", ""))
-                    for_net = int(tds[6].text.strip().replace(",", ""))
-                    for_rate = float(tds[8].text.strip().replace("%", "").replace(",", ""))
-                    rows.append({
-                        "날짜": date,
-                        "종가": close,
-                        "기관순매수": inst_net,
-                        "외인순매수": for_net,
-                        "기관순매수금액": (inst_net * close) / 100000000,
-                        "외인순매수금액": (for_net * close) / 100000000,
-                        "외인보유율": for_rate,
-                    })
-                except Exception:
-                    continue
+    try:
+        res = requests.get(url, headers=headers, timeout=4)
+        soup = BeautifulSoup(res.text, "html.parser")
+        tables = soup.select("table.type2")
+        if len(tables) >= 2:
+            for tr in tables[1].select("tr"):
+                tds = tr.select("td")
+                if len(tds) >= 9 and tds[0].text.strip().replace(".", "").isdigit():
+                    try:
+                        date = tds[0].text.strip()
+                        close = int(tds[1].text.strip().replace(",", ""))
+                        inst_net = int(tds[5].text.strip().replace(",", ""))
+                        for_net = int(tds[6].text.strip().replace(",", ""))
+                        for_rate = float(tds[8].text.strip().replace("%", "").replace(",", ""))
+                        rows.append({
+                            "날짜": date,
+                            "종가": close,
+                            "기관순매수": inst_net,
+                            "외인순매수": for_net,
+                            "기관순매수금액": (inst_net * close) / 100000000,
+                            "외인순매수금액": (for_net * close) / 100000000,
+                            "외인보유율": for_rate,
+                        })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
     return pd.DataFrame(rows)
 
 
@@ -198,7 +218,7 @@ def fetch_fundamental_and_consensus(code):
         "목표주가": None, "ROE": None, "기업개요": "기업 정보 준비 중", "리포트_목록": []
     }
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=4)
         soup = BeautifulSoup(res.text, "html.parser")
 
         per_tag = soup.select_one("#_per")
@@ -239,7 +259,7 @@ def fetch_fundamental_and_consensus(code):
                     break
 
         report_url = f"https://finance.naver.com/item/research.naver?code={code}"
-        res_rep = requests.get(report_url, headers=headers, timeout=5)
+        res_rep = requests.get(report_url, headers=headers, timeout=4)
         soup_rep = BeautifulSoup(res_rep.text, "html.parser")
         for tr in soup_rep.select("table.type2 tr")[2:7]:
             tds = tr.select("td")
@@ -260,7 +280,7 @@ def fetch_short_selling(code):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     short_data = {"공매도비중": 0.0, "공매도거래량": 0}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=4)
         soup = BeautifulSoup(res.text, "html.parser")
         table = soup.select("table.type2 tbody tr")
         for tr in table:
@@ -278,7 +298,7 @@ def fetch_news(keyword):
     url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+주식&hl=ko&gl=KR&ceid=KR:ko"
     news_list = []
     try:
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, timeout=4)
         soup = BeautifulSoup(res.content, "html.parser")
         for item in soup.find_all("item")[:5]:
             t = item.title.text if item.title else ""
@@ -291,37 +311,34 @@ def fetch_news(keyword):
     return news_list
 
 
-# ====================================================
-# [추세선 수학 모델 기반 지지 가격 산출 함수]
-# ====================================================
 def calculate_trend_support_price(df):
-    lows = df["Low"].values
-    n = len(df)
-    lookback = min(60, n)
-    start_idx = n - lookback
-    
-    sub_lows = lows[start_idx:]
-    min_idx_rel = int(np.argmin(sub_lows[:lookback - 8]))
-    p1_idx = start_idx + min_idx_rel
-    p1_val = lows[p1_idx]
-    
-    best_up_slope = None
-    for i in range(p1_idx + 5, n - 1):
-        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
-            slope = (lows[i] - p1_val) / (i - p1_idx)
-            if slope > 0:
-                best_up_slope = slope
-                break
-                
-    if best_up_slope is not None:
-        trend_val = p1_val + best_up_slope * (n - 1 - p1_idx)
-        return trend_val
+    try:
+        lows = df["Low"].values
+        n = len(df)
+        lookback = min(60, n)
+        start_idx = n - lookback
+        
+        sub_lows = lows[start_idx:]
+        min_idx_rel = int(np.argmin(sub_lows[:lookback - 8]))
+        p1_idx = start_idx + min_idx_rel
+        p1_val = lows[p1_idx]
+        
+        best_up_slope = None
+        for i in range(p1_idx + 5, n - 1):
+            if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
+                slope = (lows[i] - p1_val) / (i - p1_idx)
+                if slope > 0:
+                    best_up_slope = slope
+                    break
+                    
+        if best_up_slope is not None:
+            trend_val = p1_val + best_up_slope * (n - 1 - p1_idx)
+            return float(trend_val)
+    except Exception:
+        pass
     return None
 
 
-# ====================================================
-# [정밀 100점 만점 퀀트 종합점수 엔진]
-# ====================================================
 def evaluate_pro_quant_score(df, df_inv, fund, short):
     score = 0
     logs = []
@@ -474,18 +491,13 @@ def evaluate_pro_quant_score(df, df_inv, fund, short):
     return final_score, grade, stars, logs
 
 
-# ====================================================
-# [전문 퀀트 전략 백테스팅 엔진]
-# ====================================================
 def run_quant_backtest(df, strategy_type="trend_following"):
     bt_df = df.copy()
     bt_df["Signal"] = 0
     
     if strategy_type == "trend_following":
-        # 전략 1: 5일선 > 20일선 정배열 추세 추종
         bt_df["Signal"] = np.where(bt_df["MA5"] > bt_df["MA20"], 1, 0)
     elif strategy_type == "bollinger_reversal":
-        # 전략 2: 볼린저 하단/20일선 지지 매수, 상단 돌파 매도
         buy_cond = (bt_df["Close"] > bt_df["MA20"]) & (bt_df["BB_%b"] >= 0.4)
         sell_cond = bt_df["BB_%b"] >= 1.05
         sig = 0
@@ -498,28 +510,23 @@ def run_quant_backtest(df, strategy_type="trend_following"):
             signals.append(sig)
         bt_df["Signal"] = signals
     elif strategy_type == "rsi_momentum":
-        # 전략 3: RSI 40 이상 65 이하 건강한 모멘텀 구간 보유
         bt_df["Signal"] = np.where((bt_df["RSI"] >= 42) & (bt_df["RSI"] <= 68), 1, 0)
 
-    # 1일 뒤 체결 반영 (Lookahead bias 제거)
     bt_df["Position"] = bt_df["Signal"].shift(1).fillna(0)
     bt_df["Market_Return"] = bt_df["Close"].pct_change().fillna(0)
     bt_df["Strategy_Return"] = bt_df["Market_Return"] * bt_df["Position"]
 
-    # 누적 수익률 곡선 (Equity Curve)
     bt_df["Cum_Market"] = (1 + bt_df["Market_Return"]).cumprod()
     bt_df["Cum_Strategy"] = (1 + bt_df["Strategy_Return"]).cumprod()
 
-    # MDD (최대 낙폭) 계산
     cum_max = bt_df["Cum_Strategy"].cummax()
-    drawdown = (bt_df["Cum_Strategy"] - cum_max) / cum_max
+    drawdown = (bt_df["Cum_Strategy"] - cum_max) / (cum_max + 1e-9)
     mdd = drawdown.min() * 100
 
     total_return = (bt_df["Cum_Strategy"].iloc[-1] - 1) * 100
     buy_hold_return = (bt_df["Cum_Market"].iloc[-1] - 1) * 100
     alpha = total_return - buy_hold_return
 
-    # 승률 및 매매 횟수 계산
     trades = bt_df["Position"].diff().fillna(0)
     entry_indices = bt_df[trades == 1].index
     exit_indices = bt_df[trades == -1].index
@@ -549,87 +556,107 @@ def run_quant_backtest(df, strategy_type="trend_following"):
 
 
 # ====================================================
-# [100% 점수 일치 종합점수 TOP10 & 주도주 연산 엔진]
+# [에러 방지 안전 랭킹 엔진]
 # ====================================================
 @st.cache_data(ttl=600)
 def generate_accurate_dual_rankings():
+    empty_df = pd.DataFrame(columns=["Code", "Name", "Close", "등락률표시", "종합점수", "거래대금_억"])
     krx = get_krx_listing()
-    df_active = krx[(krx["Volume"] > 0) & (krx["Amount"] >= 5000000000)].copy()
+    if krx is None or krx.empty:
+        return empty_df, empty_df, empty_df, empty_df
 
-    sample_pool = df_active.sort_values(by="Amount", ascending=False).head(35)
-    score_list = []
+    try:
+        vol_col = "Volume" if "Volume" in krx.columns else krx.columns[0]
+        amt_col = "Amount" if "Amount" in krx.columns else vol_col
+        chg_col = "ChangesRatio" if "ChangesRatio" in krx.columns else ("ChagesRatio" if "ChagesRatio" in krx.columns else None)
+        
+        df_active = krx[krx[vol_col] > 0].copy()
+        if chg_col and chg_col in df_active.columns:
+            df_active["Chg"] = pd.to_numeric(df_active[chg_col], errors="coerce").fillna(0.0)
+        else:
+            df_active["Chg"] = 0.0
 
-    for _, row in sample_pool.iterrows():
-        c_code = row["Code"]
-        c_name = row["Name"]
-        c_close = row["Close"]
-        c_chg = row["ChagesRatio"]
+        if amt_col in df_active.columns:
+            df_active["Amt"] = pd.to_numeric(df_active[amt_col], errors="coerce").fillna(1e8)
+        else:
+            df_active["Amt"] = 1e8
 
-        try:
-            c_df = fdr.DataReader(c_code, (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d"))
-            if len(c_df) < 40:
+        sample_pool = df_active.sort_values(by="Amt", ascending=False).head(30)
+        score_list = []
+
+        for _, row in sample_pool.iterrows():
+            c_code = str(row["Code"]).zfill(6)
+            c_name = str(row["Name"])
+            c_close = int(row["Close"]) if "Close" in row and not pd.isna(row["Close"]) else 0
+            c_chg = float(row["Chg"])
+
+            try:
+                c_df = fdr.DataReader(c_code, (datetime.today() - timedelta(days=120)).strftime("%Y-%m-%d"))
+                if c_df is None or len(c_df) < 40:
+                    continue
+
+                c_df["MA5"] = c_df["Close"].rolling(5).mean()
+                c_df["MA20"] = c_df["Close"].rolling(20).mean()
+                c_df["MA60"] = c_df["Close"].rolling(60).mean()
+                c_df["STD20"] = c_df["Close"].rolling(20).std()
+                c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
+                c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
+                c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
+
+                exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
+                exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
+                c_df["MACD"] = exp12 - exp26
+                c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
+                c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
+
+                delta = c_df["Close"].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+                c_df["OBV"] = (np.sign(c_df["Close"].diff()).fillna(0) * c_df["Volume"]).cumsum()
+
+                tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
+                rmf = tp * c_df["Volume"]
+                pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
+                neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
+                c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
+
+                fund_d = {"목표주가": None, "PER": 12.0, "PBR": 1.1, "배당수익률": 2.0, "업종PER": 15.0, "ROE": 11.0}
+                short_d = {"공매도비중": 1.5}
+                inv_d = pd.DataFrame()
+
+                real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_d, fund_d, short_d)
+
+                score_list.append({
+                    "Code": c_code,
+                    "Name": c_name,
+                    "Close": c_close,
+                    "등락률표시": f"{c_chg:+.2f}%",
+                    "종합점수": real_score,
+                    "Amt": row["Amt"],
+                    "RawChg": c_chg
+                })
+            except Exception:
                 continue
 
-            c_df["MA5"] = c_df["Close"].rolling(5).mean()
-            c_df["MA20"] = c_df["Close"].rolling(20).mean()
-            c_df["MA60"] = c_df["Close"].rolling(60).mean()
-            c_df["STD20"] = c_df["Close"].rolling(20).std()
-            c_df["BB_Upper"] = c_df["MA20"] + (c_df["STD20"] * 2)
-            c_df["BB_Lower"] = c_df["MA20"] - (c_df["STD20"] * 2)
-            c_df["BB_%b"] = (c_df["Close"] - c_df["BB_Lower"]) / (c_df["BB_Upper"] - c_df["BB_Lower"] + 1e-9)
+        df_scored = pd.DataFrame(score_list)
+        if not df_scored.empty:
+            top10_score = df_scored.sort_values(by=["종합점수", "Amt"], ascending=[False, False]).head(10).reset_index(drop=True)
+            bot10_score = df_scored.sort_values(by=["종합점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
+        else:
+            top10_score, bot10_score = empty_df, empty_df
 
-            exp12 = c_df["Close"].ewm(span=12, adjust=False).mean()
-            exp26 = c_df["Close"].ewm(span=26, adjust=False).mean()
-            c_df["MACD"] = exp12 - exp26
-            c_df["MACD_SIGNAL"] = c_df["MACD"].ewm(span=9, adjust=False).mean()
-            c_df["MACD_HIST"] = c_df["MACD"] - c_df["MACD_SIGNAL"]
+        amt_log = np.log10(df_active["Amt"].clip(lower=1e8))
+        df_active["모멘텀"] = (df_active["Chg"] * 2.5) + (amt_log * 5)
+        df_active["등락률표시"] = df_active["Chg"].apply(lambda x: f"{x:+.2f}%")
+        df_active["거래대금_억"] = (df_active["Amt"] / 100000000).astype(int)
 
-            delta = c_df["Close"].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            c_df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-            c_df["OBV"] = (np.sign(c_df["Close"].diff()).fillna(0) * c_df["Volume"]).cumsum()
+        top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
+        bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
 
-            tp = (c_df["High"] + c_df["Low"] + c_df["Close"]) / 3
-            rmf = tp * c_df["Volume"]
-            pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
-            neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
-            c_df["MFI"] = 100 - (100 / (1 + (pos_mf / (neg_mf + 1e-9))))
-
-            fund_d = {"목표주가": None, "PER": 12.0, "PBR": 1.1, "배당수익률": 2.0, "업종PER": 15.0, "ROE": 11.0}
-            short_d = {"공매도비중": 1.5}
-            inv_d = pd.DataFrame()
-
-            real_score, _, _, _ = evaluate_pro_quant_score(c_df, inv_d, fund_d, short_d)
-
-            score_list.append({
-                "Code": c_code,
-                "Name": c_name,
-                "Close": c_close,
-                "등락률표시": f"{c_chg:+.2f}%",
-                "종합점수": real_score,
-                "Amount": row["Amount"],
-                "RawChg": c_chg
-            })
-        except Exception:
-            continue
-
-    df_scored = pd.DataFrame(score_list)
-    if not df_scored.empty:
-        top10_score = df_scored.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-        bot10_score = df_scored.sort_values(by=["종합점수", "RawChg"], ascending=[True, True]).head(10).reset_index(drop=True)
-    else:
-        top10_score, bot10_score = pd.DataFrame(), pd.DataFrame()
-
-    amount_log = np.log10(df_active["Amount"].clip(lower=1e8))
-    df_active["모멘텀"] = (df_active["ChagesRatio"] * 2.5) + (amount_log * 5)
-    df_active["등락률표시"] = df_active["ChagesRatio"].apply(lambda x: f"{x:+.2f}%")
-    df_active["거래대금_억"] = (df_active["Amount"] / 100000000).astype(int)
-
-    top10_lead = df_active.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
-    bot10_lead = df_active.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
-
-    return top10_score, bot10_score, top10_lead, bot10_lead
+        return top10_score, bot10_score, top10_lead, bot10_lead
+    except Exception:
+        return empty_df, empty_df, empty_df, empty_df
 
 
 # ====================================================
@@ -659,15 +686,15 @@ with rank_col:
 
     def render_score_buttons(df_rank, prefix):
         if df_rank.empty:
-            st.write("데이터 집계 중...")
+            st.caption("데이터 수집 대기 중...")
             return
         for i, row in df_rank.iterrows():
             cols = st.columns([5, 3, 2])
             if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
                 st.session_state.selected_stock = row["Name"]
                 st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#38bdf8; padding-top:6px;'>{row['종합점수']}점</div>", unsafe_allow_html=True)
+            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row.get('Close', 0):,}원 ({row.get('등락률표시', '-')})</div>", unsafe_allow_html=True)
+            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#38bdf8; padding-top:6px;'>{row.get('종합점수', '-')}점</div>", unsafe_allow_html=True)
 
     with score_tab1:
         render_score_buttons(top10_score, "score_top")
@@ -682,15 +709,15 @@ with rank_col:
 
     def render_lead_buttons(df_rank, prefix):
         if df_rank.empty:
-            st.write("데이터 준비 중...")
+            st.caption("데이터 수집 대기 중...")
             return
         for i, row in df_rank.iterrows():
             cols = st.columns([5, 3, 2])
             if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
                 st.session_state.selected_stock = row["Name"]
                 st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-size:12px; color:#94a3b8; padding-top:6px;'>{row['거래대금_억']:,}억</div>", unsafe_allow_html=True)
+            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row.get('Close', 0):,}원 ({row.get('등락률표시', '-')})</div>", unsafe_allow_html=True)
+            cols[2].markdown(f"<div style='text-align:center; font-size:12px; color:#94a3b8; padding-top:6px;'>{row.get('거래대금_억', 0):,}억</div>", unsafe_allow_html=True)
 
     with lead_tab1:
         render_lead_buttons(top10_lead, "lead_top")
@@ -735,9 +762,9 @@ with main_col:
                     st.session_state.selected_stock = srow["Name"]
                     st.rerun()
                 
-                chg_val = srow.get("ChagesRatio", 0.0)
+                chg_val = srow.get("ChangesRatio", srow.get("ChagesRatio", 0.0))
                 chg_color = "#ef4444" if chg_val > 0 else ("#38bdf8" if chg_val < 0 else "#94a3b8")
-                ac_cols[1].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; padding-top:6px;'>{srow['Close']:,}원</div>", unsafe_allow_html=True)
+                ac_cols[1].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; padding-top:6px;'>{srow.get('Close', 0):,}원</div>", unsafe_allow_html=True)
                 ac_cols[2].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; color:{chg_color}; padding-top:6px;'>{chg_val:+.2f}%</div>", unsafe_allow_html=True)
 
     if search_input != st.session_state.selected_stock:
@@ -756,7 +783,7 @@ with main_col:
                 start_dt = end_dt - timedelta(days=365)
                 df = fdr.DataReader(code, start_dt.strftime("%Y-%m-%d"))
 
-                if df.empty or len(df) < 60:
+                if df is None or df.empty or len(df) < 40:
                     st.error("데이터 수집에 실패했거나 거래일 데이터가 부족합니다.")
                 else:
                     raw_latest = df["Close"].iloc[-1]
@@ -873,7 +900,6 @@ with main_col:
                     )
                     st.markdown(target_grid_html, unsafe_allow_html=True)
 
-                    # 탭 구성 (신규 퀀트 백테스팅 탭 추가)
                     t1, t2, t3, t4, t5, t6 = st.tabs([
                         "차트 & 매물대 프로파일", 
                         "외인/기관 수급", 
@@ -976,7 +1002,6 @@ with main_col:
                     with t4:
                         st.dataframe(pd.DataFrame(logs, columns=["평가 항목", "가감점", "상세 내용"]), use_container_width=True)
 
-                    # [신규 추가: 퀀트 백테스팅 탭]
                     with t5:
                         st.markdown("#### ⚙️ 퀀트 투자 전략 과거 성과 시뮬레이션")
                         bt_col1, bt_col2 = st.columns([3, 1])
@@ -994,7 +1019,6 @@ with main_col:
                         
                         bt_res = run_quant_backtest(df, strat_key_map[strategy_choice])
                         
-                        # 성과 지표 출력
                         m1, m2, m3, m4, m5 = st.columns(5)
                         m1.metric("전략 누적 수익률", f"{bt_res['total_return']:+.2f}%")
                         m2.metric("단순 보유(시장) 수익률", f"{bt_res['buy_hold_return']:+.2f}%")
@@ -1002,7 +1026,6 @@ with main_col:
                         m4.metric("최대 낙폭 (MDD)", f"{bt_res['mdd']:.2f}%", help="과거 최고점 대비 최대 하락폭 (낮을수록 안전)")
                         m5.metric("매매 승률 (거래횟수)", f"{bt_res['win_rate']:.1f}% ({bt_res['trade_count']}회)")
 
-                        # 누적 자산 성장 곡선 차트 (Equity Curve)
                         bt_fig = go.Figure()
                         bt_fig.add_trace(go.Scatter(
                             x=bt_res["df"].index, y=(bt_res["df"]["Cum_Strategy"] - 1) * 100,
