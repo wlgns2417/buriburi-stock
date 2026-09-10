@@ -1190,6 +1190,127 @@ def running_horse_score(frame):
             "resistance":float(r.HIGH60_PREV)}
 
 
+
+def _horse_supply_metrics(investors, history_df):
+    """Return verified 5/20-session foreign/institution flow metrics when available."""
+    metrics = {
+        "foreign5": None, "institution5": None,
+        "foreign20": None, "institution20": None,
+        "foreign_rate_change10": None,
+    }
+    if investors is None or getattr(investors, "empty", True) or history_df is None or history_df.empty:
+        return metrics
+
+    for sessions, key_f, key_i in [
+        (5, "foreign5", "institution5"),
+        (20, "foreign20", "institution20"),
+    ]:
+        window = investor_window(investors, history_df, sessions, ["ForeignNet", "InstitutionNet"])
+        if window is not None:
+            metrics[key_f] = float(window.ForeignNet.sum())
+            metrics[key_i] = float(window.InstitutionNet.sum())
+
+    w10 = investor_window(investors, history_df, 10, ["ForeignRate"])
+    if w10 is not None:
+        metrics["foreign_rate_change10"] = float(w10.ForeignRate.iloc[-1] - w10.ForeignRate.iloc[0])
+    return metrics
+
+
+def _fmt_shares(v):
+    if v is None:
+        return "미확인"
+    sign = "+" if v > 0 else ""
+    av = abs(v)
+    if av >= 1_000_000:
+        return f"{sign}{v/1_000_000:,.1f}백만주"
+    if av >= 10_000:
+        return f"{sign}{v/10_000:,.1f}만주"
+    return f"{sign}{v:,.0f}주"
+
+
+def build_horse_commentary(result, investors=None):
+    """Deterministic broker-style commentary based only on observed chart/flow data."""
+    r = result["row"]
+    supply = _horse_supply_metrics(investors, result["df"])
+    positives, risks = [], []
+
+    # Trend structure
+    if r.Close > r.MA20 > r.MA60 > r.MA120 and r.MA20_SLOPE > 0 and r.MA60_SLOPE > 0:
+        positives.append("단·중기 이동평균선이 정배열을 형성하고 20·60일선의 기울기도 우상향해 추세의 연속성이 양호합니다.")
+    elif r.Close > r.MA20 and r.MA20 > r.MA60:
+        positives.append("단기 추세는 우위에 있으나 120일선까지 포함한 완전한 중기 정배열 여부는 추가 확인이 필요합니다.")
+    else:
+        risks.append("이동평균선 배열이 완전히 정돈되지 않아 추세 추종 관점의 가격 구조는 아직 확증 단계가 아닙니다.")
+
+    # Breakout / price location
+    dist_high = (r.Close / result["resistance"] - 1) * 100
+    if r.Close > result["resistance"]:
+        positives.append(f"60일 전고점을 {dist_high:+.1f}% 상회해 매물대 돌파 시도가 확인됩니다. 돌파 가격대의 지지 전환 여부가 후속 강도의 핵심입니다.")
+    elif dist_high >= -3:
+        positives.append(f"60일 전고점까지 {abs(dist_high):.1f}% 이내로 접근해 가격 발견 구간 진입 가능성이 열려 있습니다.")
+    else:
+        risks.append(f"60일 전고점 대비 {dist_high:.1f}% 위치로, 본격적인 신고가 모멘텀으로 보기에는 아직 상단 매물 소화가 필요합니다.")
+
+    # Momentum / overheating
+    if 55 <= r.RSI <= 70 and r.MACD > r.MACD_SIGNAL and r.MACD > 0 and r.ADX14 >= 20 and r.PLUS_DI > r.MINUS_DI:
+        positives.append("RSI·MACD·DMI가 동시에 강세 구간을 가리켜 가격 모멘텀의 질은 비교적 양호한 편입니다.")
+    elif r.RSI >= 78 or r.DIST_MA20 >= 10:
+        risks.append(f"RSI {r.RSI:.1f}, 20일선 이격 {r.DIST_MA20:+.1f}%로 단기 과열 부담이 있어 신규 추격 매수의 손익비는 다소 불리합니다.")
+    else:
+        risks.append("모멘텀 지표가 일제히 강세를 확인하지 못해 상승 추세의 가속 구간으로 단정하기에는 신호가 혼재돼 있습니다.")
+
+    # Volume
+    if r.VOL_RATIO >= 1.5 and r.Close > result["resistance"]:
+        positives.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배로 확대돼 돌파 과정에 거래 에너지가 동반되고 있습니다.")
+    elif r.VOL_RATIO < 0.8:
+        risks.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배에 그쳐 가격 상승을 뒷받침하는 거래 에너지는 다소 제한적입니다.")
+    elif r.VOL_RATIO < 1.2:
+        risks.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배 수준으로, 추세 확장 국면으로 보기에는 수급 확산 신호가 아직 약합니다.")
+
+    # Investor flow
+    f5, i5, f20, i20 = supply["foreign5"], supply["institution5"], supply["foreign20"], supply["institution20"]
+    if f5 is not None and i5 is not None:
+        if f5 > 0 and i5 > 0:
+            positives.append(f"최근 5거래일 외국인({_fmt_shares(f5)})과 기관({_fmt_shares(i5)})이 동반 순매수해 수급의 방향성이 가격 추세와 일치합니다.")
+        elif f5 > 0 or i5 > 0:
+            buyer = "외국인" if f5 > 0 else "기관"
+            risks.append(f"최근 5거래일 {buyer}은 순매수이나 외국인·기관 동반 매수는 확인되지 않아 수급의 폭은 제한적입니다.")
+        else:
+            risks.append(f"최근 5거래일 외국인({_fmt_shares(f5)}), 기관({_fmt_shares(i5)}) 모두 순매도여서 가격 모멘텀 대비 수급 확증이 부족합니다.")
+    else:
+        risks.append("최근 외국인·기관 수급 데이터가 충분히 확보되지 않아 수급 측면의 확증 여부는 보수적으로 해석할 필요가 있습니다.")
+
+    if f20 is not None and i20 is not None:
+        if f20 > 0 and i20 > 0:
+            positives.append("20거래일 누적 기준에서도 외국인·기관이 동반 순매수해 단기성 매수보다 지속성 있는 수급으로 해석할 여지가 있습니다.")
+        elif f20 < 0 and i20 < 0:
+            risks.append("20거래일 누적으로는 외국인·기관 모두 순매도여서 중기 수급 추세가 아직 가격 상승을 지지하지 못하고 있습니다.")
+
+    # Final house view
+    score = result["score"]
+    if score >= 82 and len(positives) >= 3 and not (r.RSI >= 78 or r.DIST_MA20 >= 10):
+        view = "추세·모멘텀·수급의 정합성이 높은 편입니다. 다만 돌파 직후 추격보다는 전고점 또는 20일선 부근의 지지 확인 시 손익비가 개선될 수 있습니다."
+    elif score >= 70:
+        view = "기술적 추세는 우호적이지만 일부 수급 또는 거래량 조건의 추가 확인이 필요합니다. 신규 진입은 돌파 유지와 눌림 구간의 거래량 감소 여부를 함께 확인하는 전략이 적절합니다."
+    elif score >= 55:
+        view = "상승 후보군에는 포함될 수 있으나 추세·모멘텀·수급 중 적어도 한 축의 확증이 부족합니다. 현 시점에서는 선매수보다 신호 개선을 확인하는 관찰 전략이 우선입니다."
+    else:
+        view = "현재는 추세 추종형 신규 진입의 우선순위가 낮습니다. 이동평균선 재정렬, 거래량 회복, 외국인·기관 수급 개선 중 두 가지 이상이 동반되는지를 확인할 필요가 있습니다."
+
+    return {
+        "view": view,
+        "positives": positives[:4],
+        "risks": risks[:4],
+        "supply": supply,
+    }
+
+
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def cached_horse_investors(code):
+    result = fetch_investors(code)
+    return result.data if result.status != "error" else pd.DataFrame(columns=INV_COLS)
+
+
 @st.cache_data(ttl=900, max_entries=256, show_spinner=False)
 def cached_running_score(code):
     result = fetch_history(code)
@@ -1294,6 +1415,131 @@ def _render_horse_leaderboard(out):
     )
 
 
+
+@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
+def cached_horse_kospi_universe(max_pages=20):
+    """Fetch KOSPI market-cap pages only. Lightweight first-stage universe collection."""
+    max_pages = max(1, min(int(max_pages), 25))
+    jobs = [(0, page) for page in range(1, max_pages + 1)]
+
+    def get(job):
+        sosok, page = job
+        try:
+            body = request_bytes(BASE + "/sise/sise_market_sum.naver", {"sosok": sosok, "page": page})
+            return parse_market(body, "KOSPI"), None
+        except Exception as exc:
+            return None, f"KOSPI {page}페이지: {type(exc).__name__}"
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        responses = list(pool.map(get, jobs))
+    frames = [x for x, _ in responses if x is not None]
+    errors = [err for _, err in responses if err]
+    df = pd.concat(frames, ignore_index=True).drop_duplicates("Code") if frames else pd.DataFrame(columns=MARKET_COLS)
+    notes = [f"KOSPI 시가총액 표 {len(frames)}/{len(jobs)}페이지 수집 · {len(df)}종목 확보"] + errors
+    return Result(df, BASE + "/sise/sise_market_sum.naver", "ok" if not errors else "partial" if frames else "error", notes)
+
+
+def _horse_prefilter_kospi(stocks, deep_count=60):
+    """Diversified lightweight pre-filter so deep OHLCV calls stay bounded."""
+    if stocks is None or stocks.empty:
+        return stocks
+    df = stocks.copy()
+    for col in ["Close", "Chg", "Volume", "Marcap"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Close", "Chg", "Volume", "Marcap"])
+    df = df[(df.Close > 0) & (df.Volume > 0) & (df.Marcap > 0)].copy()
+    if df.empty:
+        return df
+    df["AmountEstimate"] = df.Close * df.Volume
+
+    # Illiquid tail removal: retain upper 70% of turnover or sufficiently large caps.
+    turnover_floor = df.AmountEstimate.quantile(0.30)
+    liquid = df[(df.AmountEstimate >= turnover_floor) | (df.Marcap.rank(pct=True) >= 0.70)].copy()
+    ranked = market_rankings(liquid)
+
+    # Blend several lenses to avoid a pure large-cap or pure one-day gainer bias.
+    bucket = max(20, deep_count // 2)
+    parts = [
+        ranked.head(bucket),
+        liquid.sort_values("AmountEstimate", ascending=False).head(bucket),
+        liquid.sort_values("Chg", ascending=False).head(bucket),
+        liquid.sort_values("Marcap", ascending=False).head(max(15, deep_count // 3)),
+    ]
+    merged = pd.concat(parts, ignore_index=True).drop_duplicates("Code")
+    if "ScreenScore" not in merged.columns:
+        merged = merged.merge(ranked[["Code", "ScreenScore"]], on="Code", how="left")
+    return merged.sort_values(["ScreenScore", "AmountEstimate"], ascending=False).head(deep_count)
+
+
+def _deep_scan_horse_candidates(candidates, workers=6):
+    if candidates is None or candidates.empty:
+        return []
+    records = candidates.to_dict("records")
+
+    def analyze(rec):
+        code = str(rec["Code"])
+        sr = cached_running_score(code)
+        if sr is None:
+            return None
+        rr = sr["row"]
+        return {
+            "종목명": rec.get("Name", code),
+            "코드": code,
+            "점수": sr["score"],
+            "상태": sr["status"],
+            "종가": round(float(rr.Close)),
+            "5일수익률(%)": round(float(rr.RET5), 2),
+            "20일수익률(%)": round(float(rr.RET20), 2),
+            "RSI": round(float(rr.RSI), 1),
+            "ADX": round(float(rr.ADX14), 1),
+            "거래량배수": round(float(rr.VOL_RATIO), 2),
+            "20일선이격(%)": round(float(rr.DIST_MA20), 2),
+            "60일고점대비(%)": round((float(rr.Close) / float(sr["resistance"]) - 1) * 100, 2),
+            "_result": sr,
+        }
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=max(2, min(int(workers), 8))) as pool:
+        futures = [pool.submit(analyze, rec) for rec in records]
+        for future in futures:
+            try:
+                item = future.result()
+                if item is not None:
+                    rows.append(item)
+            except Exception:
+                pass
+    return rows
+
+
+def _enrich_top20_with_supply(raw):
+    if raw is None or raw.empty:
+        return raw
+    enriched = raw.head(20).copy()
+    comments, flow_labels = [], []
+    for _, row in enriched.iterrows():
+        sr = row["_result"]
+        inv = cached_horse_investors(str(row["코드"]))
+        commentary = build_horse_commentary(sr, inv)
+        supply = commentary["supply"]
+        f5, i5 = supply["foreign5"], supply["institution5"]
+        if f5 is not None and i5 is not None:
+            if f5 > 0 and i5 > 0:
+                flow = "외인·기관 동반매수"
+            elif f5 > 0:
+                flow = "외국인 우위"
+            elif i5 > 0:
+                flow = "기관 우위"
+            else:
+                flow = "외인·기관 동반매도"
+        else:
+            flow = "수급 미확인"
+        comments.append(commentary["view"])
+        flow_labels.append(flow)
+    enriched["수급"] = flow_labels
+    enriched["전략 코멘트"] = comments
+    return enriched
+
+
 def render_running_horse(market_result):
     st.markdown("### 🐎 달리는 말 탐지기")
     st.caption("추세·거래량·RSI·MACD·ADX·신고가·이격도를 100점으로 평가합니다. 점수는 매수 신호가 아니라 후보 선별용입니다.")
@@ -1357,6 +1603,26 @@ def render_running_horse(market_result):
                     f"20일선 {r.MA20:,.0f}원 · 60일선 {r.MA60:,.0f}원 · "
                     f"60일 전고점 {result['resistance']:,.0f}원 · 20일선 이격 {r.DIST_MA20:+.1f}%"
                 )
+                with st.spinner("외국인·기관 수급을 함께 점검하고 있습니다…"):
+                    horse_inv = cached_horse_investors(code)
+                commentary = build_horse_commentary(result, horse_inv)
+                st.markdown("##### 🏦 리서치 데스크 코멘트")
+                st.info(commentary["view"])
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    st.markdown("**상승 논거**")
+                    if commentary["positives"]:
+                        for text in commentary["positives"]:
+                            st.markdown(f"- {text}")
+                    else:
+                        st.caption("현재 확인 가능한 강한 상승 논거가 제한적입니다.")
+                with cc2:
+                    st.markdown("**리스크 체크**")
+                    if commentary["risks"]:
+                        for text in commentary["risks"]:
+                            st.markdown(f"- {text}")
+                    else:
+                        st.caption("주요 기술·수급 리스크가 두드러지지 않습니다.")
                 render_running_chart(result, name)
                 l, rcol = st.columns([3, 2])
                 with l:
@@ -1369,72 +1635,95 @@ def render_running_horse(market_result):
                         st.warning(" / ".join(result["penalties"]))
 
     with scanner:
-        c1, c2, c3 = st.columns(3)
-        target_market = c1.selectbox("시장", ["KOSPI", "KOSDAQ"], key="horse_market")
-        scan_count = c2.slider("스캔 종목 수", 10, 100, 30, 10, key="horse_count")
-        min_score = c3.slider("최소 점수", 40, 90, 65, 5, key="horse_min")
-        st.caption("Naver 시가총액 표 상위 표본에서 시가총액 순으로 분석합니다. 현재 설정에서의 상대 순위이며 전체 상장종목 전수 순위는 아닙니다.")
+        st.markdown("#### 🇰🇷 KOSPI 자동 달리는 말 TOP 20")
+        st.caption(
+            "KOSPI 전체 시가총액 표를 1차로 수집한 뒤 거래대금·등락률·시총으로 후보를 압축하고, "
+            "일봉 기술지표를 정밀 분석합니다. 최종 상위 20개는 외국인·기관 수급까지 추가 점검합니다."
+        )
+        c1, c2 = st.columns(2)
+        deep_count = c1.slider("정밀 분석 후보 수", 40, 100, 60, 10, key="horse_deep_count",
+                               help="클수록 시장 커버리지는 넓어지지만 조회 시간이 늘어납니다.")
+        pages = c2.slider("KOSPI 시장 페이지", 10, 25, 20, 5, key="horse_kospi_pages",
+                          help="페이지당 종목 수는 공급 화면에 따라 달라질 수 있습니다.")
 
-        if st.button("🏁 달리는 말 순위 산출", type="primary", key="horse_scan", use_container_width=True):
-            with st.spinner("시장 표본을 확장 조회하고 있습니다…"):
-                full_market = cached_market(5)
-            candidates = full_market.data[full_market.data.Market == target_market].sort_values("Marcap", ascending=False).head(scan_count)
-            if candidates.empty:
-                st.warning("스캔할 시장 데이터를 확보하지 못했습니다.")
+        if st.button("🚀 KOSPI TOP 20 자동 분석", type="primary", key="horse_auto_top20", use_container_width=True):
+            with st.spinner("1단계: KOSPI 전체 후보군을 수집하고 있습니다…"):
+                universe = cached_horse_kospi_universe(pages)
+            if universe.data.empty:
+                st.warning("KOSPI 후보군을 확보하지 못했습니다.")
             else:
-                rows = []
-                bar = st.progress(0)
-                msg = st.empty()
-                for i, row in enumerate(candidates.itertuples(), start=1):
-                    msg.text(f"[{i}/{len(candidates)}] {row.Name} 분석 중…")
-                    sr = cached_running_score(str(row.Code))
-                    if sr is not None:
-                        rr = sr["row"]
-                        rows.append({
-                            "종목명": row.Name,
-                            "코드": row.Code,
-                            "점수": sr["score"],
-                            "상태": sr["status"],
-                            "종가": round(rr.Close),
-                            "5일수익률(%)": round(rr.RET5, 2),
-                            "20일수익률(%)": round(rr.RET20, 2),
-                            "RSI": round(rr.RSI, 1),
-                            "ADX": round(rr.ADX14, 1),
-                            "거래량배수": round(rr.VOL_RATIO, 2),
-                            "20일선이격(%)": round(rr.DIST_MA20, 2),
-                            "60일고점대비(%)": round((rr.Close / sr['resistance'] - 1) * 100, 2),
-                        })
-                    bar.progress(i / len(candidates))
-                bar.empty()
-                msg.empty()
-
-                if rows:
-                    raw = pd.DataFrame(rows).sort_values(["점수", "20일수익률(%)"], ascending=[False, False]).reset_index(drop=True)
-                    out = raw[raw["점수"] >= min_score].reset_index(drop=True)
-                    st.session_state.horse_scan_raw = raw
-                    st.session_state.horse_scan_out = out
-                    st.session_state.horse_scan_meta = (target_market, len(candidates), min_score)
+                candidates = _horse_prefilter_kospi(universe.data, deep_count)
+                st.caption(f"1차 수집 {len(universe.data)}종목 → 정밀 분석 후보 {len(candidates)}종목")
+                progress = st.progress(0)
+                progress.progress(20)
+                with st.spinner(f"2단계: {len(candidates)}종목 일봉·모멘텀을 병렬 분석하고 있습니다…"):
+                    rows = _deep_scan_horse_candidates(candidates, workers=6)
+                progress.progress(75)
+                if not rows:
+                    progress.empty()
+                    st.warning("정밀 분석 결과를 확보하지 못했습니다.")
                 else:
-                    st.session_state.horse_scan_raw = pd.DataFrame()
-                    st.session_state.horse_scan_out = pd.DataFrame()
-                    st.info("분석 가능한 종목이 없었습니다.")
+                    raw = pd.DataFrame(rows).sort_values(
+                        ["점수", "20일수익률(%)", "거래량배수"], ascending=[False, False, False]
+                    ).reset_index(drop=True)
+                    with st.spinner("3단계: 상위 20개 외국인·기관 수급을 확인하고 있습니다…"):
+                        top20 = _enrich_top20_with_supply(raw)
+                    progress.progress(100)
+                    progress.empty()
+                    st.session_state.horse_auto_raw = raw
+                    st.session_state.horse_auto_top20 = top20
+                    st.session_state.horse_auto_meta = {
+                        "universe": len(universe.data), "deep": len(candidates), "pages": pages,
+                        "status": universe.status, "notes": universe.notes,
+                    }
 
-        out = st.session_state.get("horse_scan_out")
-        meta = st.session_state.get("horse_scan_meta")
-        if isinstance(out, pd.DataFrame) and meta and meta[0] == target_market:
-            _, analyzed_count, used_min = meta
-            if out.empty:
-                st.info(f"{analyzed_count}종목을 분석했지만 {used_min}점 이상 후보가 없습니다.")
-            else:
-                st.success(f"{analyzed_count}종목 분석 완료 · {used_min}점 이상 {len(out)}종목")
-                _render_horse_leaderboard(out)
-                st.download_button(
-                    "달리는 말 순위 CSV",
-                    out.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"running_horse_{target_market}.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+        top20 = st.session_state.get("horse_auto_top20")
+        meta = st.session_state.get("horse_auto_meta")
+        if isinstance(top20, pd.DataFrame) and not top20.empty:
+            st.success(
+                f"KOSPI {meta.get('universe', 0)}종목 1차 탐색 → "
+                f"{meta.get('deep', 0)}종목 정밀 분석 → 최종 TOP 20"
+            )
+            _render_horse_leaderboard(top20.drop(columns=["_result"], errors="ignore"))
+
+            st.markdown("##### 🏦 TOP 20 리서치 요약")
+            for idx, row in top20.reset_index(drop=True).iterrows():
+                rank = idx + 1
+                badge = _horse_rank_badge(rank)
+                with st.expander(
+                    f"{badge} {rank}위 · {row['종목명']} ({row['코드']}) · {int(row['점수'])}점 · {row['수급']}"
+                ):
+                    sr = row["_result"]
+                    inv = cached_horse_investors(str(row["코드"]))
+                    commentary = build_horse_commentary(sr, inv)
+                    st.info(commentary["view"])
+                    cpos, crisk = st.columns(2)
+                    with cpos:
+                        st.markdown("**상승 논거**")
+                        for text in commentary["positives"]:
+                            st.markdown(f"- {text}")
+                    with crisk:
+                        st.markdown("**리스크 요인**")
+                        for text in commentary["risks"]:
+                            st.markdown(f"- {text}")
+                    supply = commentary["supply"]
+                    st.caption(
+                        "최근 5거래일 순매수 · "
+                        f"외국인 {_fmt_shares(supply['foreign5'])} / 기관 {_fmt_shares(supply['institution5'])}"
+                    )
+
+            export = top20.drop(columns=["_result"], errors="ignore")
+            st.download_button(
+                "KOSPI 달리는 말 TOP20 CSV",
+                export.to_csv(index=False).encode("utf-8-sig"),
+                file_name="running_horse_KOSPI_TOP20.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            st.caption(
+                "※ 전 종목을 동일 깊이로 전수 분석하는 방식이 아니라, KOSPI 시장 전체를 1차 경량 스크리닝한 뒤 "
+                "상위 후보군에 기술·수급 분석을 집중하는 2단계 방식입니다. 속도와 시장 커버리지의 균형을 위한 설계입니다."
+            )
 
     with rules:
         st.markdown("""
@@ -1501,7 +1790,8 @@ def main():
     for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
                        "candidates": [], "search_message": "", "horse_matches": [],
                        "horse_selected_code": "", "horse_selected_name": "",
-                       "horse_scan_raw": None, "horse_scan_out": None, "horse_scan_meta": None}.items():
+                       "horse_scan_raw": None, "horse_scan_out": None, "horse_scan_meta": None,
+                       "horse_auto_raw": None, "horse_auto_top20": None, "horse_auto_meta": None}.items():
         if key not in st.session_state:
             st.session_state[key] = value
     with st.spinner("시장 표본을 조회하고 있습니다…"):
