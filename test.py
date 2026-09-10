@@ -1,1037 +1,1121 @@
-import urllib.parse
-from datetime import datetime, timedelta
-import FinanceDataReader as fdr
+# -*- coding: utf-8 -*-
+"""부리부리 종합 주식 작전실 — 단일 Python 파일 수정본
+
+GitHub에 있는 기존 실행 .py 파일의 내용을 이 파일 전체로 교체하십시오.
+기존 파일명과 실행 설정은 유지하실 수 있습니다.
+core.py, providers.py, fdr_worker.py, 테마 설정 파일을 별도로 올릴 필요가 없습니다.
+
+실행: python -m streamlit run app.py
+필요 패키지(기존 앱과 동일):
+    streamlit, finance-datareader, numpy, pandas, plotly, requests, beautifulsoup4
+권장 Python: 3.12. 기존 requirements.txt는 설치 목록이므로 유지하십시오.
+
+데이터 수집 실패는 미확인으로 표시하며 임의 가격으로 대체하지 않습니다.
+공매도 자동 수집은 미제공이며 선택적 CSV 입력을 사용합니다.
+이 파일로 합치는 과정에서 이전 수정본의 계산·데이터 처리 규칙은 유지했습니다.
+"""
+from __future__ import annotations
+
+
+
+# ===== 1. 계산 엔진 =====
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import math
+
 import numpy as np
 import pandas as pd
+
+KST = ZoneInfo("Asia/Seoul")
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+STRATEGIES = {
+    "5일·20일 이동평균 추세 추종": "trend_following",
+    "볼린저 중심선 회복 스윙": "bollinger_reversal",
+    "RSI 42~68 구간 보유": "rsi_momentum",
+}
+
+
+def number(value):
+    """None is missing; zero is a valid observation."""
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def clean_history(frame):
+    if frame is None or frame.empty:
+        raise ValueError("일봉을 가져오지 못했습니다.")
+    if not set(OHLCV).issubset(frame.columns):
+        raise ValueError("일봉에 Open, High, Low, Close, Volume 열이 필요합니다.")
+    df = frame[OHLCV].copy()
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    if df.index.isna().any():
+        raise ValueError("해석할 수 없는 일봉 날짜가 있습니다.")
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert(KST).tz_localize(None)
+    df.index = df.index.normalize()
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    df = df.apply(pd.to_numeric, errors="coerce")
+    # Some providers encode suspended sessions with zero O/H/L. Keep the
+    # session and its last mark, but the simulator never trades zero-volume bars.
+    suspended = (df.Volume == 0) & (df.Close > 0)
+    for col in ["Open", "High", "Low"]:
+        df.loc[suspended & (df[col] == 0), col] = df.loc[suspended & (df[col] == 0), "Close"]
+    valid = (
+        np.isfinite(df).all(axis=1)
+        & (df[["Open", "High", "Low", "Close"]] > 0).all(axis=1)
+        & (df.Volume >= 0)
+        & (df.High >= df[["Open", "Close", "Low"]].max(axis=1))
+        & (df.Low <= df[["Open", "Close", "High"]].min(axis=1))
+    )
+    if not valid.all():
+        raise ValueError(f"OHLCV 검증 실패: {int((~valid).sum())}개 일봉. 잘못된 봉을 건너뛰어 수익률을 연결하지 않습니다.")
+    df.index.name = "Date"
+    return df.astype(float)
+
+
+def completed_history(frame, now=None):
+    now = now or datetime.now(KST)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    today = pd.Timestamp(now.astimezone(KST).date())
+    # Deliberately exclude the entire current KST date, even after the close.
+    # No holiday calendar, exchange closing-time assumption, or snapshot merge.
+    df = clean_history(frame)
+    return df.loc[df.index < today].copy()
+
+
+def _oscillator(positive, negative):
+    total = positive + negative
+    return (100 * positive / total.where(total != 0)).mask(total == 0, 50.0)
+
+
+def add_indicators(frame):
+    df = frame.copy()
+    for period in [5, 20, 60]:
+        df[f"MA{period}"] = df.Close.rolling(period, min_periods=period).mean()
+    std = df.Close.rolling(20, min_periods=20).std(ddof=0)
+    df["BB_Upper"], df["BB_Lower"] = df.MA20 + 2 * std, df.MA20 - 2 * std
+    width = df.BB_Upper - df.BB_Lower
+    df["BB_pct"] = ((df.Close - df.BB_Lower) / width.where(width != 0)).mask(width == 0, 0.5)
+    previous = df.Close.shift(1)
+    tr = pd.concat([df.High - df.Low, (df.High - previous).abs(), (df.Low - previous).abs()], axis=1).max(axis=1)
+    df["ATR14"] = tr.rolling(14, min_periods=14).mean()
+    df["MACD"] = df.Close.ewm(span=12, adjust=False, min_periods=12).mean() - df.Close.ewm(span=26, adjust=False, min_periods=26).mean()
+    df["MACD_SIGNAL"] = df.MACD.ewm(span=9, adjust=False, min_periods=9).mean()
+    df["MACD_HIST"] = df.MACD - df.MACD_SIGNAL
+    delta = df.Close.diff()
+    gain = delta.clip(lower=0).rolling(14, min_periods=14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
+    df["RSI"] = _oscillator(gain, loss)
+    df["OBV"] = (np.sign(delta).fillna(0) * df.Volume).cumsum()
+    tp = (df.High + df.Low + df.Close) / 3
+    flow = tp * df.Volume
+    pos = flow.where(tp.diff() > 0, 0).rolling(14, min_periods=14).sum()
+    neg = flow.where(tp.diff() < 0, 0).rolling(14, min_periods=14).sum()
+    df["MFI"] = _oscillator(pos, neg)
+    return df
+
+
+def period_return(df, sessions):
+    if len(df) <= sessions:
+        return None
+    return (df.Close.iloc[-1] / df.Close.iloc[-sessions - 1] - 1) * 100
+
+
+def investor_window(investors, history, sessions, columns):
+    """Require the exact latest sessions; never label 3 or 18 rows as 5/20 days."""
+    if investors.empty or len(history) < sessions or not set(columns).issubset(investors.columns):
+        return None
+    inv = investors.copy()
+    inv["Date"] = pd.to_datetime(inv["Date"], errors="coerce")
+    inv = inv.dropna(subset=["Date"]).drop_duplicates("Date", keep="last").set_index("Date")
+    window = inv.reindex(history.index[-sessions:])
+    if not window[columns].apply(pd.to_numeric, errors="coerce").notna().all().all():
+        return None
+    return window
+
+
+def evaluate_score(df, investors, fund, short=None):
+    """100 possible points, no normalization or implicit reward for missing data.
+
+    Every row is positive evidence in [0, weight]. 'None' means unavailable.
+    Full grading is withheld unless all 100 possible points are observable.
+    """
+    latest, prev = df.iloc[-1], df.iloc[-2]
+    rows = []
+
+    def add(group, label, weight, points, detail):
+        rows.append({"영역": group, "항목": label, "배점": weight,
+                     "득점": points, "상태": "미확인" if points is None else "확인",
+                     "근거": detail})
+
+    ready = all(number(latest.get(k)) is not None for k in ["MA5", "MA20", "MA60"])
+    pts = (12 if latest.MA5 > latest.MA20 > latest.MA60 else 6 if latest.Close > latest.MA20 else 0) if ready else None
+    add("추세", "이동평균", 12, pts, "5>20>60: 12점 / 종가>20일선: 6점 / 나머지: 0점")
+    bb = number(latest.get("BB_pct"))
+    add("추세", "볼린저 위치", 7, (7 if 0.75 <= bb <= 1.05 else 0) if bb is not None else None, "%b 0.75~1.05: 7점")
+    macd_ok = all(number(x) is not None for x in [latest.MACD_HIST, prev.MACD_HIST])
+    pts = (6 if latest.MACD_HIST > 0 >= prev.MACD_HIST else 3 if latest.MACD_HIST > 0 else 0) if macd_ok else None
+    add("추세", "MACD", 6, pts, "히스토그램 상향 돌파: 6점 / 양수 유지: 3점")
+
+    w5 = investor_window(investors, df, 5, ["ForeignNet", "InstitutionNet"])
+    if w5 is None:
+        pts, detail = None, "일봉과 일치하는 최근 5거래일 수급 필요"
+    else:
+        foreign, institution = w5.ForeignNet.sum(), w5.InstitutionNet.sum()
+        pts = 12 if foreign > 0 and institution > 0 else 6 if foreign > 0 or institution > 0 else 0
+        detail = f"5일 순매수 수량: 외국인 {foreign:+,.0f}주 / 기관 {institution:+,.0f}주"
+    add("수급", "외국인·기관", 12, pts, detail)
+    w10 = investor_window(investors, df, 10, ["ForeignRate"])
+    add("수급", "외국인 보유율", 5, (5 if w10.ForeignRate.iloc[-1] > w10.ForeignRate.iloc[0] else 0) if w10 is not None else None,
+        "일봉과 일치하는 10거래일 중 첫날 대비 보유율 증가: 5점")
+    mfi = number(latest.MFI)
+    add("수급", "MFI", 5, (5 if 50 <= mfi <= 75 and df.Volume.tail(14).sum() > 0 else 0) if mfi is not None else None,
+        "MFI 50~75 및 거래량 존재: 5점. 특정 투자자의 매집을 증명하지 않음")
+    add("수급", "OBV", 3, 3 if latest.OBV > df.OBV.tail(20).mean() else 0, "OBV가 최근 20일 평균 상회: 3점")
+
+    target, roe, per, industry, pbr = [number(fund.get(k)) for k in ["Target", "ROE", "PER", "IndustryPER", "PBR"]]
+    upside = (target / latest.Close - 1) * 100 if target is not None and target > 0 else None
+    add("가치", "컨센서스 목표가", 10, (10 if upside >= 25 else 6 if upside >= 10 else 0) if upside is not None else None,
+        f"종가 대비 괴리율 {upside:+.1f}%" if upside is not None else "목표가 미제공")
+    add("가치", "최근 확정 연간 ROE", 8, (8 if roe >= 15 else 4 if roe >= 8 else 0) if roe is not None else None,
+        f"{fund.get('ROEPeriod', '')} ROE {roe:.2f}%" if roe is not None else "확정 연간 실적을 확인하지 못함")
+    comparable = per is not None and industry is not None and per > 0 and industry > 0
+    add("가치", "업종 대비 PER", 4, (4 if per <= industry * 0.7 else 0) if comparable else None,
+        f"PER {per:g} / 업종 {industry:g}" if comparable else "양수 PER끼리만 비교; 적자·미제공·음수 업종PER은 비교 제외")
+    add("가치", "PBR", 3, (3 if 0 < pbr < 0.9 else 0) if pbr is not None else None,
+        f"PBR {pbr:g}배" if pbr is not None else "미제공")
+
+    rsi = number(latest.RSI)
+    add("모멘텀", "RSI", 10, (10 if 45 <= rsi <= 65 else 5 if 30 <= rsi < 45 else 0) if rsi is not None else None,
+        f"RSI(단순 14일) {rsi:.1f}" if rsi is not None else "준비 기간 부족")
+    cutoff = df.index[-1] - pd.Timedelta(weeks=52)
+    window = df.loc[df.index >= cutoff]
+    year_ready = df.index[0] <= cutoff
+    dist = (latest.Close / window.High.max() - 1) * 100
+    add("모멘텀", "52주 고가 근접", 10, (10 if dist >= -7 else 0) if year_ready else None,
+        f"52주 고가 대비 {dist:+.1f}%" if year_ready else "52주 이력이 부족하여 평가 제외")
+    ratio = number((short or {}).get("ShortRatio"))
+    short_date = pd.to_datetime((short or {}).get("Date"), errors="coerce")
+    short_ok = ratio is not None and 0 <= ratio <= 100 and short_date == df.index[-1]
+    add("모멘텀", "공매도 거래량 비중", 5, (5 if ratio < 7 else 0) if short_ok else None,
+        f"{ratio:.2f}% (7% 미만: 5점)" if short_ok else "분석 기준일과 일치하는 공매도 데이터 미확인")
+
+    points = sum(row["득점"] for row in rows if row["득점"] is not None)
+    possible = sum(row["배점"] for row in rows if row["득점"] is not None)
+    missing = 100 - possible
+    grade = "일부 항목 미확인 · 종합등급 보류"
+    if not missing:
+        grade = "조건 충족도 높음" if points >= 80 else "조건 충족도 보통" if points >= 50 else "조건 충족도 낮음"
+    return {"points": points, "possible": possible, "coverage": possible,
+            "score": points if not missing else None, "upper_bound": points + missing,
+            "grade": grade, "logs": pd.DataFrame(rows)}
+
+
+def price_scenario(df):
+    """ATR-based reference scenario. No claimed trend support or executable ticks."""
+    price, atr = float(df.Close.iloc[-1]), number(df.ATR14.iloc[-1])
+    if atr is None or atr <= 0 or price < 10:
+        return None
+    distance = min(max(atr, price * 0.01), price * 0.15)
+    entry1 = math.floor(price - 0.5 * distance)
+    entry2 = min(math.floor(price - distance), entry1 - 1)
+    stop = math.floor(entry2 - 1.5 * distance)
+    target1 = math.ceil(price + 1.5 * distance)
+    target2 = max(math.ceil(price + 3 * distance), target1 + 1)
+    if not (0 < stop < entry2 < entry1 < price < target1 < target2):
+        return None
+    return {"1차 참고 진입가": entry1, "2차 참고 진입가": entry2,
+            "1차 참고 목표가": target1, "2차 참고 목표가": target2,
+            "참고 손절가": stop,
+            "reward_risk": (target1 - entry1) / (entry1 - stop)}
+
+
+def strategy_signals(df, strategy):
+    valid = df[["MA5", "MA20", "MA60", "RSI", "BB_pct"]].notna().all(axis=1)
+    if strategy == "trend_following":
+        return ((df.MA5 > df.MA20) & valid).astype(int)
+    if strategy == "rsi_momentum":
+        return (df.RSI.between(42, 68) & valid).astype(int)
+    if strategy != "bollinger_reversal":
+        raise ValueError("지원하지 않는 전략입니다.")
+    position, output = 0, []
+    for i in range(len(df)):
+        if not valid.iloc[i]:
+            position = 0
+        elif position:
+            # Exit is evaluated before entry. The entry region excludes >=1.05.
+            if df.BB_pct.iloc[i] >= 1.05 or df.Close.iloc[i] < df.MA20.iloc[i]:
+                position = 0
+        elif df.Close.iloc[i] > df.MA20.iloc[i] and 0.4 <= df.BB_pct.iloc[i] < 1.05:
+            position = 1
+        output.append(position)
+    return pd.Series(output, index=df.index, dtype=int)
+
+
+def _simulate(df, desired, capital, fee, slippage, sell_tax):
+    cash, units, entry = float(capital), 0.0, None
+    equity, positions, trades = [], [], []
+    for i, (day, bar) in enumerate(df.iterrows()):
+        target = int(desired.iloc[i])
+        tradable = bar.Volume > 0 and bar.Open > 0
+        if units == 0 and target == 1 and tradable:
+            fill = bar.Open * (1 + slippage)
+            allocated = cash
+            units = cash / (fill * (1 + fee))
+            cash = 0.0
+            entry = {"EntryDate": day, "EntryPrice": fill, "Capital": allocated, "Units": units}
+        elif units > 0 and target == 0 and tradable:
+            fill = bar.Open * (1 - slippage)
+            cash = units * fill * (1 - fee - sell_tax)
+            trades.append({**entry, "ExitDate": day, "ExitPrice": fill,
+                           "PnL": cash - entry["Capital"], "ReturnPct": (cash / entry["Capital"] - 1) * 100})
+            units, entry = 0.0, None
+        equity.append(cash + units * bar.Close)
+        positions.append(int(units > 0))
+    return pd.Series(equity, index=df.index), pd.Series(positions, index=df.index), pd.DataFrame(trades), entry
+
+
+def run_backtest(df, strategy="trend_following", start=None, capital=10_000_000,
+                 fee_bps=1.5, slippage_bps=5.0, sell_tax_bps=0.0):
+    """Signal at t close -> fill at t+1 open. Closed trades and equity share fills.
+
+    Fractional units, all-in/all-out, no leverage, cash interest or dividends.
+    Open final position is marked at the last close; no artificial final exit.
+    """
+    if capital <= 0 or any(not math.isfinite(v) or v < 0 or v >= 1000 for v in [fee_bps, slippage_bps, sell_tax_bps]):
+        raise ValueError("투자금과 비용 설정을 확인해 주십시오.")
+    signal = strategy_signals(df, strategy)
+    # Shared warm-up window for all strategies and the benchmark.
+    eligible = df[["MA60", "RSI", "BB_pct", "MACD_SIGNAL"]].notna().all(axis=1).shift(1, fill_value=False)
+    if start is not None:
+        eligible &= df.index >= pd.Timestamp(start)
+    eligible_indices = df.index[eligible]
+    if not len(eligible_indices):
+        raise ValueError("준비 기간 이후의 백테스트 데이터가 부족합니다.")
+    first = eligible_indices[0]
+    bt = df.loc[df.index >= first].copy()
+    if len(bt) < 2:
+        raise ValueError("백테스트에는 준비 기간 이후 최소 2거래일이 필요합니다.")
+    desired = signal.shift(1, fill_value=0).reindex(bt.index)
+    fee, slip, tax = [v / 10_000 for v in [fee_bps, slippage_bps, sell_tax_bps]]
+    equity, position, trades, open_trade = _simulate(bt, desired, capital, fee, slip, tax)
+    hold, _, _, _ = _simulate(bt, pd.Series(1, index=bt.index), capital, fee, slip, tax)
+    bt["Signal"] = signal.reindex(bt.index)
+    bt["DesiredPosition"], bt["Position"] = desired, position
+    bt["Equity"], bt["BenchmarkEquity"] = equity, hold
+    bt["Cum_Strategy"], bt["Cum_Market"] = equity / capital, hold / capital
+    # Initial cash belongs to the peak series (first entry fee can cause MDD).
+    peaks = np.maximum.accumulate(np.r_[capital, equity.to_numpy()])[1:]
+    mdd = float((equity.to_numpy() / peaks - 1).min() * 100)
+    total, benchmark = (equity.iloc[-1] / capital - 1) * 100, (hold.iloc[-1] / capital - 1) * 100
+    win_rate = float((trades.PnL > 0).mean() * 100) if not trades.empty else None
+    return {"df": bt, "trades": trades, "open_trade": open_trade,
+            "total_return": total, "buy_hold_return": benchmark,
+            "excess_pp": total - benchmark, "mdd": mdd,
+            "win_rate": win_rate, "trade_count": len(trades)}
+
+
+def market_rankings(stocks):
+    if stocks.empty:
+        return stocks.copy()
+    df = stocks.copy()
+    # Closing price * volume is an estimate, not turnover or investor inflow.
+    required = ["Close", "Chg", "Volume", "Marcap"]
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=required)
+    df = df[(df.Close > 0) & (df.Volume > 0) & (df.Marcap > 0)].copy()
+    df["AmountEstimate"] = df.Close * df.Volume
+    if df.empty:
+        return df
+    # Bounded continuous momentum. Crossing +20% no longer drops ~36 points.
+    df["ScreenScore"] = (
+        50 * ((df.Chg + 10) / 30).clip(0, 1)
+        + 25 * df.Marcap.rank(pct=True)
+        + 25 * df.AmountEstimate.rank(pct=True)
+    ).round(1)
+    df["Momentum"] = df.Chg.rank(pct=True) * 60 + df.AmountEstimate.rank(pct=True) * 40
+    return df.sort_values(["ScreenScore", "AmountEstimate"], ascending=False).reset_index(drop=True)
+
+# ===== 2. 데이터 수집 (일봉 수집 코드도 이 파일에 포함) =====
+_FDR_WORKER_CODE = '"""A killable FDR worker; prevents upstream requests without timeouts hanging UI."""\nimport contextlib\nimport re\nimport sys\n\n\ndef main():\n    if len(sys.argv) != 4 or not re.fullmatch(r"\\d{6}", sys.argv[1]):\n        raise ValueError("Expected code, start, end")\n    # Keep stdout machine-readable even if FDR writes progress text.\n    with contextlib.redirect_stdout(sys.stderr):\n        import FinanceDataReader as fdr\n        frame = fdr.DataReader(f"NAVER:{sys.argv[1]}", sys.argv[2], sys.argv[3])\n    if frame is None or frame.empty:\n        raise ValueError("No daily prices returned")\n    print(frame.to_json(orient="split", date_format="iso"))\n\n\nif __name__ == "__main__":\n    main()\n'
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from io import StringIO
+from pathlib import Path
+import json
+import re
+import subprocess
+import sys
+import threading
+from urllib.parse import parse_qs, urljoin, urlparse
+import xml.etree.ElementTree as ET
+
+from bs4 import BeautifulSoup
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+BASE = "https://finance.naver.com"
+MARKET_COLS = ["Code", "Name", "Market", "Close", "Chg", "Volume", "Marcap"]
+INV_COLS = ["Date", "Close", "InstitutionNet", "ForeignNet", "ForeignRate", "InstitutionAmountEstimate", "ForeignAmountEstimate"]
+_local = threading.local()
+
+
+@dataclass
+class Result:
+    data: object
+    source: str
+    status: str = "ok"
+    notes: list[str] = field(default_factory=list)
+    fetched_at: str = field(default_factory=lambda: datetime.now(KST).isoformat(timespec="seconds"))
+
+
+def compact(value):
+    return re.sub(r"\s+", "", str(value))
+
+
+def numeric(value):
+    cleaned = compact(value).replace(",", "").replace("%", "").replace("−", "-")
+    return number(cleaned)
+
+
+def valid_code(code):
+    return bool(re.fullmatch(r"\d{6}", str(code)))
+
+
+def _require_code(code):
+    if not valid_code(code):
+        raise ValueError("국내 종목의 6자리 숫자 코드를 입력해 주십시오.")
+
+
+def _session():
+    if not hasattr(_local, "session"):
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "ko-KR,ko;q=0.9"})
+        retry = Retry(total=1, connect=1, read=0, status=0, backoff_factor=0.2)
+        session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4))
+        _local.session = session
+    return _local.session
+
+
+def request_bytes(url, params=None):
+    response = _session().get(url, params=params, timeout=(3.05, 7))
+    response.raise_for_status()
+    if len(response.content) > 5_000_000:
+        raise ValueError("응답 크기가 예상 범위를 초과했습니다.")
+    return response.content
+
+
+def safe_url(value, base=BASE):
+    resolved = urljoin(base, value)
+    parsed = urlparse(resolved)
+    return resolved if parsed.scheme in {"https", "http"} and parsed.netloc and not parsed.username else None
+
+
+def failure(source, empty, error):
+    return Result(empty, source, "error", [f"데이터를 확인하지 못했습니다 ({type(error).__name__})."])
+
+
+def parse_market(body, market):
+    soup = BeautifulSoup(body, "html.parser")
+    table = soup.select_one("table.type_2")
+    if table is None:
+        raise ValueError("시가총액 표를 찾지 못했습니다.")
+    heads = [compact(x.get_text()) for x in table.select("th")]
+    required = {"현재가": "Close", "등락률": "Chg", "거래량": "Volume", "시가총액": "Marcap"}
+    if not set(required).issubset(heads):
+        raise ValueError("시가총액 표의 필수 열 구성이 달라졌습니다.")
+    positions = {label: heads.index(label) for label in required}
+    rows = []
+    for tr in table.select("tr"):
+        cells = tr.find_all("td", recursive=False)
+        link = tr.select_one("a[href*='code=']")
+        if not link or len(cells) != len(heads):
+            continue
+        code = parse_qs(urlparse(link.get("href", "")).query).get("code", [""])[0]
+        if not valid_code(code):
+            continue
+        row = {"Code": code, "Name": link.get_text(strip=True), "Market": market}
+        for label, field_name in required.items():
+            row[field_name] = numeric(cells[positions[label]].get_text())
+        if any(row[key] is None for key in required.values()):
+            continue
+        row["Marcap"] *= 100_000_000
+        if row["Close"] > 0 and row["Volume"] >= 0 and row["Marcap"] > 0:
+            rows.append(row)
+    if not rows:
+        raise ValueError("검증된 종목 행이 없습니다.")
+    return pd.DataFrame(rows, columns=MARKET_COLS)
+
+
+def fetch_market(pages_per_market=2):
+    pages_per_market = max(1, min(int(pages_per_market), 5))
+    jobs = [(sosok, page) for sosok in (0, 1) for page in range(1, pages_per_market + 1)]
+
+    def get(job):
+        sosok, page = job
+        market = "KOSPI" if sosok == 0 else "KOSDAQ"
+        try:
+            body = request_bytes(BASE + "/sise/sise_market_sum.naver", {"sosok": sosok, "page": page})
+            return parse_market(body, market), None
+        except Exception as exc:
+            return None, f"{market} {page}페이지: {type(exc).__name__}"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(pool.map(get, jobs))
+    frames, errors = [x for x, _ in responses if x is not None], [err for _, err in responses if err]
+    df = pd.concat(frames, ignore_index=True).drop_duplicates("Code") if frames else pd.DataFrame(columns=MARKET_COLS)
+    notes = [f"시장별 시가총액 상위 {pages_per_market}페이지 중 {len(frames)}/{len(jobs)}페이지 수집; 실제 {len(df)}종목 표본.",
+             "페이지별 조회 시점이 다를 수 있으며 기준 체결 시각은 미제공입니다."] + errors
+    return Result(df, BASE + "/sise/sise_market_sum.naver", "ok" if not errors else "partial" if frames else "error", notes)
+
+
+def local_search(query, stocks):
+    query = query.strip()
+    if not query or stocks.empty:
+        return pd.DataFrame(columns=["Code", "Name"])
+    matches = (stocks.Code.astype(str).str.startswith(query) if query.isdigit()
+               else stocks.Name.astype(str).str.contains(query, case=False, regex=False, na=False))
+    return stocks.loc[matches, ["Code", "Name"]].drop_duplicates("Code").head(10)
+
+
+def parse_autocomplete(payload):
+    rows = []
+
+    def scalar(value):
+        while isinstance(value, list) and value:
+            value = value[0]
+        return value if isinstance(value, str) else ""
+
+    def walk(value):
+        if isinstance(value, dict):
+            code = value.get("code") or value.get("itemCode") or value.get("symbolCode")
+            name = value.get("name") or value.get("itemName") or value.get("stockName")
+            if valid_code(code) and isinstance(name, str):
+                rows.append({"Code": str(code), "Name": name})
+            else:
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+        elif isinstance(value, list):
+            if len(value) >= 2 and valid_code(scalar(value[0])) and scalar(value[1]) and not valid_code(scalar(value[1])):
+                rows.append({"Code": scalar(value[0]), "Name": scalar(value[1])})
+            else:
+                for child in value:
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+    walk(payload)
+    return pd.DataFrame(rows, columns=["Code", "Name"]).drop_duplicates("Code").head(10)
+
+
+def search_remote(query):
+    source = "https://ac.finance.naver.com/ac"
+    try:
+        payload = json.loads(request_bytes(source, {"q": query[:80], "target": "stock"}))
+        return Result(parse_autocomplete(payload), source)
+    except Exception as exc:
+        return failure(source, pd.DataFrame(columns=["Code", "Name"]), exc)
+
+
+def fetch_history(code, days=800):
+    _require_code(code)
+    today = datetime.now(KST).date()
+    source = f"FinanceDataReader / NAVER:{code}"
+    try:
+        process = subprocess.run(
+            [sys.executable, "-c", _FDR_WORKER_CODE, code,
+             str(today - timedelta(days=days)), str(today)],
+            capture_output=True, text=True, encoding="utf-8", timeout=25, check=True,
+        )
+        data = json.loads(process.stdout)
+        frame = pd.DataFrame(data["data"], columns=data["columns"], index=pd.to_datetime(data["index"]))
+        return Result(frame, source)
+    except Exception as exc:
+        return failure(source, pd.DataFrame(), exc)
+
+
+def empty_fund():
+    return {"PER": None, "PBR": None, "DividendYield": None, "IndustryPER": None,
+            "Target": None, "ROE": None, "ROEPeriod": None, "Summary": None}
+
+
+def parse_main(body, code):
+    soup = BeautifulSoup(body, "html.parser")
+    # Validate identity, not just the existence of some price elsewhere on page.
+    company = soup.select_one(".wrap_company")
+    accessible = next((tag for tag in soup.select("div.blind")
+                       if "종목코드" in tag.get_text() and code in tag.get_text()), None)
+    identity = company.get_text(" ", strip=True) if company else (accessible.get_text(" ", strip=True) if accessible else "")
+    if code not in identity:
+        raise ValueError("응답의 종목코드를 검증하지 못했습니다.")
+    name_tag = company.select_one("h2 a") if company else None
+    name = name_tag.get_text(strip=True) if name_tag else code
+    quote = {"Code": code, "Name": name, "Price": None, "Previous": None, "AsOf": None, "Market": "KRX"}
+    # Prefer the explicitly labelled accessibility block; do not mix KRX/NXT panels.
+    if accessible:
+        text = accessible.get_text(" ", strip=True)
+        price = re.search(r"현재가\s*([\d,]+)", text)
+        previous = re.search(r"전일가\s*([\d,]+)", text)
+        quote["Price"] = numeric(price.group(1)) if price else None
+        quote["Previous"] = numeric(previous.group(1)) if previous else None
+        timestamp = re.search(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일\s*(\d{1,2})시\s*(\d{1,2})분", text)
+        if timestamp:
+            quote["AsOf"] = datetime(*map(int, timestamp.groups()), tzinfo=KST).isoformat(timespec="minutes")
+    fund = empty_fund()
+    for field_name, selector in [("PER", "#_per"), ("PBR", "#_pbr"), ("DividendYield", "#_dvr"), ("Target", "#_target_money")]:
+        tag = soup.select_one(selector)
+        fund[field_name] = numeric(tag.get_text()) if tag else None
+    # _cper can be forecast PER; industry PER must be found by its label.
+    for th in soup.select("th"):
+        label = compact(th.get_text())
+        td = th.find_next_sibling("td")
+        if not td:
+            continue
+        if label.startswith("동일업종PER"):
+            em = td.select_one("em")
+            fund["IndustryPER"] = numeric(em.get_text() if em else td.get_text().replace("배", ""))
+        if "목표주가" in label and fund["Target"] is None:
+            ems = td.select("em")
+            if ems:
+                fund["Target"] = numeric(ems[-1].get_text())
+    summary = soup.select(".summary_info p")
+    if summary:
+        fund["Summary"] = "\n\n".join(x.get_text(" ", strip=True) for x in summary)
+    table = soup.select_one(".cop_analysis table")
+    if table:
+        # Derive annual span from headers, then explicitly exclude all (E) cells.
+        annual = next((th for th in table.select("thead th") if "최근 연간 실적" in th.get_text(" ", strip=True)), None)
+        count = int(annual.get("colspan", "0")) if annual else 0
+        periods = [compact(th.get_text()) for th in table.select("thead th") if re.search(r"\d{4}\.\d{2}", th.get_text())]
+        for tr in table.select("tbody tr"):
+            th = tr.select_one("th")
+            if not th or "ROE" not in th.get_text():
+                continue
+            cells = tr.find_all("td", recursive=False)
+            if count <= 0 or len(periods) != len(cells):
+                break
+            for i in reversed(range(min(count, len(periods)))):
+                period, value = periods[i], numeric(cells[i].get_text())
+                if "(E)" not in period and value is not None:
+                    fund["ROE"], fund["ROEPeriod"] = value, period
+                    break
+            break
+    return {"quote": quote, "fund": fund}
+
+
+def fetch_main(code):
+    _require_code(code)
+    source = BASE + "/item/main.naver?code=" + code
+    try:
+        data = parse_main(request_bytes(source), code)
+        missing = [key for key in ["PER", "PBR", "IndustryPER", "Target", "ROE"] if data["fund"][key] is None]
+        notes = ["조회 화면의 KRX 가격 스냅샷이며 일봉 및 백테스트에 합치지 않습니다."]
+        if missing:
+            notes.append("재무 미확인 항목: " + ", ".join(missing))
+        if data["quote"]["Price"] is None or data["quote"]["AsOf"] is None:
+            notes.append("현재가 또는 그 기준 시각을 확인하지 못했습니다.")
+        return Result(data, source, "partial" if missing or data["quote"]["Price"] is None else "ok", notes)
+    except Exception as exc:
+        return failure(source, {"quote": {}, "fund": empty_fund()}, exc)
+
+
+def parse_investors(body):
+    soup = BeautifulSoup(body, "html.parser")
+    rows = []
+    for table in soup.select("table.type2"):
+        labels = compact(" ".join(th.get_text(" ", strip=True) for th in table.select("th")))
+        if not all(key in labels for key in ["날짜", "종가", "기관", "외국인", "보유율"]):
+            continue
+        # Two-level header: 5 common fields + institution net + foreign net/held/rate.
+        if not all(key in labels for key in ["전일비", "등락률", "거래량", "순매매량", "보유주수"]):
+            continue
+        for tr in table.select("tr"):
+            cells = tr.find_all("td", recursive=False)
+            if len(cells) != 9:
+                continue
+            values = [x.get_text(" ", strip=True) for x in cells]
+            if not re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", values[0]):
+                continue
+            close, institution, foreign, rate = [numeric(values[i]) for i in [1, 5, 6, 8]]
+            if close is None or close <= 0:
+                continue
+            rows.append({"Date": pd.Timestamp(values[0].replace(".", "-")), "Close": close,
+                         "InstitutionNet": institution, "ForeignNet": foreign, "ForeignRate": rate,
+                         "InstitutionAmountEstimate": institution * close / 1e8 if institution is not None else None,
+                         "ForeignAmountEstimate": foreign * close / 1e8 if foreign is not None else None})
+    if not rows:
+        raise ValueError("투자자별 수급 표의 구조 또는 데이터를 검증하지 못했습니다.")
+    return pd.DataFrame(rows, columns=INV_COLS).drop_duplicates("Date").sort_values("Date")
+
+
+def fetch_investors(code):
+    _require_code(code)
+    source = BASE + "/item/frgn.naver?code=" + code
+    frames, errors = [], []
+    for page in (1, 2):
+        try:
+            frames.append(parse_investors(request_bytes(BASE + "/item/frgn.naver", {"code": code, "page": page})))
+        except Exception as exc:
+            errors.append(f"수급 {page}페이지: {type(exc).__name__}")
+    df = pd.concat(frames, ignore_index=True).drop_duplicates("Date").sort_values("Date") if frames else pd.DataFrame(columns=INV_COLS)
+    return Result(df, source, "ok" if not errors else "partial" if frames else "error",
+                  ["금액은 순매수 수량×해당일 종가의 추정값입니다. 실제 순매수 거래대금과 다릅니다."] + errors)
+
+
+def parse_reports(body, code):
+    soup = BeautifulSoup(body, "html.parser")
+    table = soup.select_one("table.type_1")
+    if not table or not all(label in table.get_text() for label in ["종목명", "제목", "증권사", "작성일"]):
+        raise ValueError("리포트 표를 확인하지 못했습니다.")
+    rows = []
+    for tr in table.select("tr"):
+        cells = tr.find_all("td", recursive=False)
+        if len(cells) != 6:
+            continue
+        stock, title = cells[0].select_one("a"), cells[1].select_one("a")
+        if not stock or not title:
+            continue
+        row_code = parse_qs(urlparse(stock.get("href", "")).query).get("code", [""])[0]
+        if row_code != code:
+            continue
+        link = safe_url(title.get("href", ""), BASE + "/research/")
+        if link:
+            rows.append({"title": title.get_text(strip=True), "broker": cells[2].get_text(strip=True),
+                         "date": cells[4].get_text(strip=True), "link": link})
+    return rows[:5]
+
+
+def fetch_reports(code):
+    _require_code(code)
+    source = BASE + "/research/company_list.naver"
+    try:
+        body = request_bytes(source, {"searchType": "itemCode", "itemCode": code})
+        return Result(parse_reports(body, code), source)
+    except Exception as exc:
+        return failure(source, [], exc)
+
+
+def parse_news(body):
+    root = ET.fromstring(body)
+    rows = []
+    for item in root.findall("./channel/item")[:5]:
+        link = safe_url(item.findtext("link", ""), "https://news.google.com")
+        if link:
+            rows.append({"title": item.findtext("title", "제목 미제공"), "link": link,
+                         "date": item.findtext("pubDate", ""), "publisher": item.findtext("source", "")})
+    return rows
+
+
+def fetch_news(name):
+    source = "https://news.google.com/rss/search"
+    try:
+        body = request_bytes(source, {"q": f'"{name[:80]}" 주식', "hl": "ko", "gl": "KR", "ceid": "KR:ko"})
+        return Result(parse_news(body), source)
+    except Exception as exc:
+        return failure(source, [], exc)
+
+
+def read_short_csv(content, code, asof):
+    """Optional explicit data input; no unsupported short-selling endpoint used."""
+    frame = pd.read_csv(StringIO(content.decode("utf-8-sig")), dtype={"Code": str})
+    required = {"Code", "Date", "ShortRatio"}
+    if not required.issubset(frame.columns):
+        raise ValueError("공매도 CSV에는 Code, Date, ShortRatio 열이 필요합니다.")
+    frame["Code"] = frame.Code.str.strip().str.zfill(6)
+    frame["Date"] = pd.to_datetime(frame.Date, errors="coerce")
+    matches = frame[(frame.Code == code) & (frame.Date == pd.Timestamp(asof))]
+    if len(matches) != 1:
+        raise ValueError("종목코드와 분석 기준일이 일치하는 행이 정확히 1개 필요합니다.")
+    row = matches.iloc[0].to_dict()
+    ratio = numeric(row["ShortRatio"])
+    if ratio is None or not 0 <= ratio <= 100:
+        raise ValueError("ShortRatio는 0~100 범위의 거래량 비중(%)이어야 합니다.")
+    row["ShortRatio"] = ratio
+    return row
+
+
+def fetch_bundle(code):
+    jobs = {"history": lambda: fetch_history(code), "main": lambda: fetch_main(code),
+            "investors": lambda: fetch_investors(code), "reports": lambda: fetch_reports(code)}
+    # Four independent bounded data jobs; UI and Streamlit state stay on main thread.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {key: pool.submit(fn) for key, fn in jobs.items()}
+        return {key: future.result() for key, future in futures.items()}
+
+# ===== 3. Streamlit 화면 =====
+from datetime import datetime
+from html import escape
+
+import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import requests
-from bs4 import BeautifulSoup
 import streamlit as st
 
-st.set_page_config(
-    page_title="부리부리 종합 주식 작전실",
-    page_icon="🐽",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-st.markdown(
-    """
-    <style>
-    @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
-    * { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, sans-serif; }
-    .stApp { background-color: #0c0f17; color: #e1e7f0; }
-    
-    .header-card {
-        background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 16px;
-        padding: 18px 24px;
-        margin-bottom: 20px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    
-    .score-container {
-        background: rgba(255, 255, 255, 0.02);
-        border: 1px solid rgba(255, 255, 255, 0.07);
-        border-radius: 16px;
-        padding: 20px;
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    
-    .target-grid {
-        display: flex;
-        justify-content: space-between;
-        gap: 10px;
-        margin-top: 16px;
-        flex-wrap: wrap;
-    }
-    .target-item {
-        flex: 1;
-        min-width: 110px;
-        background: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        border-radius: 10px;
-        padding: 10px 6px;
-        text-align: center;
-    }
-    .target-title { font-size: 11px; color: #8b9bb4; margin-bottom: 4px; }
-    .target-val { font-size: 15px; font-weight: 700; color: #38bdf8; }
-
-    .insight-card {
-        background: rgba(255, 255, 255, 0.02);
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        border-radius: 12px;
-        padding: 16px 20px;
-        margin-bottom: 12px;
-        line-height: 1.6;
-        font-size: 14px;
-        color: #cbd5e1;
-    }
-
-    .autocomplete-box {
-        background: rgba(22, 27, 34, 0.95);
-        border: 1px solid rgba(56, 189, 248, 0.3);
-        border-radius: 14px;
-        padding: 12px 16px;
-        margin-bottom: 15px;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-    }
-    .autocomplete-header {
-        font-size: 12px;
-        color: #94a3b8;
-        font-weight: 600;
-        margin-bottom: 8px;
-        display: flex;
-        justify-content: space-between;
-    }
-
-    [data-testid="stMetric"] {
-        background: rgba(255, 255, 255, 0.02) !important;
-        border: 1px solid rgba(255, 255, 255, 0.06) !important;
-        padding: 12px !important;
-        border-radius: 12px !important;
-    }
-    [data-testid="stMetricLabel"] { font-size: 12px !important; color: #94a3b8 !important; }
-    [data-testid="stMetricValue"] { font-size: 19px !important; font-weight: 700 !important; }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
-
-if "selected_stock" not in st.session_state:
-    st.session_state.selected_stock = ""
 
 
-# ====================================================
-# [네이버 금융 직결 고속 종목 리스트 크롤러 (차단 위험 0%)]
-# ====================================================
-@st.cache_data(ttl=600)
-def get_naver_market_stocks():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    rows = []
-    # 코스피 1~2페이지 (상위 100종목)
-    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
-        for page in [1, 2]:
-            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
-            try:
-                res = requests.get(url, headers=headers, timeout=3.5)
-                soup = BeautifulSoup(res.text, "html.parser")
-                table = soup.select_one("table.type_2")
-                if not table:
-                    continue
-                for tr in table.select("tr"):
-                    tds = tr.select("td")
-                    if len(tds) >= 12 and tds[1].select_one("a"):
-                        a_tag = tds[1].select_one("a")
-                        name = a_tag.text.strip()
-                        code = a_tag["href"].split("code=")[-1].strip()
-                        close_txt = tds[2].text.strip().replace(",", "")
-                        diff_txt = tds[4].text.strip().replace("%", "").replace(",", "").replace("+", "")
-                        vol_txt = tds[9].text.strip().replace(",", "")
-                        mar_txt = tds[6].text.strip().replace(",", "")
-                        
-                        try:
-                            close = int(close_txt)
-                            chg = float(diff_txt)
-                            vol = int(vol_txt)
-                            marcap = int(mar_txt) * 100000000  # 억원 단위
-                            amt = (close * vol)
-                            rows.append({
-                                "Code": code,
-                                "Name": name,
-                                "Close": close,
-                                "Chg": chg,
-                                "Volume": vol,
-                                "Amount": amt,
-                                "Marcap": marcap
-                            })
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-
-    if rows:
-        df = pd.DataFrame(rows).drop_duplicates(subset=["Code"]).reset_index(drop=True)
-        return df
-    
-    # 예외 대비 기본 우량주 백업 리스트
-    fallback_data = [
-        {"Code": "005930", "Name": "삼성전자", "Close": 72000, "Chg": 1.5, "Volume": 10000000, "Amount": 720000000000, "Marcap": 450000000000000},
-        {"Code": "000660", "Name": "SK하이닉스", "Close": 180000, "Chg": 2.2, "Volume": 3000000, "Amount": 540000000000, "Marcap": 130000000000000},
-        {"Code": "373220", "Name": "LG에너지솔루션", "Close": 380000, "Chg": -0.8, "Volume": 400000, "Amount": 150000000000, "Marcap": 90000000000000},
-        {"Code": "207940", "Name": "삼성바이오로직스", "Close": 950000, "Chg": 3.1, "Volume": 150000, "Amount": 140000000000, "Marcap": 68000000000000},
-        {"Code": "005380", "Name": "현대차", "Close": 240000, "Chg": 1.2, "Volume": 900000, "Amount": 210000000000, "Marcap": 50000000000000},
-        {"Code": "000270", "Name": "기아", "Close": 115000, "Chg": 0.5, "Volume": 1100000, "Amount": 120000000000, "Marcap": 46000000000000},
-        {"Code": "068270", "Name": "셀트리온", "Close": 190000, "Chg": -1.2, "Volume": 700000, "Amount": 130000000000, "Marcap": 41000000000000},
-        {"Code": "035420", "Name": "NAVER", "Close": 170000, "Chg": -0.5, "Volume": 800000, "Amount": 136000000000, "Marcap": 27000000000000},
-        {"Code": "035720", "Name": "카카오", "Close": 42000, "Chg": -1.8, "Volume": 1500000, "Amount": 63000000000, "Marcap": 18000000000000},
-        {"Code": "012330", "Name": "현대모비스", "Close": 225000, "Chg": 0.8, "Volume": 300000, "Amount": 67000000000, "Marcap": 21000000000000},
-        {"Code": "005490", "Name": "POSCO홀딩스", "Close": 360000, "Chg": -2.1, "Volume": 450000, "Amount": 160000000000, "Marcap": 30000000000000},
-        {"Code": "028260", "Name": "삼성물산", "Close": 145000, "Chg": 1.4, "Volume": 400000, "Amount": 58000000000, "Marcap": 26000000000000}
-    ]
-    return pd.DataFrame(fallback_data)
+@st.cache_data(ttl=300, max_entries=4, show_spinner=False)
+def cached_market(pages=2):
+    return fetch_market(pages)
 
 
-def resolve_stock_code(query):
-    query = query.strip()
-    stocks = get_naver_market_stocks()
-    if query.isdigit():
-        matched = stocks[stocks["Code"] == query]
-        if not matched.empty:
-            return query, matched.iloc[0]["Name"]
-        return query, query
-    matched = stocks[stocks["Name"] == query]
-    if not matched.empty:
-        return matched.iloc[0]["Code"], query
-    matched_part = stocks[stocks["Name"].astype(str).str.contains(query, case=False, na=False)]
-    if not matched_part.empty:
-        return matched_part.iloc[0]["Code"], matched_part.iloc[0]["Name"]
-    
-    # 네이버 실시간 검색 직접 조회
-    try:
-        url = f"https://ac.finance.naver.com/ac?q={urllib.parse.quote(query)}&target=stock"
-        res = requests.get(url, timeout=2.5).json()
-        items = res.get("items", [[]])[0]
-        if items:
-            return items[0][0], items[0][1]
-    except Exception:
-        pass
-    return None, None
+@st.cache_data(ttl=300, max_entries=64, show_spinner=False)
+def cached_bundle(code):
+    return fetch_bundle(code)
 
 
-def search_similar_stocks(query):
-    query = query.strip()
+@st.cache_data(ttl=300, max_entries=128, show_spinner=False)
+def cached_search(query):
+    return search_remote(query)
+
+
+@st.cache_data(ttl=900, max_entries=64, show_spinner=False)
+def cached_news(name):
+    return fetch_news(name)
+
+
+def fmt(value, suffix="", digits=0, signed=False):
+    value = number(value)
+    if value is None:
+        return "미확인"
+    return format(value, f"{ '+' if signed else ''},.{digits}f") + suffix
+
+
+def select_stock(code, name):
+    st.session_state.selected_code = code
+    st.session_state.selected_name = name
+    st.session_state.query = name
+    st.session_state.candidates = []
+    st.session_state.search_message = ""
+    st.session_state.needs_search = False
+
+
+def request_search():
+    st.session_state.needs_search = True
+
+
+def refresh_selected():
+    code, name = st.session_state.selected_code, st.session_state.selected_name
+    if code:
+        cached_bundle.clear(code)
+    if name:
+        cached_news.clear(name)
+
+
+def resolve_pending(stocks):
+    if not st.session_state.needs_search:
+        return
+    st.session_state.needs_search = False
+    query = st.session_state.query.strip()
+    st.session_state.candidates, st.session_state.search_message = [], ""
     if not query:
-        return pd.DataFrame()
-    stocks = get_naver_market_stocks()
-    if query.isdigit():
-        matched = stocks[stocks["Code"].astype(str).str.startswith(query)].copy()
+        return
+    local = local_search(query, stocks)
+    if valid_code(query):
+        match = local.loc[local.Code == query]
+        select_stock(query, match.iloc[0].Name if not match.empty else query)
+        return
+    exact = local[local.Name.str.casefold() == query.casefold()]
+    if len(exact) == 1:
+        select_stock(exact.iloc[0].Code, exact.iloc[0].Name)
+        return
+    if len(query) < 2:
+        st.session_state.search_message = "종목명은 두 글자 이상, 종목코드는 6자리로 입력해 주십시오."
+        return
+    remote = cached_search(query)
+    matches = pd.concat([local, remote.data], ignore_index=True).drop_duplicates("Code").head(10)
+    exact = matches[matches.Name.str.casefold() == query.casefold()]
+    if len(exact) == 1:
+        select_stock(exact.iloc[0].Code, exact.iloc[0].Name)
     else:
-        matched = stocks[stocks["Name"].astype(str).str.contains(query, case=False, na=False)].copy()
-    
-    if matched.empty:
-        return pd.DataFrame()
-    return matched.sort_values(by="Amount", ascending=False).head(5)
+        st.session_state.candidates = matches.to_dict("records")
+        if matches.empty:
+            st.session_state.search_message = "검색 결과를 확인하지 못했습니다. 6자리 종목코드로 조회해 주십시오."
 
 
-def fetch_realtime_price(code, fallback_price):
-    url = f"https://finance.naver.com/item/main.naver?code={code}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+def render_rankings(result):
+    st.markdown("#### 🏆 표본 종목 비교")
+    st.caption(result.notes[0])
+    st.button("랭킹 새로 조회", key="refresh_market", on_click=cached_market.clear, use_container_width=True)
+    if result.status != "ok":
+        st.warning("일부 또는 전체 페이지를 수집하지 못했습니다. 확보된 종목만 표시합니다.")
+    ranked = market_rankings(result.data)
+    if ranked.empty:
+        st.info("랭킹을 계산할 유효한 시세가 없습니다. 종목코드로 개별 분석을 진행하실 수 있습니다.")
+        return
+    st.caption("랭킹 점수 = 당일 등락률 50 + 표본 내 시가총액 25 + 추정 거래대금 25. 개별 분석 점수와 다른 지표입니다.")
+    top, bottom, lead = st.tabs(["점수 상위", "점수 하위", "모멘텀"])
+    groups = [(top, ranked.head(10), "top"),
+              (bottom, ranked.sort_values("ScreenScore").head(10), "bottom"),
+              (lead, ranked.sort_values("Momentum", ascending=False).head(10), "lead")]
+    for tab, frame, prefix in groups:
+        with tab:
+            for i, row in enumerate(frame.itertuples()):
+                st.button(f"{i + 1}. {row.Name} · {row.ScreenScore:.1f}점", key=f"{prefix}_{row.Code}",
+                          use_container_width=True, on_click=select_stock, args=(row.Code, row.Name))
+                st.caption(f"{row.Close:,.0f}원 · {row.Chg:+.2f}% · 거래대금 추정 {row.AmountEstimate / 1e8:,.0f}억원")
+    st.caption("전체 시장 순위가 아닙니다. 가격×거래량은 실제 거래대금·자금 유입액과 다릅니다.")
+
+
+def render_chart(df):
+    view = df.loc[df.index >= df.index[-1] - pd.Timedelta(days=365)]
+    fig = make_subplots(rows=2, cols=2, shared_xaxes=True,
+                        row_heights=[0.75, 0.25], column_widths=[0.84, 0.16],
+                        horizontal_spacing=0.02, vertical_spacing=0.05,
+                        specs=[[{}, {}], [{}, None]])
+    fig.add_trace(go.Candlestick(x=view.index, open=view.Open, high=view.High, low=view.Low,
+                                close=view.Close, name="일봉", increasing_line_color="#ef4444",
+                                decreasing_line_color="#38bdf8"), row=1, col=1)
+    for col, color in [("MA5", "#f59e0b"), ("MA20", "#38bdf8"), ("MA60", "#10b981")]:
+        fig.add_trace(go.Scatter(x=view.index, y=view[col], name=col,
+                                line={"color": color, "width": 1.3}), row=1, col=1)
+    low, high = view.Low.min(), view.High.max()
+    if high <= low:
+        low, high = low * 0.99, high * 1.01
+    bins = np.linspace(low, high, 17)
+    counts, _ = np.histogram(view.Close, bins=bins, weights=view.Volume)
+    fig.add_trace(go.Bar(y=(bins[:-1] + bins[1:]) / 2, x=counts, orientation="h",
+                         name="종가 구간별 거래량", marker_color="rgba(56,189,248,0.4)"), row=1, col=2)
+    for col, color in [("MACD", "#f43f5e"), ("MACD_SIGNAL", "#fbbf24")]:
+        fig.add_trace(go.Scatter(x=view.index, y=view[col], name=col,
+                                line={"color": color, "width": 1.3}), row=2, col=1)
+    fig.update_yaxes(matches="y", showticklabels=False, row=1, col=2)
+    fig.update_xaxes(showticklabels=False, row=1, col=2)
+    for row in (1, 2):
+        fig.update_xaxes(rangebreaks=[{"bounds": ["sat", "mon"]}], row=row, col=1)
+    fig.update_layout(template="plotly_dark", height=530, xaxis_rangeslider_visible=False,
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      margin={"l": 5, "r": 5, "t": 15, "b": 5}, legend={"orientation": "h"})
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("우측 분포는 일별 거래량 전체를 그날 종가 구간에 배정한 근사치입니다. 실제 체결가격별 매물대가 아닙니다.")
+
+
+def render_supply(df, investors):
+    columns = st.columns(4)
+    for box, sessions, field, title in [
+        (columns[0], 5, "ForeignAmountEstimate", "5거래일 외국인 추정"),
+        (columns[1], 5, "InstitutionAmountEstimate", "5거래일 기관 추정"),
+        (columns[2], 20, "ForeignAmountEstimate", "20거래일 외국인 추정"),
+    ]:
+        window = investor_window(investors, df, sessions, [field])
+        box.metric(title, fmt(window[field].sum() if window is not None else None, "억원", 1, True))
+    latest = investor_window(investors, df, 1, ["ForeignRate"])
+    columns[3].metric("외국인 보유율", fmt(latest.ForeignRate.iloc[-1] if latest is not None else None, "%", 2))
+    st.caption("추정 금액 = 일별 순매수 수량×해당일 종가의 합. 실제 순매수 금액과 다릅니다. 기간 내 모든 거래일이 있어야 합계를 표시합니다.")
+    if investors.empty:
+        st.info("투자자별 매매 데이터를 확인하지 못했습니다.")
+        return
+    inv = investors[investors.Date <= df.index[-1]].sort_values("Date", ascending=False).head(20)
+    show = inv.rename(columns={"Date": "날짜", "Close": "종가", "InstitutionNet": "기관 순매수(주)",
+                               "ForeignNet": "외국인 순매수(주)", "ForeignRate": "외국인 보유율(%)",
+                               "InstitutionAmountEstimate": "기관 추정(억원)", "ForeignAmountEstimate": "외국인 추정(억원)"})
+    st.dataframe(show, hide_index=True, use_container_width=True)
+    if not inv.empty:
+        plot = inv.sort_values("Date")
+        fig = go.Figure()
+        fig.add_bar(x=plot.Date, y=plot.ForeignNet, name="외국인(주)")
+        fig.add_bar(x=plot.Date, y=plot.InstitutionNet, name="기관(주)")
+        fig.update_layout(template="plotly_dark", height=280, barmode="group", margin={"t": 15, "b": 5})
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_fund(fund, reports, close):
+    st.markdown("#### 기업 개요")
+    st.text(fund.get("Summary") or "기업 개요를 확인하지 못했습니다.")
+    cols = st.columns(4)
+    target = fund.get("Target")
+    cols[0].metric("컨센서스 목표주가", fmt(target, "원"),
+                   fmt((target / close - 1) * 100, "%", 1, True) if target and target > 0 else None)
+    cols[1].metric("최근 확정 연간 ROE", fmt(fund.get("ROE"), "%", 2))
+    cols[2].metric("PER / 업종 PER", f"{fmt(fund.get('PER'), '배', 2)} / {fmt(fund.get('IndustryPER'), '배', 2)}")
+    cols[3].metric("PBR", fmt(fund.get("PBR"), "배", 2))
+    st.caption(f"ROE 기간: {fund.get('ROEPeriod') or '미확인'} · 배당수익률: {fmt(fund.get('DividendYield'), '%', 2)}")
+    st.caption("조회 시점의 재무·컨센서스 정보입니다. 목표가는 증권사 전망 평균이며, 차트·백테스트의 매도 체결가로 사용하지 않습니다.")
+    st.markdown("#### 증권사 리포트")
+    if not reports.data:
+        st.info("리포트가 없거나 수집하지 못했습니다. 데이터 상태에서 확인하실 수 있습니다.")
+    for rep in reports.data:
+        st.link_button(f"{rep['broker']} · {rep['title']} ({rep['date']})", rep["link"])
+
+
+def render_backtest(df):
+    choice = st.selectbox("전략", list(STRATEGIES), key="bt_strategy")
+    c1, c2, c3 = st.columns(3)
+    fee = c1.number_input("편도 수수료(%)", min_value=0.0, max_value=5.0, value=0.015, step=0.005, format="%.3f", key="bt_fee")
+    slip = c2.number_input("편도 슬리피지(%)", min_value=0.0, max_value=5.0, value=0.05, step=0.01, format="%.3f", key="bt_slippage")
+    tax = c3.number_input("매도 시 세금(%)", min_value=0.0, max_value=5.0, value=0.0, step=0.01, format="%.3f", key="bt_tax")
+    st.caption("세금 기본값은 0%입니다. 대상 상품과 적용 기간에 맞게 직접 입력해 주십시오. 입력한 단일 세율을 전체 기간에 적용합니다.")
+    start = df.index[-1] - pd.Timedelta(days=365)
     try:
-        res = requests.get(url, headers=headers, timeout=2.5)
-        soup = BeautifulSoup(res.text, "html.parser")
-        p_tag = soup.select_one(".no_today .no_down .blind, .no_today .no_up .blind, .no_today span.blind")
-        if p_tag and p_tag.text.strip():
-            return float(p_tag.text.replace(",", ""))
-    except Exception:
-        pass
-    return fallback_price
+        result = run_backtest(df, STRATEGIES[choice], start=start,
+                              fee_bps=fee * 100, slippage_bps=slip * 100, sell_tax_bps=tax * 100)
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+    bt = result["df"]
+    st.caption(f"평가 구간: {bt.index[0]:%Y-%m-%d} ~ {bt.index[-1]:%Y-%m-%d}. 이전 일봉은 지표 준비에만 사용합니다.")
+    boxes = st.columns(5)
+    boxes[0].metric("전략 누적수익률", fmt(result["total_return"], "%", 2, True))
+    boxes[1].metric("동일 종목 단순보유", fmt(result["buy_hold_return"], "%", 2, True))
+    boxes[2].metric("단순보유 대비 차이", fmt(result["excess_pp"], "%p", 2, True))
+    boxes[3].metric("최대낙폭(MDD)", fmt(result["mdd"], "%", 2), help="음수 값이며 0에 가까울수록 과거 낙폭이 작습니다.")
+    boxes[4].metric("청산 거래 승률", fmt(result["win_rate"], "%", 1), f"청산 {result['trade_count']}회", delta_color="off")
+    fig = go.Figure()
+    for col, label, color in [("Cum_Strategy", "전략", "#38bdf8"), ("Cum_Market", "단순보유", "#94a3b8")]:
+        fig.add_scatter(x=bt.index, y=(bt[col] - 1) * 100, name=label, line={"color": color})
+    fig.update_layout(template="plotly_dark", height=340, yaxis_title="누적 수익률(%)", margin={"t": 20, "b": 10})
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("전일 종가로 신호를 확정하고 다음 거래일 시가에 체결합니다. 수수료·슬리피지·매도세를 입력값대로 반영합니다. 거래량 0인 날에는 체결하지 않습니다.")
+    st.caption("마지막 보유분은 마지막 종가로 평가하며 청산 승률에서 제외합니다. 단순보유에도 같은 시작일과 매수 비용을 적용합니다. 소수점 수량을 허용한 전액 매수·매도 모형입니다.")
+    st.caption("현재 종목의 과거 가격 모형이며 배당·현금이자·실제 주문 유동성은 반영하지 않습니다. 데이터의 수정주가·기업행사 처리에 영향을 받으며 미래 성과를 보장하지 않습니다.")
+    if result["open_trade"]:
+        st.info(f"종료일 미청산 보유분이 있습니다. 진입일: {result['open_trade']['EntryDate']:%Y-%m-%d}")
+    if not result["trades"].empty:
+        st.dataframe(result["trades"].drop(columns=["Capital", "Units"]), hide_index=True, use_container_width=True)
+    st.download_button("백테스트 일별 결과 CSV", bt.to_csv().encode("utf-8-sig"),
+                       file_name=f"backtest_{st.session_state.selected_code}.csv", mime="text/csv")
 
 
-def fetch_investor_naver(code):
-    url = f"https://finance.naver.com/item/frgn.naver?code={code}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    rows = []
+def render_analysis(bundle, code, display_name):
+    history = bundle["history"]
+    if history.status == "error":
+        st.error("일봉 수집에 실패했습니다. 잠시 후 다시 조회해 주십시오.")
+        st.caption(" / ".join(history.notes))
+        return
     try:
-        res = requests.get(url, headers=headers, timeout=3.5)
-        soup = BeautifulSoup(res.text, "html.parser")
-        tables = soup.select("table.type2")
-        if len(tables) >= 2:
-            for tr in tables[1].select("tr"):
-                tds = tr.select("td")
-                if len(tds) >= 9 and tds[0].text.strip().replace(".", "").isdigit():
-                    try:
-                        date = tds[0].text.strip()
-                        close = int(tds[1].text.strip().replace(",", ""))
-                        inst_net = int(tds[5].text.strip().replace(",", ""))
-                        for_net = int(tds[6].text.strip().replace(",", ""))
-                        for_rate = float(tds[8].text.strip().replace("%", "").replace(",", ""))
-                        rows.append({
-                            "날짜": date,
-                            "종가": close,
-                            "기관순매수": inst_net,
-                            "외인순매수": for_net,
-                            "기관순매수금액": (inst_net * close) / 100000000,
-                            "외인순매수금액": (for_net * close) / 100000000,
-                            "외인보유율": for_rate,
-                        })
-                    except Exception:
-                        continue
-    except Exception:
-        pass
-    return pd.DataFrame(rows)
-
-
-def fetch_fundamental_and_consensus(code):
-    url = f"https://finance.naver.com/item/main.naver?code={code}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    data = {
-        "PER": None, "PBR": None, "배당수익률": None, "업종PER": None,
-        "목표주가": None, "ROE": None, "기업개요": "기업 정보 준비 중", "리포트_목록": []
-    }
-    try:
-        res = requests.get(url, headers=headers, timeout=3.5)
-        soup = BeautifulSoup(res.text, "html.parser")
-
-        per_tag = soup.select_one("#_per")
-        pbr_tag = soup.select_one("#_pbr")
-        dvr_tag = soup.select_one("#_dvr")
-        c_per_tag = soup.select_one("#_cper")
-        target_tag = soup.select_one("em#_target_money")
-
-        if per_tag and per_tag.text.strip():
-            data["PER"] = float(per_tag.text.replace(",", ""))
-        if pbr_tag and pbr_tag.text.strip():
-            data["PBR"] = float(pbr_tag.text.replace(",", ""))
-        if dvr_tag and dvr_tag.text.strip():
-            data["배당수익률"] = float(dvr_tag.text.replace(",", ""))
-        if c_per_tag and c_per_tag.text.strip():
-            data["업종PER"] = float(c_per_tag.text.replace(",", ""))
-        if target_tag and target_tag.text.strip():
-            data["목표주가"] = float(target_tag.text.replace(",", ""))
-
-        summary_tag = soup.select_one("div.summary_info p")
-        if summary_tag:
-            data["기업개요"] = summary_tag.text.strip()
-
-        cop_table = soup.select_one("div.section.cop_analysis table")
-        if cop_table:
-            for tr in cop_table.select("tbody tr"):
-                th = tr.select_one("th")
-                if th and "ROE" in th.text:
-                    tds = tr.select("td")
-                    for td in reversed(tds):
-                        val = td.text.strip().replace(",", "")
-                        if val and val != "-":
-                            try:
-                                data["ROE"] = float(val)
-                                break
-                            except Exception:
-                                continue
-                    break
-
-        report_url = f"https://finance.naver.com/item/research.naver?code={code}"
-        res_rep = requests.get(report_url, headers=headers, timeout=3.5)
-        soup_rep = BeautifulSoup(res_rep.text, "html.parser")
-        for tr in soup_rep.select("table.type2 tr")[2:7]:
-            tds = tr.select("td")
-            if len(tds) >= 4 and tds[0].text.strip():
-                title = tds[0].text.strip()
-                broker = tds[2].text.strip()
-                date = tds[3].text.strip()
-                link_tag = tds[0].select_one("a")
-                link = "https://finance.naver.com" + link_tag["href"] if link_tag else "#"
-                data["리포트_목록"].append({"title": title, "broker": broker, "date": date, "link": link})
-    except Exception:
-        pass
-    return data
-
-
-def fetch_short_selling(code):
-    url = f"https://finance.naver.com/item/short_selling.naver?code={code}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    short_data = {"공매도비중": 0.0, "공매도거래량": 0}
-    try:
-        res = requests.get(url, headers=headers, timeout=3.5)
-        soup = BeautifulSoup(res.text, "html.parser")
-        table = soup.select("table.type2 tbody tr")
-        for tr in table:
-            tds = tr.select("td")
-            if len(tds) >= 5 and tds[0].text.strip():
-                short_data["공매도비중"] = float(tds[4].text.strip().replace("%", "").replace(",", ""))
-                short_data["공매도거래량"] = int(tds[1].text.strip().replace(",", ""))
-                break
-    except Exception:
-        pass
-    return short_data
-
-
-def fetch_news(keyword):
-    url = f"https://news.google.com/rss/search?q={urllib.parse.quote(keyword)}+주식&hl=ko&gl=KR&ceid=KR:ko"
-    news_list = []
-    try:
-        res = requests.get(url, timeout=3.5)
-        soup = BeautifulSoup(res.content, "html.parser")
-        for item in soup.find_all("item")[:5]:
-            t = item.title.text if item.title else ""
-            l = item.link.text if item.link else "#"
-            if " - " in t:
-                t = t.rsplit(" - ", 1)[0]
-            news_list.append({"title": t, "link": l})
-    except Exception:
-        pass
-    return news_list
-
-
-def calculate_trend_support_price(df):
-    try:
-        lows = df["Low"].values
-        n = len(df)
-        lookback = min(60, n)
-        start_idx = n - lookback
-        sub_lows = lows[start_idx:]
-        min_idx_rel = int(np.argmin(sub_lows[:lookback - 8]))
-        p1_idx = start_idx + min_idx_rel
-        p1_val = lows[p1_idx]
-        
-        best_up_slope = None
-        for i in range(p1_idx + 5, n - 1):
-            if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
-                slope = (lows[i] - p1_val) / (i - p1_idx)
-                if slope > 0:
-                    best_up_slope = slope
-                    break
-                    
-        if best_up_slope is not None:
-            trend_val = p1_val + best_up_slope * (n - 1 - p1_idx)
-            return float(trend_val)
-    except Exception:
-        pass
-    return None
-
-
-def evaluate_pro_quant_score(df, df_inv, fund, short):
-    score = 0
-    logs = []
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    # 1. 기술적 추세 팩터 (25점)
-    tech_score = 0
-    if latest["MA5"] > latest["MA20"] > latest["MA60"]:
-        tech_score += 12
-        logs.append(("이평선 완전 정배열 (5>20>60)", "+12점", "상승 추세 추종 적합 (골든 상태)"))
-    elif latest["Close"] > latest["MA20"]:
-        tech_score += 6
-        logs.append(("20일선 지지 안착", "+6점", "단기 지지선 반등 흐름 유지"))
-    else:
-        tech_score -= 6
-        logs.append(("20일선 하회 역배열", "-6점", "단기 하락 추세 지속"))
-
-    bb_b = latest["BB_%b"]
-    if 0.75 <= bb_b <= 1.05:
-        tech_score += 7
-        logs.append(("볼린저 밴드라이딩 모멘텀", "+7점", "강한 추세 확장 구간 진입"))
-    elif bb_b < 0.2:
-        tech_score -= 4
-        logs.append(("볼린저 하단 이탈 경계", "-4점", "하방 압력 과도"))
-
-    if latest["MACD_HIST"] > 0 and prev["MACD_HIST"] <= 0:
-        tech_score += 6
-        logs.append(("MACD 골든크로스 발생", "+6점", "상승 모멘텀 전환 신호 포착"))
-    elif latest["MACD"] > latest["MACD_SIGNAL"]:
-        tech_score += 3
-        logs.append(("MACD 시그널 상회", "+3점", "매수 우위 흐름 지속"))
-    score += max(0, min(25, tech_score))
-
-    # 2. 수급 및 저변동성 팩터 (25점)
-    supply_score = 0
-    if not df_inv.empty:
-        for_5d_amt = df_inv["외인순매수금액"].head(5).sum()
-        inst_5d_amt = df_inv["기관순매수금액"].head(5).sum()
-        if for_5d_amt > 0 and inst_5d_amt > 0:
-            supply_score += 12
-            logs.append(("외인·기관 쌍끌이 동반 순매수", "+12점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 유입"))
-        elif for_5d_amt > 0 or inst_5d_amt > 0:
-            supply_score += 6
-            logs.append(("메이저 주포 수급 유입", "+6점", f"외인({for_5d_amt:+.1f}억) 또는 기관({inst_5d_amt:+.1f}억) 순매수"))
-        else:
-            supply_score -= 5
-            logs.append(("외인·기관 동반 매도세", "-5점", f"5일 외인({for_5d_amt:+.1f}억), 기관({inst_5d_amt:+.1f}억) 이탈"))
-
-        if len(df_inv) >= 10 and df_inv["외인보유율"].iloc[0] > df_inv["외인보유율"].iloc[9]:
-            supply_score += 5
-            logs.append(("외국인 지분율 확대", "+5점", f"현재 외인 지분율 {df_inv['외인보유율'].iloc[0]:.2f}%"))
-
-    mfi = latest["MFI"]
-    if 50 <= mfi <= 75:
-        supply_score += 5
-        logs.append(("MFI 스마트 머니 유입", "+5점", f"MFI {mfi:.1f} (대량 매집 진행)"))
-    elif mfi > 80:
-        supply_score -= 4
-        logs.append(("MFI 단기 과열 경계", "-4점", f"MFI {mfi:.1f}"))
-
-    if latest["OBV"] > df["OBV"].tail(20).mean():
-        supply_score += 3
-        logs.append(("OBV 매집 추세 유지", "+3점", "거래량 기반 매집 에너지 양호"))
-    score += max(0, min(25, supply_score))
-
-    # 3. 밸류 & 퀄리티 팩터 (25점)
-    analyst_score = 0
-    if fund["목표주가"] and fund["목표주가"] > 0:
-        upside = ((fund["목표주가"] - latest["Close"]) / latest["Close"]) * 100
-        if upside >= 25.0:
-            analyst_score += 10
-            logs.append(("목표가 괴리율 매력", "+10점", f"목표가 {fund['목표주가']:,.0f}원 (상승여력 {upside:+.1f}%)"))
-        elif upside >= 10.0:
-            analyst_score += 6
-            logs.append(("상승여력 유효", "+6점", f"목표가 {fund['목표주가']:,.0f}원 (상승여력 {upside:+.1f}%)"))
-        elif upside < 0:
-            analyst_score -= 6
-            logs.append(("목표가 초과 고평가", "-6점", f"현재가가 목표주가({fund['목표주가']:,.0f}원) 상회"))
-
-    if fund["ROE"] is not None:
-        if fund["ROE"] >= 15.0:
-            analyst_score += 8
-            logs.append(("고수익 퀄리티 (ROE 15%↑)", "+8점", f"ROE {fund['ROE']:.2f}% (우수한 자본 효율성)"))
-        elif fund["ROE"] >= 8.0:
-            analyst_score += 4
-            logs.append(("안정적 자본 효율성", "+4점", f"ROE {fund['ROE']:.2f}% (안정적 이익 창출)"))
-        elif fund["ROE"] < 0:
-            analyst_score -= 8
-            logs.append(("ROE 마이너스 적자 기업", "-8점", f"ROE {fund['ROE']:.2f}%"))
-
-    if fund["PER"] is not None:
-        if fund["PER"] < 0:
-            analyst_score -= 5
-            logs.append(("실적 적자", "-5점", "PER 음수"))
-        elif fund["업종PER"] and fund["PER"] <= fund["업종PER"] * 0.7:
-            analyst_score += 4
-            logs.append(("업종 대비 저평가", "+4점", f"PER {fund['PER']}배 (업종 {fund['업종PER']}배)"))
-
-    if fund["PBR"] and fund["PBR"] < 0.9:
-        analyst_score += 3
-        logs.append(("저PBR 자산 가치주", "+3점", f"PBR {fund['PBR']}배로 장부가치 하회"))
-    score += max(0, min(25, analyst_score))
-
-    # 4. 가격 모멘텀 & 리스크 관리 (25점)
-    m_score = 0
-    rsi = latest["RSI"]
-    if 45 <= rsi <= 65:
-        m_score += 10
-        logs.append(("이상적 RSI 구간", "+10점", f"RSI {rsi:.1f} (과열 없는 안정적 추세)"))
-    elif 30 <= rsi < 45:
-        m_score += 5
-        logs.append(("바닥권 반등 구간", "+5점", f"RSI {rsi:.1f}"))
-    elif rsi > 75:
-        m_score -= 6
-        logs.append(("단기 과매수 과열 경계", "-6점", f"RSI {rsi:.1f}"))
-
-    high_52w = df["High"].max()
-    dist_high = ((latest["Close"] - high_52w) / high_52w) * 100
-    if dist_high >= -7.0:
-        m_score += 10
-        logs.append(("52주 신고가 근접 (12M 모멘텀)", "+10점", f"최고가 대비 {dist_high:.1f}% 위치 (강한 주도력)"))
-    elif dist_high <= -35.0:
-        m_score -= 6
-        logs.append(("장기 낙폭 과대 역배열", "-6점", f"최고가 대비 {dist_high:.1f}% 하락"))
-
-    if short["공매도비중"] >= 15.0:
-        m_score -= 8
-        logs.append(("공매도 폭탄 경보", "-8점", f"공매도 비중 {short['공매도비중']:.2f}% (하방 압력 과도)"))
-    elif short["공매도비중"] >= 7.0:
-        m_score -= 4
-        logs.append(("공매도 경계", "-4점", f"공매도 비중 {short['공매도비중']:.2f}%"))
-    else:
-        m_score += 5
-
-    score += max(0, min(25, m_score))
-
-    final_score = int(max(10, min(100, score)))
-    if final_score >= 85:
-        grade, stars = "🌟 슈퍼 주도주 (강력 매수)", "★★★★★"
-    elif final_score >= 70:
-        grade, stars = "👍 우량 상승주 (분할 매수)", "★★★★☆"
-    elif final_score >= 50:
-        grade, stars = "⚖️ 중립 관망 (추세 확인)", "★★★☆☆"
-    elif final_score >= 35:
-        grade, stars = "⚠️ 약세 지속 (비중 축소)", "★★☆☆☆"
-    else:
-        grade, stars = "🚨 고위험 종목 (진입 금지)", "★☆☆☆☆"
-
-    return final_score, grade, stars, logs
-
-
-def run_quant_backtest(df, strategy_type="trend_following"):
-    bt_df = df.copy()
-    bt_df["Signal"] = 0
-    
-    if strategy_type == "trend_following":
-        bt_df["Signal"] = np.where(bt_df["MA5"] > bt_df["MA20"], 1, 0)
-    elif strategy_type == "bollinger_reversal":
-        buy_cond = (bt_df["Close"] > bt_df["MA20"]) & (bt_df["BB_%b"] >= 0.4)
-        sell_cond = bt_df["BB_%b"] >= 1.05
-        sig = 0
-        signals = []
-        for i in range(len(bt_df)):
-            if buy_cond.iloc[i]:
-                sig = 1
-            elif sell_cond.iloc[i]:
-                sig = 0
-            signals.append(sig)
-        bt_df["Signal"] = signals
-    elif strategy_type == "rsi_momentum":
-        bt_df["Signal"] = np.where((bt_df["RSI"] >= 42) & (bt_df["RSI"] <= 68), 1, 0)
-
-    bt_df["Position"] = bt_df["Signal"].shift(1).fillna(0)
-    bt_df["Market_Return"] = bt_df["Close"].pct_change().fillna(0)
-    bt_df["Strategy_Return"] = bt_df["Market_Return"] * bt_df["Position"]
-
-    bt_df["Cum_Market"] = (1 + bt_df["Market_Return"]).cumprod()
-    bt_df["Cum_Strategy"] = (1 + bt_df["Strategy_Return"]).cumprod()
-
-    cum_max = bt_df["Cum_Strategy"].cummax()
-    drawdown = (bt_df["Cum_Strategy"] - cum_max) / (cum_max + 1e-9)
-    mdd = drawdown.min() * 100
-
-    total_return = (bt_df["Cum_Strategy"].iloc[-1] - 1) * 100
-    buy_hold_return = (bt_df["Cum_Market"].iloc[-1] - 1) * 100
-    alpha = total_return - buy_hold_return
-
-    trades = bt_df["Position"].diff().fillna(0)
-    entry_indices = bt_df[trades == 1].index
-    exit_indices = bt_df[trades == -1].index
-
-    win_count = 0
-    trade_count = 0
-    for entry in entry_indices:
-        sub_exits = exit_indices[exit_indices > entry]
-        if len(sub_exits) > 0:
-            exit_p = bt_df.loc[sub_exits[0], "Close"]
-            entry_p = bt_df.loc[entry, "Close"]
-            if (exit_p - entry_p) > 0:
-                win_count += 1
-            trade_count += 1
-
-    win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0.0
-
-    return {
-        "df": bt_df,
-        "total_return": total_return,
-        "buy_hold_return": buy_hold_return,
-        "alpha": alpha,
-        "mdd": mdd,
-        "win_rate": win_rate,
-        "trade_count": trade_count,
-    }
-
-
-# ====================================================
-# [0.1초 즉시 산출: 네이버 금융 직결 고속 랭킹 엔진]
-# ====================================================
-@st.cache_data(ttl=300)
-def generate_instant_market_rankings():
-    stocks = get_naver_market_stocks()
-    df = stocks.copy()
-
-    # 1. 종합점수 랭킹 연산 (우량성 + 모멘텀 + 유동성)
-    trend_pts = np.where(df["Chg"] > 20, 15 - (df["Chg"] - 20) * 1.5,
-                np.where(df["Chg"] > 0, 25 + df["Chg"] * 1.3, 18 + df["Chg"] * 2.0))
-    marcap_pts = ((np.log10(df["Marcap"].clip(lower=1e10)) - 10.5) * 6).clip(lower=5, upper=25)
-    liquidity_pts = ((np.log10(df["Amount"].clip(lower=1e8)) - 8.5) * 6).clip(lower=5, upper=25)
-
-    df["종합점수"] = (trend_pts + marcap_pts + liquidity_pts + 15).clip(lower=20, upper=95).astype(int)
-    df["등락률표시"] = df["Chg"].apply(lambda x: f"{x:+.2f}%")
-    df["거래대금_억"] = (df["Amount"] / 100000000).astype(int)
-
-    top10_score = df.sort_values(by=["종합점수", "Amount"], ascending=[False, False]).head(10).reset_index(drop=True)
-    bot10_score = df.sort_values(by=["종합점수", "Chg"], ascending=[True, True]).head(10).reset_index(drop=True)
-
-    # 2. 시장 자금 주도주 랭킹 (모멘텀 + 거래대금)
-    amt_log = np.log10(df["Amount"].clip(lower=1e8))
-    df["모멘텀"] = (df["Chg"] * 2.5) + (amt_log * 5)
-    top10_lead = df.sort_values(by="모멘텀", ascending=False).head(10).reset_index(drop=True)
-    bot10_lead = df.sort_values(by="모멘텀", ascending=True).head(10).reset_index(drop=True)
-
-    return top10_score, bot10_score, top10_lead, bot10_lead
-
-
-# ====================================================
-# 메인 헤더 & 레이아웃
-# ====================================================
-st.markdown(
-    """
-    <div class="header-card">
-        <div>
-            <div style="font-size: 13px; color: #38bdf8; font-weight:600; margin-bottom:2px;">MULTI-FACTOR & QUANT BACKTESTING ENGINE</div>
-            <h2 style="margin:0; font-size:22px; font-weight:800; color:#f8fafc;">부리부리 종합 주식 작전실</h2>
-        </div>
-        <div style="font-size: 26px;">🐽📊</div>
-    </div>
-""",
-    unsafe_allow_html=True,
-)
-
-main_col, rank_col = st.columns([7, 3])
-
-# 1. 오른쪽 시장 랭킹
-with rank_col:
-    top10_score, bot10_score, top10_lead, bot10_lead = generate_instant_market_rankings()
-
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#38bdf8; margin-bottom:6px;'>🏆 종합점수 TOP 10</div>", unsafe_allow_html=True)
-    score_tab1, score_tab2 = st.tabs(["🌟 종합점수 상위 TOP 10", "🚨 종합점수 하위 TOP 10"])
-
-    def render_score_buttons(df_rank, prefix):
-        if df_rank.empty:
-            st.caption("데이터 수집 중...")
+        completed = completed_history(history.data)
+        if len(completed) < 61:
+            st.warning(f"전 거래일까지의 일봉이 {len(completed)}개입니다. 60일 지표와 전일 비교에는 최소 61개가 필요합니다.")
             return
-        for i, row in df_rank.iterrows():
-            cols = st.columns([5, 3, 2])
-            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
-                st.session_state.selected_stock = row["Name"]
-                st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-weight:700; font-size:13px; color:#38bdf8; padding-top:6px;'>{row['종합점수']}점</div>", unsafe_allow_html=True)
+        df = add_indicators(completed)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    fund = bundle["main"].data["fund"]
+    quote = bundle["main"].data["quote"]
+    investors = bundle["investors"].data
+    name = quote.get("Name") or display_name
+    stale = (datetime.now(KST).date() - df.index[-1].date()).days > 7
+    st.markdown(f"### {escape(name)} ({code})")
+    st.caption(f"분석 일봉 기준: {df.index[-1]:%Y-%m-%d} · KST 당일 봉은 항상 제외 · 조회: {history.fetched_at}")
+    if stale:
+        st.warning("최근 일봉이 7일 이상 경과했습니다. 거래정지·휴장·수집 지연 여부를 확인해 주십시오. 최신 재무정보의 점수 반영은 보류합니다.")
+    qcols = st.columns(2)
+    previous, snapshot = number(quote.get("Previous")), number(quote.get("Price"))
+    qcols[0].metric("확정 일봉 종가", fmt(df.Close.iloc[-1], "원"), fmt(period_return(df, 1), "%", 2, True))
+    qcols[1].metric("별도 조회 시세 스냅샷(KRX)", fmt(snapshot, "원"),
+                   fmt((snapshot / previous - 1) * 100, "%", 2, True) if snapshot and previous and previous > 0 else None)
+    st.caption(f"스냅샷 기준 시각: {quote.get('AsOf') or '미확인'} · 조회 시세는 과거 일봉에 덮어쓰지 않습니다.")
+    with st.expander("공매도 데이터 추가 및 출처 상태"):
+        st.caption("공매도 자동 수집은 검증된 공급원이 없어 미제공 상태입니다. Code, Date, ShortRatio 열이 있는 UTF-8 CSV를 올리시면 기준일이 일치하는 행을 평가에 사용할 수 있습니다. ShortRatio는 공매도 거래량/전체 거래량×100입니다.")
+        uploaded = st.file_uploader("공매도 CSV(선택)", type=["csv"], key=f"short_{code}")
+        status_rows = [{"데이터": key, "상태": item.status, "조회 시각(KST)": item.fetched_at,
+                        "출처": item.source, "설명": " / ".join(item.notes)} for key, item in bundle.items()]
+        st.dataframe(pd.DataFrame(status_rows), hide_index=True, use_container_width=True)
+    short = None
+    if uploaded is not None:
+        try:
+            short = read_short_csv(uploaded.getvalue(), code, df.index[-1])
+        except (ValueError, UnicodeError, pd.errors.ParserError) as exc:
+            st.warning(str(exc))
+    score = evaluate_score(df, investors, {} if stale else fund, short)
+    cols = st.columns(3)
+    cols[0].metric("확인된 항목의 득점", f"{score['points']} / {score['possible']}")
+    cols[1].metric("전체 배점 중 데이터 확보", f"{score['coverage']}%")
+    cols[2].metric("공매도 거래량 비중", fmt((short or {}).get("ShortRatio"), "%", 2))
+    st.write(score["grade"])
+    st.caption("설명 가능한 규칙 점수입니다. 승률·상승 확률이 아닙니다. 미확인 항목에는 점수를 주지 않고 100점으로 환산하지도 않습니다.")
+    if score["score"] is None:
+        st.caption(f"미확인 항목까지 확보했을 때의 산술적 점수 범위: {score['points']}~{score['upper_bound']} / 100. 신뢰구간이나 전망 범위가 아닙니다.")
+    scenario = price_scenario(df)
+    if scenario:
+        with st.expander("ATR 기준 가격 시나리오"):
+            boxes = st.columns(5)
+            for box, (label, value) in zip(boxes, [(k, v) for k, v in scenario.items() if k != "reward_risk"]):
+                box.metric(label, fmt(value, "원"))
+            st.caption(f"1차 진입 기준 보상/위험 비율 {scenario['reward_risk']:.2f}. 최근 ATR로 간격을 정한 계산 예시이며, 실제 지지·저항 검증이나 호가단위 보정은 포함하지 않습니다.")
+    tabs = st.tabs(["차트", "외국인·기관", "기업·리포트", "채점표", "백테스트", "뉴스"])
+    with tabs[0]:
+        boxes = st.columns(3)
+        for box, sessions, label in zip(boxes, [5, 20, 252], ["5거래일 수익률", "20거래일 수익률", "252거래일 수익률"]):
+            box.metric(label, fmt(period_return(df, sessions), "%", 2, True))
+        render_chart(df)
+        st.download_button("분석 일봉·지표 CSV", df.to_csv().encode("utf-8-sig"),
+                           file_name=f"daily_{code}.csv", mime="text/csv")
+    with tabs[1]:
+        render_supply(df, investors)
+    with tabs[2]:
+        render_fund(fund, bundle["reports"], df.Close.iloc[-1])
+    with tabs[3]:
+        st.dataframe(score["logs"], hide_index=True, use_container_width=True)
+        st.caption("가점 조건을 충족하지 않은 관측값은 0점, 데이터가 없는 항목은 미확인입니다. 득점 합계가 위에 표시된 점수와 일치합니다.")
+    with tabs[4]:
+        render_backtest(df)
+    with tabs[5]:
+        if st.button("관련 뉴스 조회", key=f"load_news_{code}"):
+            st.session_state[f"news_open_{code}"] = True
+        if st.session_state.get(f"news_open_{code}"):
+            news = cached_news(name)
+            if news.status == "error":
+                st.info("뉴스를 조회하지 못했습니다.")
+            elif not news.data:
+                st.info("검색된 뉴스가 없습니다.")
+            for item in news.data:
+                st.link_button(item["title"], item["link"])
+                st.caption(item["date"])
+            st.caption(f"Google News RSS · 조회: {news.fetched_at} · 제목 검색 결과이며 기업 공시 확인을 대체하지 않습니다.")
 
-    with score_tab1:
-        render_score_buttons(top10_score, "score_top")
-    with score_tab2:
-        render_score_buttons(bot10_score, "score_bot")
 
-    st.write("")
-    st.divider()
-
-    st.markdown("<div style='font-size:14px; font-weight:700; color:#f59e0b; margin-bottom:6px;'>🔥 시장 자금 주도주 TOP 10</div>", unsafe_allow_html=True)
-    lead_tab1, lead_tab2 = st.tabs(["🚀 상승 주도주", "📉 하락 소외주"])
-
-    def render_lead_buttons(df_rank, prefix):
-        if df_rank.empty:
-            st.caption("데이터 수집 중...")
-            return
-        for i, row in df_rank.iterrows():
-            cols = st.columns([5, 3, 2])
-            if cols[0].button(f"{i+1}. {row['Name']}", key=f"{prefix}_{row['Code']}", use_container_width=True):
-                st.session_state.selected_stock = row["Name"]
-                st.rerun()
-            cols[1].markdown(f"<div style='text-align:right; font-size:12px; padding-top:6px;'>{row['Close']:,}원 ({row['등락률표시']})</div>", unsafe_allow_html=True)
-            cols[2].markdown(f"<div style='text-align:center; font-size:12px; color:#94a3b8; padding-top:6px;'>{row['거래대금_억']:,}억</div>", unsafe_allow_html=True)
-
-    with lead_tab1:
-        render_lead_buttons(top10_lead, "lead_top")
-    with lead_tab2:
-        render_lead_buttons(bot10_lead, "lead_bot")
-
-
-# 2. 왼쪽 메인 정밀 분석
-with main_col:
-    col_s1, col_s2, col_s3 = st.columns([3.5, 1, 1])
-    default_search = st.session_state.selected_stock
-    search_input = col_s1.text_input(
-        "종목 검색",
-        value=default_search,
-        placeholder="종목명(예: 현대, 삼성, 카카오) 또는 6자리 코드 입력",
-        label_visibility="collapsed"
-    )
-    analyze_btn = col_s2.button("🚀 정밀 분석", type="primary", use_container_width=True)
-    refresh_btn = col_s3.button("⚡ 시세 갱신", use_container_width=True)
-
-    if refresh_btn:
-        st.cache_data.clear()
-        st.rerun()
-
-    # 연관 종목 드롭다운
-    if search_input.strip() and search_input != st.session_state.selected_stock:
-        sim_df = search_similar_stocks(search_input)
-        if not sim_df.empty:
-            st.markdown(
-                """
-                <div class="autocomplete-box">
-                    <div class="autocomplete-header">
-                        <span>🔍 연관 종목 검색 결과 (클릭 시 즉시 분석)</span>
-                        <span>실시간 현재가 / 등락률</span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-            for idx, srow in sim_df.iterrows():
-                ac_cols = st.columns([5, 3, 2])
-                if ac_cols[0].button(f"🏢 {srow['Name']} ({srow['Code']})", key=f"ac_{srow['Code']}", use_container_width=True):
-                    st.session_state.selected_stock = srow["Name"]
-                    st.rerun()
-                
-                chg_val = srow["Chg"]
-                chg_color = "#ef4444" if chg_val > 0 else ("#38bdf8" if chg_val < 0 else "#94a3b8")
-                ac_cols[1].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; padding-top:6px;'>{srow['Close']:,}원</div>", unsafe_allow_html=True)
-                ac_cols[2].markdown(f"<div style='text-align:right; font-weight:700; font-size:13px; color:{chg_color}; padding-top:6px;'>{chg_val:+.2f}%</div>", unsafe_allow_html=True)
-
-    if search_input != st.session_state.selected_stock:
-        st.session_state.selected_stock = search_input
-
-    current_target = st.session_state.selected_stock.strip() or search_input.strip()
-
-    if current_target:
-        code, stock_name = resolve_stock_code(current_target)
-
+def main():
+    st.set_page_config(page_title="부리부리 종합 주식 작전실", page_icon="🐽", layout="wide")
+    st.markdown("""<style>
+    .stApp { background-color: #0c0f17; color: #e1e7f0; }
+    .hero { padding: 22px; border: 1px solid #243249; border-radius: 16px;
+            background: linear-gradient(120deg,#152235,#111826); margin-bottom:20px; }
+    .hero h1 { font-size:26px; margin:0; padding:0; }
+    [data-testid='stMetric'] { border:1px solid #243249; border-radius:12px; padding:12px; }
+    [data-testid='stMetricValue'] { font-size:23px; }
+    </style><div class='hero'><h1>🐽 부리부리 종합 주식 작전실</h1>
+    <p style='color:#94a3b8;margin-bottom:0'>종목 분석 · 수급 확인 · 거래비용을 반영한 전략 검증</p></div>""", unsafe_allow_html=True)
+    for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
+                       "candidates": [], "search_message": ""}.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    with st.spinner("시장 표본을 조회하고 있습니다…"):
+        market = cached_market()
+    resolve_pending(market.data)
+    left, right = st.columns([7, 3])
+    with right:
+        render_rankings(market)
+    with left:
+        c1, c2, c3 = st.columns([4, 1, 1])
+        c1.text_input("종목 검색", key="query", placeholder="종목명 또는 6자리 코드", on_change=request_search, label_visibility="collapsed")
+        c2.button("정밀 분석", type="primary", on_click=request_search, use_container_width=True)
+        c3.button("데이터 갱신", on_click=refresh_selected, use_container_width=True)
+        if st.session_state.search_message:
+            st.info(st.session_state.search_message)
+        if st.session_state.candidates:
+            st.caption("분석하실 종목을 선택해 주십시오.")
+            for item in st.session_state.candidates:
+                st.button(f"{item['Name']} ({item['Code']})", key=f"search_{item['Code']}",
+                          on_click=select_stock, args=(item["Code"], item["Name"]))
+        code = st.session_state.selected_code
         if not code:
-            st.error(f"'{current_target}' 종목을 찾을 수 없습니다.")
-        else:
-            with st.spinner(f"[{stock_name}] 다중 팩터 정밀 분석 중..."):
-                end_dt = datetime.today()
-                start_dt = end_dt - timedelta(days=365)
-                df = fdr.DataReader(code, start_dt.strftime("%Y-%m-%d"))
+            st.info("종목을 검색하시거나 오른쪽 랭킹에서 선택해 주십시오.")
+            return
+        with st.spinner("일봉·재무·수급을 조회하고 있습니다…"):
+            bundle = cached_bundle(code)
+        render_analysis(bundle, code, st.session_state.selected_name)
 
-                if df is None or df.empty or len(df) < 40:
-                    st.error("데이터 수집에 실패했거나 거래일 데이터가 부족합니다.")
-                else:
-                    raw_latest = df["Close"].iloc[-1]
-                    prev_price = df["Close"].iloc[-2]
-                    
-                    latest_price = fetch_realtime_price(code, raw_latest)
-                    df.at[df.index[-1], "Close"] = latest_price
-                    today_open = df["Open"].iloc[-1]
 
-                    df["MA5"] = df["Close"].rolling(5).mean()
-                    df["MA20"] = df["Close"].rolling(20).mean()
-                    df["MA60"] = df["Close"].rolling(60).mean()
-                    df["STD20"] = df["Close"].rolling(20).std()
-                    df["BB_Upper"] = df["MA20"] + (df["STD20"] * 2)
-                    df["BB_Lower"] = df["MA20"] - (df["STD20"] * 2)
-                    df["BB_%b"] = (df["Close"] - df["BB_Lower"]) / (df["BB_Upper"] - df["BB_Lower"] + 1e-9)
-
-                    tr1 = df["High"] - df["Low"]
-                    tr2 = (df["High"] - df["Close"].shift(1)).abs()
-                    tr3 = (df["Low"] - df["Close"].shift(1)).abs()
-                    df["TR"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                    df["ATR14"] = df["TR"].rolling(14).mean()
-                    atr_val = df["ATR14"].iloc[-1] if not pd.isna(df["ATR14"].iloc[-1]) else latest_price * 0.03
-
-                    exp12 = df["Close"].ewm(span=12, adjust=False).mean()
-                    exp26 = df["Close"].ewm(span=26, adjust=False).mean()
-                    df["MACD"] = exp12 - exp26
-                    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-                    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
-
-                    delta = df["Close"].diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                    df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
-                    df["OBV"] = (np.sign(df["Close"].diff()).fillna(0) * df["Volume"]).cumsum()
-
-                    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-                    rmf = tp * df["Volume"]
-                    pos_mf = (rmf.where(tp > tp.shift(1), 0)).rolling(14).sum()
-                    neg_mf = (rmf.where(tp < tp.shift(1), 0)).rolling(14).sum()
-                    mfr = pos_mf / (neg_mf + 1e-9)
-                    df["MFI"] = 100 - (100 / (1 + mfr))
-
-                    ret_1d = ((latest_price - prev_price) / prev_price) * 100
-                    ret_1w = ((latest_price - df["Close"].iloc[-5]) / df["Close"].iloc[-5]) * 100
-                    ret_1m = ((latest_price - df["Close"].iloc[-20]) / df["Close"].iloc[-20]) * 100
-                    ret_1y = ((latest_price - df["Close"].iloc[0]) / df["Close"].iloc[0]) * 100
-
-                    high_20 = df["High"].tail(20).max()
-                    low_20 = df["Low"].tail(20).min()
-
-                    price_min, price_max = df["Low"].min(), df["High"].max()
-                    bins = np.linspace(price_min, price_max, 13)
-                    v_counts, _ = np.histogram(df["Close"], bins=bins, weights=df["Volume"])
-
-                    df_inv = fetch_investor_naver(code)
-                    fund = fetch_fundamental_and_consensus(code)
-                    short = fetch_short_selling(code)
-                    news_items = fetch_news(stock_name)
-
-                    for_5d = df_inv["외인순매수금액"].head(5).sum() if not df_inv.empty else 0
-                    inst_5d = df_inv["기관순매수금액"].head(5).sum() if not df_inv.empty else 0
-                    for_20d = df_inv["외인순매수금액"].head(20).sum() if not df_inv.empty else 0
-                    for_rate = df_inv["외인보유율"].iloc[0] if not df_inv.empty else 0.0
-
-                    total_score, grade_text, stars, logs = evaluate_pro_quant_score(df, df_inv, fund, short)
-
-                    # 1·2차 진입선 산출
-                    ma5_val = df["MA5"].iloc[-1]
-                    ma20_val = df["MA20"].iloc[-1]
-                    trend_support = calculate_trend_support_price(df)
-
-                    candidates_1 = []
-                    if trend_support is not None and (latest_price * 0.92 <= trend_support <= latest_price * 0.985):
-                        candidates_1.append(trend_support)
-                    if latest_price > ma5_val:
-                        candidates_1.append(ma5_val)
-                    candidates_1.append(latest_price * 0.965)
-
-                    calc_entry1 = min(candidates_1)
-                    if (latest_price - calc_entry1) / latest_price < 0.025:
-                        calc_entry1 = latest_price * 0.965
-                    entry_1 = round(calc_entry1, -2)
-
-                    if ma20_val < entry_1 * 0.98:
-                        entry_2 = round(max(ma20_val, entry_1 * 0.95), -2)
-                    else:
-                        entry_2 = round(entry_1 * 0.95, -2)
-
-                    t1_calc = max(high_20 * 1.01, latest_price * 1.05)
-                    target_1 = round(t1_calc, -2)
-
-                    if fund["목표주가"] and fund["목표주가"] > target_1 * 1.04:
-                        target_2 = round(fund["목표주가"], -2)
-                    else:
-                        target_2 = round(target_1 * 1.08, -2)
-
-                    stop_candidate = min(entry_2 * 0.965, latest_price - (atr_val * 1.8))
-                    stop_loss = round(max(stop_candidate, latest_price * 0.91), -2)
-
-                    target_grid_html = (
-                        f'<div class="score-container">'
-                        f'<div style="font-size: 13px; color: #94a3b8; font-weight:600;">{stock_name} ({code}) <span style="color:#22c55e; font-size:11px;">● REALTIME</span></div>'
-                        f'<div style="font-size: 44px; color: #38bdf8; font-weight: 800; margin: 2px 0;">{total_score}<span style="font-size:18px; color:#64748b;"> / 100</span></div>'
-                        f'<div style="font-size: 15px; font-weight: 600; color: #f1f5f9; margin-bottom: 12px;">{grade_text} <span style="color:#eab308;">{stars}</span></div>'
-                        f'<div class="target-grid">'
-                        f'<div class="target-item"><div class="target-title">1차 진입 (추세·5일선 눌림)</div><div class="target-val">{entry_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 진입 (20일선 지지)</div><div class="target-val">{entry_2:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">1차 목표 (단기 저항)</div><div class="target-val">{target_1:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">2차 목표 (추세 확장)</div><div class="target-val">{target_2:,.0f}원</div></div>'
-                        f'<div class="target-item"><div class="target-title">정밀 손절선</div><div class="target-val" style="color:#ef4444;">{stop_loss:,.0f}원</div></div>'
-                        f'</div>'
-                        f'</div>'
-                    )
-                    st.markdown(target_grid_html, unsafe_allow_html=True)
-
-                    t1, t2, t3, t4, t5, t6 = st.tabs([
-                        "차트 & 매물대 프로파일", 
-                        "외인/기관 수급", 
-                        "전망 & 애널리스트", 
-                        "종합 채점표", 
-                        "📈 퀀트 백테스팅", 
-                        "뉴스 브리핑"
-                    ])
-
-                    with t1:
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("현재가(실시간)", f"{latest_price:,.0f}원", f"{ret_1d:+.2f}%")
-                        c2.metric("1주일", f"{ret_1w:+.2f}%")
-                        c3.metric("1개월", f"{ret_1m:+.2f}%")
-                        c4.metric("1년(모멘텀)", f"{ret_1y:+.2f}%")
-
-                        fig = make_subplots(
-                            rows=2, cols=2,
-                            shared_xaxes=True,
-                            row_heights=[0.72, 0.28],
-                            column_widths=[0.85, 0.15],
-                            horizontal_spacing=0.01,
-                            vertical_spacing=0.04,
-                            specs=[[{}, {}], [{}, None]]
-                        )
-
-                        fig.add_trace(go.Candlestick(
-                            x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="주가"
-                        ), row=1, col=1)
-                        fig.add_trace(go.Scatter(
-                            x=df.index, y=df['MA5'], line=dict(color='#f59e0b', width=1.1, dash='dot'), name="5일선"
-                        ), row=1, col=1)
-                        fig.add_trace(go.Scatter(
-                            x=df.index, y=df['MA20'], line=dict(color='#38bdf8', width=1.3), name="20일선"
-                        ), row=1, col=1)
-                        fig.add_trace(go.Scatter(
-                            x=df.index, y=df['MA60'], line=dict(color='#10b981', width=1.3), name="60일선"
-                        ), row=1, col=1)
-
-                        bin_centers = 0.5 * (bins[:-1] + bins[1:])
-                        fig.add_trace(go.Bar(
-                            y=bin_centers, x=v_counts, orientation='h',
-                            marker_color='rgba(56, 189, 248, 0.35)', showlegend=False, hoverinfo='none'
-                        ), row=1, col=2)
-
-                        fig.add_trace(go.Scatter(
-                            x=df.index, y=df['MACD'], line=dict(color='#f43f5e', width=1.2), name="MACD"
-                        ), row=2, col=1)
-                        fig.add_trace(go.Scatter(
-                            x=df.index, y=df['MACD_SIGNAL'], line=dict(color='#fbbf24', width=1.2), name="Signal"
-                        ), row=2, col=1)
-
-                        fig.update_layout(
-                            template="plotly_dark",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            height=450,
-                            margin=dict(l=5, r=5, t=5, b=5),
-                            xaxis_rangeslider_visible=False
-                        )
-                        fig.update_xaxes(showticklabels=False, row=1, col=2)
-                        fig.update_yaxes(showticklabels=False, row=1, col=2)
-                        st.plotly_chart(fig, use_container_width=True)
-
-                    with t2:
-                        s1, s2, s3, s4, s5 = st.columns(5)
-                        s1.metric("5일 외국인", f"{for_5d:+.1f}억원")
-                        s2.metric("5일 기관", f"{inst_5d:+.1f}억원")
-                        s3.metric("20일 외국인", f"{for_20d:+.1f}억원")
-                        s4.metric("외인 지분율", f"{for_rate:.2f}%")
-                        s5.metric("MFI(자금유입)", f"{df['MFI'].iloc[-1]:.1f} pt")
-
-                        if not df_inv.empty:
-                            show_inv = df_inv.head(10)[["날짜", "종가", "기관순매수금액", "외인순매수금액", "외인보유율"]].copy()
-                            show_inv["기관순매수금액"] = show_inv["기관순매수금액"].apply(lambda x: f"{x:+.1f}억원")
-                            show_inv["외인순매수금액"] = show_inv["외인순매수금액"].apply(lambda x: f"{x:+.1f}억원")
-                            show_inv["외인보유율"] = show_inv["외인보유율"].apply(lambda x: f"{x:.2f}%")
-                            st.dataframe(show_inv, use_container_width=True)
-
-                    with t3:
-                        st.markdown("#### 🏢 기업 핵심 개요 & 사업 방향")
-                        st.markdown(f'<div class="insight-card">{fund["기업개요"]}</div>', unsafe_allow_html=True)
-
-                        st.markdown("#### 📊 펀더멘털 & 애널리스트 컨센서스")
-                        v1, v2, v3, v4, v5 = st.columns(5)
-                        v1.metric("목표주가", f"{fund['목표주가']:,.0f}원" if fund["목표주가"] else "미제공",
-                                  f"상승여력 {((fund['목표주가']-latest_price)/latest_price)*100:+.1f}%" if fund["목표주가"] else "")
-                        v2.metric("ROE (퀄리티)", f"{fund['ROE'] or '-'}%")
-                        v3.metric("PER / 업종", f"{fund['PER'] or '-'}배", f"업종 {fund['업종PER'] or '-'}배")
-                        v4.metric("PBR", f"{fund['PBR'] or '-'}배")
-                        v5.metric("공매도비중", f"{short['공매도비중']:.2f}%")
-
-                        st.markdown("#### 📑 최신 증권사 애널리스트 리포트")
-                        if fund["리포트_목록"]:
-                            for rep in fund["리포트_목록"]:
-                                st.markdown(f"- **[{rep['broker']}]** [{rep['title']}]({rep['link']}) <span style='color:#64748b; font-size:12px;'>({rep['date']})</span>", unsafe_allow_html=True)
-                        else:
-                            st.write("최근 등록된 증권사 분석 리포트가 없습니다.")
-
-                    with t4:
-                        st.dataframe(pd.DataFrame(logs, columns=["평가 항목", "가감점", "상세 내용"]), use_container_width=True)
-
-                    with t5:
-                        st.markdown("#### ⚙️ 퀀트 투자 전략 과거 성과 시뮬레이션")
-                        bt_col1, bt_col2 = st.columns([3, 1])
-                        strategy_choice = bt_col1.selectbox(
-                            "백테스트 검증 전략 선택",
-                            options=["이평선 정배열 추세 추종 (5일>20일 골든)", "볼린저 밴드 눌림목 스윙", "RSI 안정 모멘텀 구간 매매"],
-                            index=0
-                        )
-                        
-                        strat_key_map = {
-                            "이평선 정배열 추세 추종 (5일>20일 골든)": "trend_following",
-                            "볼린저 밴드 눌림목 스윙": "bollinger_reversal",
-                            "RSI 안정 모멘텀 구간 매매": "rsi_momentum"
-                        }
-                        
-                        bt_res = run_quant_backtest(df, strat_key_map[strategy_choice])
-                        
-                        m1, m2, m3, m4, m5 = st.columns(5)
-                        m1.metric("전략 누적 수익률", f"{bt_res['total_return']:+.2f}%")
-                        m2.metric("단순 보유(시장) 수익률", f"{bt_res['buy_hold_return']:+.2f}%")
-                        m3.metric("시장 초과 수익(알파)", f"{bt_res['alpha']:+.2f}%")
-                        m4.metric("최대 낙폭 (MDD)", f"{bt_res['mdd']:.2f}%", help="과거 최고점 대비 최대 하락폭 (낮을수록 안전)")
-                        m5.metric("매매 승률 (거래횟수)", f"{bt_res['win_rate']:.1f}% ({bt_res['trade_count']}회)")
-
-                        bt_fig = go.Figure()
-                        bt_fig.add_trace(go.Scatter(
-                            x=bt_res["df"].index, y=(bt_res["df"]["Cum_Strategy"] - 1) * 100,
-                            mode="lines", line=dict(color="#38bdf8", width=2.2), name="퀀트 전략 누적 수익률(%)"
-                        ))
-                        bt_fig.add_trace(go.Scatter(
-                            x=bt_res["df"].index, y=(bt_res["df"]["Cum_Market"] - 1) * 100,
-                            mode="lines", line=dict(color="#64748b", width=1.4, dash="dash"), name="단순 보유 누적 수익률(%)"
-                        ))
-
-                        bt_fig.update_layout(
-                            template="plotly_dark",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            height=350,
-                            margin=dict(l=10, r=10, t=20, b=10),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                        )
-                        st.plotly_chart(bt_fig, use_container_width=True)
-                        st.caption("💡 백테스팅은 1일 지연 체결(익일 시초가 진입 원칙)을 적용하여 미래 참조 편향(Lookahead Bias)을 제거한 통계 검증 결과입니다.")
-
-                    with t6:
-                        for item in news_items:
-                            st.markdown(f"- [{item['title']}]({item['link']})")
-    else:
-        st.info("💡 상단 검색창에 **종목명**을 입력하시거나, 우측 **종합점수 랭킹 또는 주도주 랭킹의 종목을 클릭**하시면 즉시 정밀 퀀트 분석이 시작됩니다부리!")
+if __name__ == "__main__":
+    main()
