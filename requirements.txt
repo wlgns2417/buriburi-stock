@@ -1,5 +1,7 @@
-streamlit>=1.50
-FinanceDataReader
-pandas
+streamlit
+finance-datareader
 numpy
+pandas
 plotly
+requests
+beautifulsoup4
