@@ -883,27 +883,82 @@ def resolve_pending(stocks):
 
 
 def render_rankings(result):
-    st.markdown("#### 📡 시장 스냅샷")
+    st.markdown("#### 📡 오늘의 시장 흐름")
     st.caption(result.notes[0])
     st.button("시장 데이터 새로고침", key="refresh_market", on_click=cached_market.clear, use_container_width=True)
     if result.status != "ok":
         st.warning("일부 또는 전체 페이지를 수집하지 못했습니다. 확보된 종목만 표시합니다.")
+
     ranked = market_rankings(result.data)
     if ranked.empty:
-        st.info("랭킹을 계산할 유효한 시세가 없습니다. 종목코드로 개별 분석을 진행하실 수 있습니다.")
+        st.info("시장 흐름을 계산할 유효한 시세가 없습니다. 종목코드로 개별 분석을 진행하실 수 있습니다.")
         return
-    st.caption("랭킹 점수 = 당일 등락률 50 + 표본 내 시가총액 25 + 추정 거래대금 25. 개별 분석 점수와 다른 지표입니다.")
-    top, bottom, lead = st.tabs(["점수 상위", "점수 하위", "모멘텀"])
-    groups = [(top, ranked.head(10), "top"),
-              (bottom, ranked.sort_values("ScreenScore").head(10), "bottom"),
-              (lead, ranked.sort_values("Momentum", ascending=False).head(10), "lead")]
-    for tab, frame, prefix in groups:
-        with tab:
-            for i, row in enumerate(frame.itertuples()):
-                st.button(f"{i + 1}. {row.Name} · {row.ScreenScore:.1f}점", key=f"{prefix}_{row.Code}",
-                          use_container_width=True, on_click=select_stock, args=(row.Code, row.Name))
-                st.caption(f"{row.Close:,.0f}원 · {row.Chg:+.2f}% · 거래대금 추정 {row.AmountEstimate / 1e8:,.0f}억원")
-    st.caption("전체 시장 순위가 아닙니다. 가격×거래량은 실제 거래대금·자금 유입액과 다릅니다.")
+
+    st.info(
+        "오른쪽 랭킹은 종목의 정밀 분석 점수가 아닙니다. "
+        "'시장 주목도'는 당일 등락률 50 + 표본 내 시가총액 25 + 추정 거래대금 25로 계산한 "
+        "단기 시장 관심도 지표입니다."
+    )
+
+    attention_tab, turnover_tab, momentum_tab = st.tabs([
+        "🔥 시장 주목도", "💰 거래대금 주도", "🚀 당일 모멘텀"
+    ])
+
+    with attention_tab:
+        st.caption("가격 탄력·시가총액·거래 활발도를 함께 반영한 단기 시장 관심도 순위입니다.")
+        frame = ranked.sort_values(["ScreenScore", "AmountEstimate"], ascending=False).head(10)
+        for i, row in enumerate(frame.itertuples(), start=1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            st.button(
+                f"{medal} {row.Name} · 시장 주목도 {row.ScreenScore:.1f}",
+                key=f"attention_{row.Code}",
+                use_container_width=True,
+                on_click=select_stock,
+                args=(row.Code, row.Name),
+            )
+            st.caption(
+                f"{row.Close:,.0f}원 · 당일 {row.Chg:+.2f}% · "
+                f"추정 거래대금 {row.AmountEstimate / 1e8:,.0f}억원"
+            )
+
+    with turnover_tab:
+        st.caption("가격×거래량 기준 추정 거래대금이 큰 종목입니다. 실제 체결 거래대금과는 차이가 있을 수 있습니다.")
+        frame = ranked.sort_values("AmountEstimate", ascending=False).head(10)
+        for i, row in enumerate(frame.itertuples(), start=1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            amount_eok = row.AmountEstimate / 1e8
+            st.button(
+                f"{medal} {row.Name} · {amount_eok:,.0f}억원",
+                key=f"turnover_{row.Code}",
+                use_container_width=True,
+                on_click=select_stock,
+                args=(row.Code, row.Name),
+            )
+            st.caption(
+                f"{row.Close:,.0f}원 · 당일 {row.Chg:+.2f}% · "
+                f"시장 주목도 {row.ScreenScore:.1f}"
+            )
+
+    with momentum_tab:
+        st.caption("당일 등락률이 강한 종목을 우선 보여줍니다. 급등 자체가 매수 적합성을 의미하지는 않습니다.")
+        frame = ranked.sort_values(["Chg", "AmountEstimate"], ascending=False).head(10)
+        for i, row in enumerate(frame.itertuples(), start=1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            st.button(
+                f"{medal} {row.Name} · 당일 {row.Chg:+.2f}%",
+                key=f"day_momentum_{row.Code}",
+                use_container_width=True,
+                on_click=select_stock,
+                args=(row.Code, row.Name),
+            )
+            st.caption(
+                f"{row.Close:,.0f}원 · 추정 거래대금 {row.AmountEstimate / 1e8:,.0f}억원 · "
+                f"시장 주목도 {row.ScreenScore:.1f}"
+            )
+
+    st.caption(
+        "※ 위 순위는 현재 수집된 시장 표본 기준입니다. '시장 주목도'와 왼쪽의 종합 분석 점수는 목적과 계산식이 서로 다릅니다."
+    )
 
 
 def render_chart(df):
