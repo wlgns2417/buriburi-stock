@@ -1686,7 +1686,7 @@ def render_running_horse(market_result):
         pages = c2.slider("KOSPI 시장 페이지", 10, 25, 20, 5, key="horse_kospi_pages",
                           help="페이지당 종목 수는 공급 화면에 따라 달라질 수 있습니다.")
 
-        if st.button("🚀 KOSPI TOP 20 자동 분석", type="primary", key="horse_auto_top20", use_container_width=True):
+        if st.button("🚀 KOSPI TOP 20 자동 분석", type="primary", key="horse_auto_top20_btn", use_container_width=True):
             with st.spinner("1단계: KOSPI 전체 후보군을 수집하고 있습니다…"):
                 universe = cached_horse_kospi_universe(pages)
             if universe.data.empty:
@@ -1711,13 +1711,13 @@ def render_running_horse(market_result):
                     progress.progress(100)
                     progress.empty()
                     st.session_state.horse_auto_raw = raw
-                    st.session_state.horse_auto_top20 = top20
+                    st.session_state.horse_auto_top20_results = top20
                     st.session_state.horse_auto_meta = {
                         "universe": len(universe.data), "deep": len(candidates), "pages": pages,
                         "status": universe.status, "notes": universe.notes,
                     }
 
-        top20 = st.session_state.get("horse_auto_top20")
+        top20 = st.session_state.get("horse_auto_top20_results")
         meta = st.session_state.get("horse_auto_meta")
         if isinstance(top20, pd.DataFrame) and not top20.empty:
             st.success(
@@ -2363,7 +2363,7 @@ def render_oversold_hunter(market_result):
                                help="이 단계에서 컨센서스와 외국인·기관 데이터를 추가 조회합니다.")
         pages = c3.slider("KOSPI 시장 페이지", 10, 25, 20, 5, key="oversold_kospi_pages")
 
-        if st.button("💎 KOSPI 과대낙폭 TOP 20 자동 분석", type="primary", key="oversold_auto_top20", use_container_width=True):
+        if st.button("💎 KOSPI 과대낙폭 TOP 20 자동 분석", type="primary", key="oversold_auto_top20_btn", use_container_width=True):
             with st.spinner("1단계: KOSPI 후보군을 수집하고 있습니다…"):
                 universe = cached_horse_kospi_universe(pages)
             if universe.data.empty:
@@ -2385,13 +2385,13 @@ def render_oversold_hunter(market_result):
                     progress.progress(100)
                     progress.empty()
                     st.session_state.oversold_auto_raw = raw
-                    st.session_state.oversold_auto_top20 = top20
+                    st.session_state.oversold_auto_top20_results = top20
                     st.session_state.oversold_auto_meta = {
                         "universe": len(universe.data), "deep": len(candidates),
                         "final_pool": min(final_pool, len(raw)), "pages": pages,
                     }
 
-        top20 = st.session_state.get("oversold_auto_top20")
+        top20 = st.session_state.get("oversold_auto_top20_results")
         meta = st.session_state.get("oversold_auto_meta") or {}
         if isinstance(top20, pd.DataFrame) and not top20.empty:
             st.success(
@@ -2467,9 +2467,9 @@ def main():
                        "candidates": [], "search_message": "", "horse_matches": [],
                        "horse_selected_code": "", "horse_selected_name": "",
                        "horse_scan_raw": None, "horse_scan_out": None, "horse_scan_meta": None,
-                       "horse_auto_raw": None, "horse_auto_top20": None, "horse_auto_meta": None,
+                       "horse_auto_raw": None, "horse_auto_top20_results": None, "horse_auto_meta": None,
                        "oversold_matches": [], "oversold_selected_code": "", "oversold_selected_name": "",
-                       "oversold_auto_raw": None, "oversold_auto_top20": None, "oversold_auto_meta": None}.items():
+                       "oversold_auto_raw": None, "oversold_auto_top20_results": None, "oversold_auto_meta": None}.items():
         if key not in st.session_state:
             st.session_state[key] = value
     with st.spinner("시장 표본을 조회하고 있습니다…"):
