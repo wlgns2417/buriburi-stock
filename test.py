@@ -2822,7 +2822,7 @@ def render_oversold_hunter(market_result):
 """)
 
 def main():
-    st.set_page_config(page_title="퀀트 투자전략실", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="개미 투자전략실", page_icon="📊", layout="wide")
     st.markdown("""<style>
     :root {
         --bg:#070b12;
