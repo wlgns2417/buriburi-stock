@@ -3084,7 +3084,7 @@ def main():
     </style>""", unsafe_allow_html=True)
     st.markdown("""<div class="hero">
       <div class="hero-badge">● 데이터 기반 투자 리서치</div>
-      <div class="hero-title">퀀트 투자전략실</div>
+      <div class="hero-title">개미 투자전략실</div>
       <div class="hero-subtitle">차트 · 수급 · 실적 · 전략 검증을 한 화면에서 분석합니다.</div>
       <div class="hero-meta">
         <span class="hero-chip">KOSPI · KOSDAQ</span>
