@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ALPHA DESK — Market Intelligence Terminal
+"""퀀트 투자전략실 — 데이터 기반 주식 분석 플랫폼
 
 GitHub에 있는 기존 실행 .py 파일의 내용을 이 파일 전체로 교체하십시오.
 기존 파일명과 실행 설정은 유지하실 수 있습니다.
@@ -883,7 +883,7 @@ def resolve_pending(stocks):
 
 
 def render_rankings(result):
-    st.markdown("#### Market Snapshot")
+    st.markdown("#### 📡 시장 스냅샷")
     st.caption(result.notes[0])
     st.button("시장 데이터 새로고침", key="refresh_market", on_click=cached_market.clear, use_container_width=True)
     if result.status != "ok":
@@ -1217,7 +1217,7 @@ def running_horse_score(frame):
     elif score >= 80 and breakout and r.RSI < 75:
         status="🚀 강한 돌파 — 추격보다 눌림 대기"
     elif score >= 70 and near:
-        status="🟢 Momentum Candidate — 돌파/지지 확인"
+        status="🟢 달리는 말 후보 — 돌파·지지 확인"
     elif score >= 60:
         status="🟡 관심 종목 — 조건 일부 미충족"
     elif score >= 45:
@@ -1375,7 +1375,7 @@ def render_running_chart(result, name):
     fig.add_trace(go.Scatter(x=df.index,y=df.MACD,mode="lines",name="MACD"),row=4,col=1)
     fig.add_trace(go.Scatter(x=df.index,y=df.MACD_SIGNAL,mode="lines",name="Signal"),row=4,col=1)
     fig.add_trace(go.Bar(x=df.index,y=df.MACD_HIST,name="Histogram"),row=4,col=1)
-    fig.update_layout(template="plotly_dark", title=f"{name} — Momentum Profile", height=900,
+    fig.update_layout(template="plotly_dark", title=f"{name} — 모멘텀 프로파일", height=900,
                       xaxis_rangeslider_visible=False, legend={"orientation":"h"},
                       margin={"l":10,"r":10,"t":55,"b":10},
                       paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)")
@@ -1422,7 +1422,7 @@ def _horse_rank_badge(rank):
 def _render_horse_leaderboard(out):
     if out is None or out.empty:
         return
-    st.markdown("#### Momentum Ranking")
+    st.markdown("#### 🏆 달리는 말 순위")
     st.caption("점수 → 20일 수익률 순으로 정렬한 현재 스캔 표본 순위입니다.")
     top = out.head(5).reset_index(drop=True)
     cols = st.columns(len(top))
@@ -1448,7 +1448,7 @@ def _render_horse_leaderboard(out):
         use_container_width=True,
         column_config={
             "순위": st.column_config.NumberColumn("순위", width="small", format="%d위"),
-            "점수": st.column_config.ProgressColumn("모멘텀 스코어", min_value=0, max_value=100, format="%d점"),
+            "점수": st.column_config.ProgressColumn("달리는 말 점수", min_value=0, max_value=100, format="%d점"),
             "종목명": st.column_config.TextColumn("종목명", width="medium"),
             "상태": st.column_config.TextColumn("판정", width="large"),
         },
@@ -1581,7 +1581,7 @@ def _enrich_top20_with_supply(raw):
 
 
 def render_running_horse(market_result):
-    st.markdown("### ⚡ Momentum Leaders")
+    st.markdown("### 🐎 달리는 말 탐지기")
     st.caption("가격 추세, 거래량, RSI, MACD, ADX, 신고가와 이격도를 결합해 시장 주도주의 추세 지속성을 평가합니다. 스코어는 매수 신호가 아닌 후보 선별용입니다.")
     single, scanner, rules = st.tabs(["🔎 개별 분석", "🏆 KOSPI TOP 20", "📐 모델 기준"])
 
@@ -1594,7 +1594,7 @@ def render_running_horse(market_result):
             key="horse_query",
             placeholder="예: 삼성전자 또는 005930",
         )
-        run = c2.button("모멘텀 분석", key="horse_run", use_container_width=True, type="primary")
+        run = c2.button("달리는 말 분석", key="horse_run", use_container_width=True, type="primary")
 
         if run:
             matches = _resolve_horse_query(query, market_result)
@@ -1633,7 +1633,7 @@ def render_running_horse(market_result):
                 r = result["row"]
                 st.markdown(f"#### {escape(str(name))} ({code})")
                 boxes = st.columns(5)
-                boxes[0].metric("모멘텀 스코어", f"{result['score']} / 100")
+                boxes[0].metric("달리는 말 점수", f"{result['score']} / 100")
                 boxes[1].metric("종가", f"{r.Close:,.0f}원")
                 boxes[2].metric("RSI", f"{r.RSI:.1f}")
                 boxes[3].metric("ADX", f"{r.ADX14:.1f}")
@@ -1646,18 +1646,18 @@ def render_running_horse(market_result):
                 with st.spinner("외국인·기관 수급을 함께 점검하고 있습니다…"):
                     horse_inv = cached_horse_investors(code)
                 commentary = build_horse_commentary(result, horse_inv)
-                st.markdown("##### Strategy View")
+                st.markdown("##### 🧠 리서치 데스크 코멘트")
                 st.info(commentary["view"])
                 cc1, cc2 = st.columns(2)
                 with cc1:
-                    st.markdown("**Bull Case**")
+                    st.markdown("**📈 상승 논거**")
                     if commentary["positives"]:
                         for text in commentary["positives"]:
                             st.markdown(f"- {text}")
                     else:
                         st.caption("현재 확인 가능한 강한 상승 논거가 제한적입니다.")
                 with cc2:
-                    st.markdown("**Risk Factors**")
+                    st.markdown("**⚠️ 리스크 요인**")
                     if commentary["risks"]:
                         for text in commentary["risks"]:
                             st.markdown(f"- {text}")
@@ -1675,7 +1675,7 @@ def render_running_horse(market_result):
                         st.warning(" / ".join(result["penalties"]))
 
     with scanner:
-        st.markdown("#### KOSPI Momentum Leaders · TOP 20")
+        st.markdown("#### 🏆 KOSPI 달리는 말 · TOP 20")
         st.caption(
             "KOSPI 전체 시가총액 표를 1차로 수집한 뒤 거래대금·등락률·시총으로 후보를 압축하고, "
             "일봉 기술지표를 정밀 분석합니다. 최종 상위 20개는 외국인·기관 수급까지 추가 점검합니다."
@@ -1726,7 +1726,7 @@ def render_running_horse(market_result):
             )
             _render_horse_leaderboard(top20.drop(columns=["_result"], errors="ignore"))
 
-            st.markdown("##### TOP 20 · Strategy Notes")
+            st.markdown("##### 📋 TOP 20 종목별 전략 코멘트")
             for idx, row in top20.reset_index(drop=True).iterrows():
                 rank = idx + 1
                 badge = _horse_rank_badge(rank)
@@ -1739,11 +1739,11 @@ def render_running_horse(market_result):
                     st.info(commentary["view"])
                     cpos, crisk = st.columns(2)
                     with cpos:
-                        st.markdown("**Bull Case**")
+                        st.markdown("**📈 상승 논거**")
                         for text in commentary["positives"]:
                             st.markdown(f"- {text}")
                     with crisk:
-                        st.markdown("**Risk Factors**")
+                        st.markdown("**⚠️ 리스크 요인**")
                         for text in commentary["risks"]:
                             st.markdown(f"- {text}")
                     supply = commentary["supply"]
@@ -1754,7 +1754,7 @@ def render_running_horse(market_result):
 
             export = top20.drop(columns=["_result"], errors="ignore")
             st.download_button(
-                "KOSPI Momentum TOP20 CSV",
+                "KOSPI 달리는 말 TOP20 CSV",
                 export.to_csv(index=False).encode("utf-8-sig"),
                 file_name="running_horse_KOSPI_TOP20.csv",
                 mime="text/csv",
@@ -1978,7 +1978,7 @@ def _combine_oversold_score(tech, fund=None, investors=None):
     if score >= 80 and tech["dd52"] <= -20 and rebound and outlook_ok:
         status = "💎 최우선 관찰 — 낙폭 대비 실적·반등 신호 우수"
     elif score >= 70 and outlook_ok:
-        status = "🟢 Rebound Candidate — 펀더멘털 대비 가격 메리트"
+        status = "🟢 과대낙폭 유망 후보 — 펀더멘털 대비 가격 메리트"
     elif score >= 60:
         status = "🟡 관심 — 반등 또는 실적 확증 추가 필요"
     elif score >= 45:
@@ -2116,7 +2116,7 @@ def render_oversold_chart(result, name):
     fig.add_trace(go.Scatter(x=df.index, y=df.MACD, mode="lines", name="MACD"), row=4, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df.MACD_SIGNAL, mode="lines", name="Signal"), row=4, col=1)
     fig.add_trace(go.Bar(x=df.index, y=df.MACD_HIST, name="Histogram"), row=4, col=1)
-    fig.update_layout(template="plotly_dark", title=f"{name} — Rebound Profile", height=900,
+    fig.update_layout(template="plotly_dark", title=f"{name} — 반등 프로파일", height=900,
                       xaxis_rangeslider_visible=False, legend={"orientation": "h"},
                       margin={"l": 10, "r": 10, "t": 55, "b": 10},
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
@@ -2239,7 +2239,7 @@ def _finalize_oversold_candidates(raw, final_pool=35, workers=6):
 def _render_oversold_leaderboard(out):
     if out is None or out.empty:
         return
-    st.markdown("#### Rebound Ranking")
+    st.markdown("#### 🏆 과대낙폭 유망주 순위")
     st.caption("낙폭·반등 모멘텀·실적 컨센서스·외국인/기관 수급을 합산한 후보 순위입니다.")
     top = out.head(5).reset_index(drop=True)
     cols = st.columns(len(top))
@@ -2264,15 +2264,15 @@ def _render_oversold_leaderboard(out):
         display, hide_index=True, use_container_width=True,
         column_config={
             "순위": st.column_config.NumberColumn("순위", width="small", format="%d위"),
-            "점수": st.column_config.ProgressColumn("리바운드 스코어", min_value=0, max_value=100, format="%d점"),
+            "점수": st.column_config.ProgressColumn("유망 낙폭 점수", min_value=0, max_value=100, format="%d점"),
             "상태": st.column_config.TextColumn("판정", width="large"),
-            "전략 코멘트": st.column_config.TextColumn("리서치 코멘트", width="large"),
+            "전략 코멘트": st.column_config.TextColumn("전략 코멘트", width="large"),
         },
     )
 
 
 def render_oversold_hunter(market_result):
-    st.markdown("### 💎 Rebound Selection")
+    st.markdown("### 💎 과대낙폭 유망주")
     st.caption("단순 낙폭이 아닌 가격 메리트, 반등 모멘텀, 실적 컨센서스와 외국인·기관 수급을 함께 평가해 펀더멘털 대비 과도하게 할인된 후보를 선별합니다.")
     single, scanner, rules = st.tabs(["🔎 개별 분석", "🏆 KOSPI TOP 20", "📐 모델 기준"])
 
@@ -2281,7 +2281,7 @@ def render_oversold_hunter(market_result):
         c1, c2 = st.columns([4, 1])
         query = c1.text_input("종목명 또는 종목코드", value=default_query, key="oversold_query",
                               placeholder="예: 삼성전자 또는 005930")
-        run = c2.button("리바운드 분석", key="oversold_run", use_container_width=True, type="primary")
+        run = c2.button("과대낙폭 분석", key="oversold_run", use_container_width=True, type="primary")
         if run:
             matches = _resolve_horse_query(query, market_result)
             st.session_state.oversold_matches = matches
@@ -2315,7 +2315,7 @@ def render_oversold_hunter(market_result):
                 r, fund = result["row"], result["fund"]
                 st.markdown(f"#### {escape(str(name))} ({code})")
                 boxes = st.columns(6)
-                boxes[0].metric("리바운드 스코어", f"{result['score']} / 100")
+                boxes[0].metric("유망 낙폭 점수", f"{result['score']} / 100")
                 boxes[1].metric("종가", f"{r.Close:,.0f}원")
                 boxes[2].metric("52주 고점 대비", f"{result['dd52']:+.1f}%")
                 boxes[3].metric("RSI", f"{r.RSI:.1f}")
@@ -2330,18 +2330,18 @@ def render_oversold_hunter(market_result):
                 st.caption(f"향후 연간 영업이익 {op_text} · EPS {eps_text} · 추정 기준 {fund.get('ForwardPeriod') or '미확인'}")
 
                 commentary = build_oversold_commentary(result)
-                st.markdown("##### Strategy View")
+                st.markdown("##### 🧠 리서치 데스크 코멘트")
                 st.info(commentary["view"])
                 cpos, crisk = st.columns(2)
                 with cpos:
-                    st.markdown("**Investment Case**")
+                    st.markdown("**💡 투자 포인트**")
                     if commentary["positives"]:
                         for item in commentary["positives"]:
                             st.markdown(f"- {item}")
                     else:
                         st.caption("현재 확인 가능한 강한 투자 포인트가 제한적입니다.")
                 with crisk:
-                    st.markdown("**Risk Factors**")
+                    st.markdown("**⚠️ 리스크 요인**")
                     if commentary["risks"]:
                         for item in commentary["risks"]:
                             st.markdown(f"- {item}")
@@ -2354,7 +2354,7 @@ def render_oversold_hunter(market_result):
                     st.warning(" / ".join(result["penalties"]))
 
     with scanner:
-        st.markdown("#### KOSPI Rebound Selection · TOP 20")
+        st.markdown("#### 🏆 KOSPI 과대낙폭 유망주 · TOP 20")
         st.caption("KOSPI를 1차 경량 압축한 뒤 일봉 낙폭/반등을 분석하고, 상위 후보에만 실적 컨센서스와 외국인·기관 수급을 붙여 부하를 줄입니다.")
         c1, c2, c3 = st.columns(3)
         deep_count = c1.slider("일봉 정밀 후보 수", 50, 120, 80, 10, key="oversold_deep_count",
@@ -2399,7 +2399,7 @@ def render_oversold_hunter(market_result):
                 f"{meta.get('final_pool', 0)}종목 실적·수급 분석 → TOP {len(top20)}"
             )
             _render_oversold_leaderboard(top20)
-            st.markdown("##### TOP 20 · Strategy Notes")
+            st.markdown("##### 📋 TOP 20 종목별 전략 코멘트")
             for idx, row in top20.reset_index(drop=True).iterrows():
                 rank = idx + 1
                 with st.expander(
@@ -2411,11 +2411,11 @@ def render_oversold_hunter(market_result):
                     st.info(commentary["view"])
                     cpos, crisk = st.columns(2)
                     with cpos:
-                        st.markdown("**Investment Case**")
+                        st.markdown("**💡 투자 포인트**")
                         for item in commentary["positives"]:
                             st.markdown(f"- {item}")
                     with crisk:
-                        st.markdown("**Risk Factors**")
+                        st.markdown("**⚠️ 리스크 요인**")
                         for item in commentary["risks"]:
                             st.markdown(f"- {item}")
                     fund = result["fund"]
@@ -2426,7 +2426,7 @@ def render_oversold_hunter(market_result):
 
             export = top20.drop(columns=["_result"], errors="ignore").copy()
             st.download_button(
-                "KOSPI Rebound TOP20 CSV",
+                "KOSPI 과대낙폭 TOP20 CSV",
                 export.to_csv(index=False).encode("utf-8-sig"),
                 file_name="oversold_quality_KOSPI_TOP20.csv", mime="text/csv", use_container_width=True,
             )
@@ -2444,61 +2444,276 @@ def render_oversold_hunter(market_result):
 """)
 
 def main():
-    st.set_page_config(page_title="ALPHA DESK | Market Intelligence", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="퀀트 투자전략실", page_icon="📊", layout="wide")
     st.markdown("""<style>
+    :root {
+        --bg:#070b12;
+        --panel:rgba(17,24,39,.72);
+        --panel-strong:rgba(17,24,39,.92);
+        --line:rgba(148,163,184,.14);
+        --line-strong:rgba(125,211,252,.26);
+        --text:#f4f7fb;
+        --muted:#8fa0b7;
+        --cyan:#67e8f9;
+        --blue:#60a5fa;
+        --violet:#a78bfa;
+        --green:#34d399;
+    }
+
+    html, body, [class*="css"] {
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans KR",sans-serif;
+    }
     .stApp {
         background:
-          radial-gradient(circle at 12% 0%, rgba(32,73,112,.16), transparent 28%),
-          radial-gradient(circle at 88% 8%, rgba(80,58,122,.12), transparent 25%),
-          #090d14;
-        color:#e8edf5;
+          radial-gradient(900px 520px at 8% -8%, rgba(59,130,246,.19), transparent 60%),
+          radial-gradient(760px 480px at 94% 3%, rgba(139,92,246,.16), transparent 58%),
+          radial-gradient(620px 420px at 58% 110%, rgba(6,182,212,.08), transparent 64%),
+          linear-gradient(180deg,#080c14 0%,#070a10 50%,#06090f 100%);
+        color:var(--text);
+        background-attachment:fixed;
     }
-    .block-container { padding-top:1.8rem; padding-bottom:3rem; max-width:1500px; }
+    .block-container {
+        padding-top:1.35rem;
+        padding-bottom:3.2rem;
+        max-width:1540px;
+    }
+
+    /* 상단 브랜드 카드 */
     .hero {
-        position:relative; overflow:hidden; padding:30px 34px 28px 34px;
-        border:1px solid rgba(126,153,190,.22); border-radius:20px;
-        background:linear-gradient(115deg,rgba(18,29,45,.98),rgba(12,17,27,.98));
-        box-shadow:0 18px 55px rgba(0,0,0,.28); margin-bottom:24px;
+        position:relative;
+        overflow:hidden;
+        padding:30px 32px 27px;
+        margin-bottom:22px;
+        border:1px solid rgba(148,163,184,.16);
+        border-radius:24px;
+        background:
+          linear-gradient(120deg,rgba(15,23,42,.90),rgba(17,24,39,.72)),
+          radial-gradient(circle at 90% 10%,rgba(96,165,250,.15),transparent 35%);
+        box-shadow:0 24px 70px rgba(0,0,0,.28), inset 0 1px 0 rgba(255,255,255,.035);
+        backdrop-filter:blur(18px);
+    }
+    .hero:before {
+        content:'';
+        position:absolute;
+        left:0; top:0; right:0;
+        height:2px;
+        background:linear-gradient(90deg,var(--cyan),var(--blue),var(--violet),transparent 88%);
+        opacity:.9;
     }
     .hero:after {
-        content:''; position:absolute; width:260px; height:260px; right:-80px; top:-135px;
-        border-radius:50%; background:rgba(77,141,190,.10);
+        content:'';
+        position:absolute;
+        width:360px; height:360px;
+        right:-140px; top:-220px;
+        border-radius:50%;
+        background:radial-gradient(circle,rgba(103,232,249,.14),transparent 66%);
+        pointer-events:none;
     }
-    .hero-eyebrow { color:#69b7e8; font-size:11px; font-weight:800; letter-spacing:.18em; margin-bottom:9px; }
-    .hero-title { font-size:34px; font-weight:850; letter-spacing:-.02em; margin:0; color:#f4f7fb; }
-    .hero-subtitle { color:#91a0b5; margin-top:8px; font-size:14px; letter-spacing:.01em; }
-    .hero-meta { margin-top:17px; color:#65748a; font-size:12px; }
+    .hero-badge {
+        display:inline-flex;
+        align-items:center;
+        gap:7px;
+        padding:6px 10px;
+        border:1px solid rgba(103,232,249,.18);
+        border-radius:999px;
+        background:rgba(8,145,178,.08);
+        color:#a5f3fc;
+        font-size:11px;
+        font-weight:750;
+        letter-spacing:.04em;
+        margin-bottom:12px;
+    }
+    .hero-title {
+        font-size:34px;
+        line-height:1.15;
+        font-weight:900;
+        letter-spacing:-.035em;
+        color:#f8fafc;
+        margin:0;
+    }
+    .hero-subtitle {
+        color:#b0bfd2;
+        margin-top:9px;
+        font-size:14px;
+        font-weight:550;
+    }
+    .hero-meta {
+        display:flex;
+        gap:9px;
+        flex-wrap:wrap;
+        margin-top:17px;
+    }
+    .hero-chip {
+        display:inline-block;
+        padding:5px 9px;
+        border-radius:999px;
+        border:1px solid rgba(148,163,184,.13);
+        background:rgba(15,23,42,.48);
+        color:#7f91a9;
+        font-size:11px;
+    }
+
+    /* 상단 메인 탭: 카드형 내비게이션 */
+    [data-baseweb='tab-list'] {
+        gap:8px;
+        padding:6px;
+        margin-bottom:15px;
+        border:1px solid rgba(148,163,184,.11);
+        border-radius:15px;
+        background:rgba(15,23,42,.48);
+        backdrop-filter:blur(14px);
+        box-shadow:0 8px 28px rgba(0,0,0,.12);
+    }
+    [data-baseweb='tab'] {
+        height:42px;
+        padding:0 16px;
+        border-radius:10px;
+        color:#8fa0b7;
+        font-weight:720;
+        transition:all .18s ease;
+    }
+    [data-baseweb='tab']:hover {
+        color:#e8eef7;
+        background:rgba(51,65,85,.34);
+    }
+    [aria-selected='true'][data-baseweb='tab'] {
+        color:#f8fafc !important;
+        background:linear-gradient(110deg,rgba(14,165,233,.18),rgba(99,102,241,.16));
+        box-shadow:inset 0 0 0 1px rgba(125,211,252,.20),0 5px 18px rgba(2,132,199,.08);
+    }
+
+    /* 메트릭 카드 */
     [data-testid='stMetric'] {
-        border:1px solid rgba(114,137,169,.20); border-radius:14px; padding:14px 16px;
-        background:linear-gradient(145deg,rgba(18,25,37,.92),rgba(12,17,26,.92));
-        box-shadow:0 6px 22px rgba(0,0,0,.12);
+        border:1px solid var(--line);
+        border-radius:16px;
+        padding:15px 16px;
+        background:linear-gradient(145deg,rgba(17,24,39,.78),rgba(10,15,25,.68));
+        box-shadow:0 10px 30px rgba(0,0,0,.14),inset 0 1px 0 rgba(255,255,255,.025);
+        backdrop-filter:blur(12px);
+        transition:border-color .18s ease,transform .18s ease;
     }
-    [data-testid='stMetricLabel'] { color:#8391a5; }
-    [data-testid='stMetricValue'] { font-size:23px; font-weight:750; color:#eef3f9; }
-    [data-baseweb='tab-list'] { gap:8px; border-bottom:1px solid rgba(113,135,164,.18); }
-    [data-baseweb='tab'] { height:46px; padding:0 16px; border-radius:10px 10px 0 0; color:#8795a9; font-weight:650; }
-    [aria-selected='true'][data-baseweb='tab'] { color:#eef4fb; background:rgba(35,54,77,.45); }
-    .stButton > button { border-radius:10px; border:1px solid rgba(111,142,179,.28); font-weight:700; min-height:42px; }
+    [data-testid='stMetric']:hover {
+        border-color:rgba(103,232,249,.22);
+        transform:translateY(-1px);
+    }
+    [data-testid='stMetricLabel'] { color:#899bb2; font-weight:650; }
+    [data-testid='stMetricValue'] { font-size:24px; font-weight:850; color:#f3f7fb; letter-spacing:-.02em; }
+
+    /* 입력 / 선택 */
+    [data-baseweb='input'] > div,
+    [data-baseweb='select'] > div,
+    [data-testid='stNumberInput'] input {
+        background:rgba(15,23,42,.72) !important;
+        border-color:rgba(148,163,184,.16) !important;
+        border-radius:12px !important;
+    }
+    [data-baseweb='input'] > div:focus-within,
+    [data-baseweb='select'] > div:focus-within {
+        border-color:rgba(103,232,249,.36) !important;
+        box-shadow:0 0 0 3px rgba(34,211,238,.05) !important;
+    }
+
+    /* 버튼 */
+    .stButton > button,
+    .stDownloadButton > button,
+    .stLinkButton > a {
+        border-radius:12px !important;
+        border:1px solid rgba(148,163,184,.16) !important;
+        background:linear-gradient(145deg,rgba(30,41,59,.82),rgba(15,23,42,.82)) !important;
+        color:#eaf1f8 !important;
+        font-weight:750 !important;
+        min-height:42px;
+        box-shadow:0 6px 18px rgba(0,0,0,.12);
+        transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease;
+    }
+    .stButton > button:hover,
+    .stDownloadButton > button:hover,
+    .stLinkButton > a:hover {
+        border-color:rgba(103,232,249,.32) !important;
+        transform:translateY(-1px);
+        box-shadow:0 9px 24px rgba(0,0,0,.18);
+    }
+    [data-testid='stBaseButton-primary'] {
+        background:linear-gradient(105deg,#0f7fa5 0%,#2563a9 52%,#5b4ab2 100%) !important;
+        border-color:rgba(125,211,252,.34) !important;
+        box-shadow:0 10px 26px rgba(37,99,235,.16) !important;
+    }
+
+    /* 알림 카드 */
+    [data-testid='stAlert'] {
+        border-radius:14px;
+        border:1px solid rgba(148,163,184,.12);
+        background:rgba(15,23,42,.60);
+        backdrop-filter:blur(10px);
+    }
+
+    /* 익스팬더 / 데이터프레임 */
+    [data-testid='stExpander'] {
+        border:1px solid rgba(148,163,184,.12) !important;
+        border-radius:14px !important;
+        background:rgba(15,23,42,.42) !important;
+        overflow:hidden;
+    }
+    [data-testid='stDataFrame'] {
+        border:1px solid rgba(148,163,184,.10);
+        border-radius:14px;
+        overflow:hidden;
+        box-shadow:0 8px 24px rgba(0,0,0,.10);
+    }
+
+    /* 랭킹 카드 */
     .horse-rank-card {
-        border:1px solid rgba(110,137,171,.24); border-radius:16px; padding:18px 12px;
-        min-height:172px; text-align:center; background:linear-gradient(145deg,rgba(20,29,43,.96),rgba(12,17,26,.96));
-        box-shadow:0 9px 30px rgba(0,0,0,.20);
+        position:relative;
+        overflow:hidden;
+        border:1px solid rgba(148,163,184,.15);
+        border-radius:18px;
+        padding:18px 13px;
+        min-height:174px;
+        text-align:center;
+        background:
+          radial-gradient(circle at 50% -20%,rgba(96,165,250,.12),transparent 45%),
+          linear-gradient(150deg,rgba(20,29,44,.92),rgba(9,14,23,.92));
+        box-shadow:0 14px 38px rgba(0,0,0,.18),inset 0 1px 0 rgba(255,255,255,.025);
+        transition:transform .18s ease,border-color .18s ease;
     }
-    .horse-rank-1 { border-color:rgba(214,173,59,.68); box-shadow:0 9px 30px rgba(214,173,59,.08); }
-    .horse-rank-2 { border-color:rgba(156,169,184,.52); }
-    .horse-rank-3 { border-color:rgba(169,113,66,.52); }
-    .horse-rank-badge { font-size:24px; margin-bottom:7px; }
-    .horse-rank-name { font-size:16px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .horse-rank-score { font-size:31px; font-weight:900; line-height:1.2; margin:7px 0; }
-    .horse-rank-score span { font-size:11px; color:#718096; margin-left:3px; }
-    .horse-rank-meta { font-size:12px; color:#8c99aa; margin-top:4px; }
-    hr { border-color:rgba(113,135,164,.16); }
+    .horse-rank-card:hover { transform:translateY(-2px); border-color:rgba(103,232,249,.26); }
+    .horse-rank-1 { border-color:rgba(250,204,21,.42); background:radial-gradient(circle at 50% -10%,rgba(250,204,21,.10),transparent 45%),linear-gradient(150deg,rgba(25,30,39,.94),rgba(10,14,22,.94)); }
+    .horse-rank-2 { border-color:rgba(203,213,225,.30); }
+    .horse-rank-3 { border-color:rgba(251,146,60,.30); }
+    .horse-rank-badge { font-size:25px; margin-bottom:6px; }
+    .horse-rank-name { font-size:16px; font-weight:850; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#f3f6fa; }
+    .horse-rank-score { font-size:31px; font-weight:900; line-height:1.2; margin:7px 0; letter-spacing:-.03em; }
+    .horse-rank-score span { font-size:11px; color:#708298; margin-left:3px; }
+    .horse-rank-meta { font-size:12px; color:#91a0b4; margin-top:4px; }
+
+    /* 제목 */
+    h1,h2,h3,h4,h5 { letter-spacing:-.025em; }
+    h3 { margin-top:.4rem !important; }
+    hr { border-color:rgba(148,163,184,.12); }
+
+    /* 스크롤바 */
+    ::-webkit-scrollbar { width:10px; height:10px; }
+    ::-webkit-scrollbar-track { background:#080c13; }
+    ::-webkit-scrollbar-thumb { background:#263449; border-radius:999px; border:2px solid #080c13; }
+    ::-webkit-scrollbar-thumb:hover { background:#344761; }
+
+    @media (max-width: 900px) {
+        .block-container { padding-left:1rem; padding-right:1rem; }
+        .hero { padding:24px 22px; border-radius:19px; }
+        .hero-title { font-size:29px; }
+        [data-baseweb='tab'] { padding:0 10px; font-size:13px; }
+    }
     </style>""", unsafe_allow_html=True)
     st.markdown("""<div class="hero">
-      <div class="hero-eyebrow">MARKET INTELLIGENCE TERMINAL</div>
-      <div class="hero-title">ALPHA DESK</div>
-      <div class="hero-subtitle">Price Action · Investor Flow · Fundamentals · Quant Strategy</div>
-      <div class="hero-meta">Korea Equity Research Dashboard · Systematic screening for momentum and rebound opportunities</div>
+      <div class="hero-badge">● 데이터 기반 투자 리서치</div>
+      <div class="hero-title">퀀트 투자전략실</div>
+      <div class="hero-subtitle">차트 · 수급 · 실적 · 전략 검증을 한 화면에서 분석합니다.</div>
+      <div class="hero-meta">
+        <span class="hero-chip">KOSPI · KOSDAQ</span>
+        <span class="hero-chip">모멘텀 스크리닝</span>
+        <span class="hero-chip">과대낙폭 탐색</span>
+        <span class="hero-chip">외국인 · 기관 수급</span>
+      </div>
     </div>""", unsafe_allow_html=True)
     for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
                        "candidates": [], "search_message": "", "horse_matches": [],
@@ -2511,7 +2726,7 @@ def main():
             st.session_state[key] = value
     with st.spinner("시장 표본을 조회하고 있습니다…"):
         market = cached_market()
-    main_tab, horse_tab, oversold_tab = st.tabs(["📊 Research Dashboard", "⚡ Momentum Leaders", "💎 Rebound Selection"])
+    main_tab, horse_tab, oversold_tab = st.tabs(["📊 종합 분석", "🐎 달리는 말 탐지기", "💎 과대낙폭 유망주"])
     with main_tab:
         render_original_workspace(market)
     with horse_tab:
