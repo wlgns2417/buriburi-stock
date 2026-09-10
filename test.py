@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""부리부리 종합 주식 작전실 — 단일 Python 파일 수정본
+"""ALPHA DESK — Market Intelligence Terminal
 
 GitHub에 있는 기존 실행 .py 파일의 내용을 이 파일 전체로 교체하십시오.
 기존 파일명과 실행 설정은 유지하실 수 있습니다.
@@ -883,9 +883,9 @@ def resolve_pending(stocks):
 
 
 def render_rankings(result):
-    st.markdown("#### 🏆 표본 종목 비교")
+    st.markdown("#### Market Snapshot")
     st.caption(result.notes[0])
-    st.button("랭킹 새로 조회", key="refresh_market", on_click=cached_market.clear, use_container_width=True)
+    st.button("시장 데이터 새로고침", key="refresh_market", on_click=cached_market.clear, use_container_width=True)
     if result.status != "ok":
         st.warning("일부 또는 전체 페이지를 수집하지 못했습니다. 확보된 종목만 표시합니다.")
     ranked = market_rankings(result.data)
@@ -1217,7 +1217,7 @@ def running_horse_score(frame):
     elif score >= 80 and breakout and r.RSI < 75:
         status="🚀 강한 돌파 — 추격보다 눌림 대기"
     elif score >= 70 and near:
-        status="🟢 달리는 말 후보 — 돌파/지지 확인"
+        status="🟢 Momentum Candidate — 돌파/지지 확인"
     elif score >= 60:
         status="🟡 관심 종목 — 조건 일부 미충족"
     elif score >= 45:
@@ -1375,7 +1375,7 @@ def render_running_chart(result, name):
     fig.add_trace(go.Scatter(x=df.index,y=df.MACD,mode="lines",name="MACD"),row=4,col=1)
     fig.add_trace(go.Scatter(x=df.index,y=df.MACD_SIGNAL,mode="lines",name="Signal"),row=4,col=1)
     fig.add_trace(go.Bar(x=df.index,y=df.MACD_HIST,name="Histogram"),row=4,col=1)
-    fig.update_layout(template="plotly_dark", title=f"{name} — 달리는 말 분석", height=900,
+    fig.update_layout(template="plotly_dark", title=f"{name} — Momentum Profile", height=900,
                       xaxis_rangeslider_visible=False, legend={"orientation":"h"},
                       margin={"l":10,"r":10,"t":55,"b":10},
                       paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)")
@@ -1422,7 +1422,7 @@ def _horse_rank_badge(rank):
 def _render_horse_leaderboard(out):
     if out is None or out.empty:
         return
-    st.markdown("#### 🏆 달리는 말 점수 TOP")
+    st.markdown("#### Momentum Ranking")
     st.caption("점수 → 20일 수익률 순으로 정렬한 현재 스캔 표본 순위입니다.")
     top = out.head(5).reset_index(drop=True)
     cols = st.columns(len(top))
@@ -1448,7 +1448,7 @@ def _render_horse_leaderboard(out):
         use_container_width=True,
         column_config={
             "순위": st.column_config.NumberColumn("순위", width="small", format="%d위"),
-            "점수": st.column_config.ProgressColumn("달리는 말 점수", min_value=0, max_value=100, format="%d점"),
+            "점수": st.column_config.ProgressColumn("모멘텀 스코어", min_value=0, max_value=100, format="%d점"),
             "종목명": st.column_config.TextColumn("종목명", width="medium"),
             "상태": st.column_config.TextColumn("판정", width="large"),
         },
@@ -1581,9 +1581,9 @@ def _enrich_top20_with_supply(raw):
 
 
 def render_running_horse(market_result):
-    st.markdown("### 🐎 달리는 말 탐지기")
-    st.caption("추세·거래량·RSI·MACD·ADX·신고가·이격도를 100점으로 평가합니다. 점수는 매수 신호가 아니라 후보 선별용입니다.")
-    single, scanner, rules = st.tabs(["🔎 단일 종목", "🏇 시장 스캐너", "📖 점수 기준"])
+    st.markdown("### ⚡ Momentum Leaders")
+    st.caption("가격 추세, 거래량, RSI, MACD, ADX, 신고가와 이격도를 결합해 시장 주도주의 추세 지속성을 평가합니다. 스코어는 매수 신호가 아닌 후보 선별용입니다.")
+    single, scanner, rules = st.tabs(["🔎 개별 분석", "🏆 KOSPI TOP 20", "📐 모델 기준"])
 
     with single:
         default_query = st.session_state.get("selected_name") or st.session_state.get("selected_code") or "삼성전자"
@@ -1594,7 +1594,7 @@ def render_running_horse(market_result):
             key="horse_query",
             placeholder="예: 삼성전자 또는 005930",
         )
-        run = c2.button("탐지", key="horse_run", use_container_width=True, type="primary")
+        run = c2.button("모멘텀 분석", key="horse_run", use_container_width=True, type="primary")
 
         if run:
             matches = _resolve_horse_query(query, market_result)
@@ -1625,7 +1625,7 @@ def render_running_horse(market_result):
         code = st.session_state.get("horse_selected_code", "")
         name = st.session_state.get("horse_selected_name", code)
         if code:
-            with st.spinner(f"{name} 달리는 말 조건을 분석하고 있습니다…"):
+            with st.spinner(f"{name} 모멘텀 조건을 분석하고 있습니다…"):
                 result = cached_running_score(code)
             if result is None:
                 st.warning("분석 가능한 일봉 데이터가 부족하거나 조회에 실패했습니다.")
@@ -1633,7 +1633,7 @@ def render_running_horse(market_result):
                 r = result["row"]
                 st.markdown(f"#### {escape(str(name))} ({code})")
                 boxes = st.columns(5)
-                boxes[0].metric("달리는 말 점수", f"{result['score']} / 100")
+                boxes[0].metric("모멘텀 스코어", f"{result['score']} / 100")
                 boxes[1].metric("종가", f"{r.Close:,.0f}원")
                 boxes[2].metric("RSI", f"{r.RSI:.1f}")
                 boxes[3].metric("ADX", f"{r.ADX14:.1f}")
@@ -1646,18 +1646,18 @@ def render_running_horse(market_result):
                 with st.spinner("외국인·기관 수급을 함께 점검하고 있습니다…"):
                     horse_inv = cached_horse_investors(code)
                 commentary = build_horse_commentary(result, horse_inv)
-                st.markdown("##### 🏦 리서치 데스크 코멘트")
+                st.markdown("##### Strategy View")
                 st.info(commentary["view"])
                 cc1, cc2 = st.columns(2)
                 with cc1:
-                    st.markdown("**상승 논거**")
+                    st.markdown("**Bull Case**")
                     if commentary["positives"]:
                         for text in commentary["positives"]:
                             st.markdown(f"- {text}")
                     else:
                         st.caption("현재 확인 가능한 강한 상승 논거가 제한적입니다.")
                 with cc2:
-                    st.markdown("**리스크 체크**")
+                    st.markdown("**Risk Factors**")
                     if commentary["risks"]:
                         for text in commentary["risks"]:
                             st.markdown(f"- {text}")
@@ -1675,7 +1675,7 @@ def render_running_horse(market_result):
                         st.warning(" / ".join(result["penalties"]))
 
     with scanner:
-        st.markdown("#### 🇰🇷 KOSPI 자동 달리는 말 TOP 20")
+        st.markdown("#### KOSPI Momentum Leaders · TOP 20")
         st.caption(
             "KOSPI 전체 시가총액 표를 1차로 수집한 뒤 거래대금·등락률·시총으로 후보를 압축하고, "
             "일봉 기술지표를 정밀 분석합니다. 최종 상위 20개는 외국인·기관 수급까지 추가 점검합니다."
@@ -1686,7 +1686,7 @@ def render_running_horse(market_result):
         pages = c2.slider("KOSPI 시장 페이지", 10, 25, 20, 5, key="horse_kospi_pages",
                           help="페이지당 종목 수는 공급 화면에 따라 달라질 수 있습니다.")
 
-        if st.button("🚀 KOSPI TOP 20 자동 분석", type="primary", key="horse_auto_top20_btn", use_container_width=True):
+        if st.button("KOSPI 모멘텀 TOP 20 분석", type="primary", key="horse_auto_top20_btn", use_container_width=True):
             with st.spinner("1단계: KOSPI 전체 후보군을 수집하고 있습니다…"):
                 universe = cached_horse_kospi_universe(pages)
             if universe.data.empty:
@@ -1726,7 +1726,7 @@ def render_running_horse(market_result):
             )
             _render_horse_leaderboard(top20.drop(columns=["_result"], errors="ignore"))
 
-            st.markdown("##### 🏦 TOP 20 리서치 요약")
+            st.markdown("##### TOP 20 · Strategy Notes")
             for idx, row in top20.reset_index(drop=True).iterrows():
                 rank = idx + 1
                 badge = _horse_rank_badge(rank)
@@ -1739,11 +1739,11 @@ def render_running_horse(market_result):
                     st.info(commentary["view"])
                     cpos, crisk = st.columns(2)
                     with cpos:
-                        st.markdown("**상승 논거**")
+                        st.markdown("**Bull Case**")
                         for text in commentary["positives"]:
                             st.markdown(f"- {text}")
                     with crisk:
-                        st.markdown("**리스크 요인**")
+                        st.markdown("**Risk Factors**")
                         for text in commentary["risks"]:
                             st.markdown(f"- {text}")
                     supply = commentary["supply"]
@@ -1754,7 +1754,7 @@ def render_running_horse(market_result):
 
             export = top20.drop(columns=["_result"], errors="ignore")
             st.download_button(
-                "KOSPI 달리는 말 TOP20 CSV",
+                "KOSPI Momentum TOP20 CSV",
                 export.to_csv(index=False).encode("utf-8-sig"),
                 file_name="running_horse_KOSPI_TOP20.csv",
                 mime="text/csv",
@@ -1978,7 +1978,7 @@ def _combine_oversold_score(tech, fund=None, investors=None):
     if score >= 80 and tech["dd52"] <= -20 and rebound and outlook_ok:
         status = "💎 최우선 관찰 — 낙폭 대비 실적·반등 신호 우수"
     elif score >= 70 and outlook_ok:
-        status = "🟢 유망 낙폭과대 — 펀더멘털 대비 가격 메리트"
+        status = "🟢 Rebound Candidate — 펀더멘털 대비 가격 메리트"
     elif score >= 60:
         status = "🟡 관심 — 반등 또는 실적 확증 추가 필요"
     elif score >= 45:
@@ -2116,7 +2116,7 @@ def render_oversold_chart(result, name):
     fig.add_trace(go.Scatter(x=df.index, y=df.MACD, mode="lines", name="MACD"), row=4, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df.MACD_SIGNAL, mode="lines", name="Signal"), row=4, col=1)
     fig.add_trace(go.Bar(x=df.index, y=df.MACD_HIST, name="Histogram"), row=4, col=1)
-    fig.update_layout(template="plotly_dark", title=f"{name} — 과대낙폭·반등 분석", height=900,
+    fig.update_layout(template="plotly_dark", title=f"{name} — Rebound Profile", height=900,
                       xaxis_rangeslider_visible=False, legend={"orientation": "h"},
                       margin={"l": 10, "r": 10, "t": 55, "b": 10},
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
@@ -2239,7 +2239,7 @@ def _finalize_oversold_candidates(raw, final_pool=35, workers=6):
 def _render_oversold_leaderboard(out):
     if out is None or out.empty:
         return
-    st.markdown("#### 💎 과대낙폭 유망주 TOP")
+    st.markdown("#### Rebound Ranking")
     st.caption("낙폭·반등 모멘텀·실적 컨센서스·외국인/기관 수급을 합산한 후보 순위입니다.")
     top = out.head(5).reset_index(drop=True)
     cols = st.columns(len(top))
@@ -2264,7 +2264,7 @@ def _render_oversold_leaderboard(out):
         display, hide_index=True, use_container_width=True,
         column_config={
             "순위": st.column_config.NumberColumn("순위", width="small", format="%d위"),
-            "점수": st.column_config.ProgressColumn("과대낙폭 유망 점수", min_value=0, max_value=100, format="%d점"),
+            "점수": st.column_config.ProgressColumn("리바운드 스코어", min_value=0, max_value=100, format="%d점"),
             "상태": st.column_config.TextColumn("판정", width="large"),
             "전략 코멘트": st.column_config.TextColumn("리서치 코멘트", width="large"),
         },
@@ -2272,16 +2272,16 @@ def _render_oversold_leaderboard(out):
 
 
 def render_oversold_hunter(market_result):
-    st.markdown("### 💎 과대낙폭 유망주 탐지기")
-    st.caption("많이 빠졌다는 이유만으로 고르지 않습니다. 52주 낙폭 + 반등 모멘텀 + 실적/컨센서스 + 외국인·기관 수급을 함께 평가합니다.")
-    single, scanner, rules = st.tabs(["🔎 단일 종목", "💎 시장 스캐너", "📖 점수 기준"])
+    st.markdown("### 💎 Rebound Selection")
+    st.caption("단순 낙폭이 아닌 가격 메리트, 반등 모멘텀, 실적 컨센서스와 외국인·기관 수급을 함께 평가해 펀더멘털 대비 과도하게 할인된 후보를 선별합니다.")
+    single, scanner, rules = st.tabs(["🔎 개별 분석", "🏆 KOSPI TOP 20", "📐 모델 기준"])
 
     with single:
         default_query = st.session_state.get("selected_name") or st.session_state.get("selected_code") or "삼성전자"
         c1, c2 = st.columns([4, 1])
         query = c1.text_input("종목명 또는 종목코드", value=default_query, key="oversold_query",
                               placeholder="예: 삼성전자 또는 005930")
-        run = c2.button("탐지", key="oversold_run", use_container_width=True, type="primary")
+        run = c2.button("리바운드 분석", key="oversold_run", use_container_width=True, type="primary")
         if run:
             matches = _resolve_horse_query(query, market_result)
             st.session_state.oversold_matches = matches
@@ -2315,7 +2315,7 @@ def render_oversold_hunter(market_result):
                 r, fund = result["row"], result["fund"]
                 st.markdown(f"#### {escape(str(name))} ({code})")
                 boxes = st.columns(6)
-                boxes[0].metric("유망 낙폭 점수", f"{result['score']} / 100")
+                boxes[0].metric("리바운드 스코어", f"{result['score']} / 100")
                 boxes[1].metric("종가", f"{r.Close:,.0f}원")
                 boxes[2].metric("52주 고점 대비", f"{result['dd52']:+.1f}%")
                 boxes[3].metric("RSI", f"{r.RSI:.1f}")
@@ -2330,18 +2330,18 @@ def render_oversold_hunter(market_result):
                 st.caption(f"향후 연간 영업이익 {op_text} · EPS {eps_text} · 추정 기준 {fund.get('ForwardPeriod') or '미확인'}")
 
                 commentary = build_oversold_commentary(result)
-                st.markdown("##### 🏦 리서치 데스크 코멘트")
+                st.markdown("##### Strategy View")
                 st.info(commentary["view"])
                 cpos, crisk = st.columns(2)
                 with cpos:
-                    st.markdown("**투자 포인트**")
+                    st.markdown("**Investment Case**")
                     if commentary["positives"]:
                         for item in commentary["positives"]:
                             st.markdown(f"- {item}")
                     else:
                         st.caption("현재 확인 가능한 강한 투자 포인트가 제한적입니다.")
                 with crisk:
-                    st.markdown("**리스크 체크**")
+                    st.markdown("**Risk Factors**")
                     if commentary["risks"]:
                         for item in commentary["risks"]:
                             st.markdown(f"- {item}")
@@ -2354,7 +2354,7 @@ def render_oversold_hunter(market_result):
                     st.warning(" / ".join(result["penalties"]))
 
     with scanner:
-        st.markdown("#### 🇰🇷 KOSPI 자동 과대낙폭 유망주 TOP 20")
+        st.markdown("#### KOSPI Rebound Selection · TOP 20")
         st.caption("KOSPI를 1차 경량 압축한 뒤 일봉 낙폭/반등을 분석하고, 상위 후보에만 실적 컨센서스와 외국인·기관 수급을 붙여 부하를 줄입니다.")
         c1, c2, c3 = st.columns(3)
         deep_count = c1.slider("일봉 정밀 후보 수", 50, 120, 80, 10, key="oversold_deep_count",
@@ -2363,7 +2363,7 @@ def render_oversold_hunter(market_result):
                                help="이 단계에서 컨센서스와 외국인·기관 데이터를 추가 조회합니다.")
         pages = c3.slider("KOSPI 시장 페이지", 10, 25, 20, 5, key="oversold_kospi_pages")
 
-        if st.button("💎 KOSPI 과대낙폭 TOP 20 자동 분석", type="primary", key="oversold_auto_top20_btn", use_container_width=True):
+        if st.button("KOSPI 리바운드 TOP 20 분석", type="primary", key="oversold_auto_top20_btn", use_container_width=True):
             with st.spinner("1단계: KOSPI 후보군을 수집하고 있습니다…"):
                 universe = cached_horse_kospi_universe(pages)
             if universe.data.empty:
@@ -2399,7 +2399,7 @@ def render_oversold_hunter(market_result):
                 f"{meta.get('final_pool', 0)}종목 실적·수급 분석 → TOP {len(top20)}"
             )
             _render_oversold_leaderboard(top20)
-            st.markdown("##### 🏦 TOP 20 리서치 요약")
+            st.markdown("##### TOP 20 · Strategy Notes")
             for idx, row in top20.reset_index(drop=True).iterrows():
                 rank = idx + 1
                 with st.expander(
@@ -2411,11 +2411,11 @@ def render_oversold_hunter(market_result):
                     st.info(commentary["view"])
                     cpos, crisk = st.columns(2)
                     with cpos:
-                        st.markdown("**투자 포인트**")
+                        st.markdown("**Investment Case**")
                         for item in commentary["positives"]:
                             st.markdown(f"- {item}")
                     with crisk:
-                        st.markdown("**리스크 요인**")
+                        st.markdown("**Risk Factors**")
                         for item in commentary["risks"]:
                             st.markdown(f"- {item}")
                     fund = result["fund"]
@@ -2426,7 +2426,7 @@ def render_oversold_hunter(market_result):
 
             export = top20.drop(columns=["_result"], errors="ignore").copy()
             st.download_button(
-                "KOSPI 과대낙폭 유망주 TOP20 CSV",
+                "KOSPI Rebound TOP20 CSV",
                 export.to_csv(index=False).encode("utf-8-sig"),
                 file_name="oversold_quality_KOSPI_TOP20.csv", mime="text/csv", use_container_width=True,
             )
@@ -2444,25 +2444,62 @@ def render_oversold_hunter(market_result):
 """)
 
 def main():
-    st.set_page_config(page_title="부리부리 종합 주식 작전실", page_icon="🐽", layout="wide")
+    st.set_page_config(page_title="ALPHA DESK | Market Intelligence", page_icon="📈", layout="wide")
     st.markdown("""<style>
-    .stApp { background-color: #0c0f17; color: #e1e7f0; }
-    .hero { padding: 22px; border: 1px solid #243249; border-radius: 16px; background: linear-gradient(120deg,#152235,#111826); margin-bottom:20px; }
-    .hero-title { font-size:26px; font-weight:800; margin:0 0 6px 0; color:#e1e7f0; }
-    .hero-subtitle { color:#94a3b8; margin:0; font-size:15px; }
-    [data-testid='stMetric'] { border:1px solid #243249; border-radius:12px; padding:12px; }
-    [data-testid='stMetricValue'] { font-size:23px; }
-    .horse-rank-card { border:1px solid #2b3950; border-radius:16px; padding:16px 12px; min-height:168px; text-align:center; background:linear-gradient(145deg,#151c29,#10151f); box-shadow:0 8px 22px rgba(0,0,0,.18); }
-    .horse-rank-1 { border-color:#d6ad3b; }
-    .horse-rank-2 { border-color:#9ca9b8; }
-    .horse-rank-3 { border-color:#a97142; }
-    .horse-rank-badge { font-size:27px; margin-bottom:6px; }
-    .horse-rank-name { font-size:17px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .horse-rank-score { font-size:30px; font-weight:900; line-height:1.2; margin:7px 0; }
-    .horse-rank-score span { font-size:12px; color:#7f8b9b; margin-left:2px; }
-    .horse-rank-meta { font-size:12px; color:#9aa6b6; margin-top:3px; }
+    .stApp {
+        background:
+          radial-gradient(circle at 12% 0%, rgba(32,73,112,.16), transparent 28%),
+          radial-gradient(circle at 88% 8%, rgba(80,58,122,.12), transparent 25%),
+          #090d14;
+        color:#e8edf5;
+    }
+    .block-container { padding-top:1.8rem; padding-bottom:3rem; max-width:1500px; }
+    .hero {
+        position:relative; overflow:hidden; padding:30px 34px 28px 34px;
+        border:1px solid rgba(126,153,190,.22); border-radius:20px;
+        background:linear-gradient(115deg,rgba(18,29,45,.98),rgba(12,17,27,.98));
+        box-shadow:0 18px 55px rgba(0,0,0,.28); margin-bottom:24px;
+    }
+    .hero:after {
+        content:''; position:absolute; width:260px; height:260px; right:-80px; top:-135px;
+        border-radius:50%; background:rgba(77,141,190,.10);
+    }
+    .hero-eyebrow { color:#69b7e8; font-size:11px; font-weight:800; letter-spacing:.18em; margin-bottom:9px; }
+    .hero-title { font-size:34px; font-weight:850; letter-spacing:-.02em; margin:0; color:#f4f7fb; }
+    .hero-subtitle { color:#91a0b5; margin-top:8px; font-size:14px; letter-spacing:.01em; }
+    .hero-meta { margin-top:17px; color:#65748a; font-size:12px; }
+    [data-testid='stMetric'] {
+        border:1px solid rgba(114,137,169,.20); border-radius:14px; padding:14px 16px;
+        background:linear-gradient(145deg,rgba(18,25,37,.92),rgba(12,17,26,.92));
+        box-shadow:0 6px 22px rgba(0,0,0,.12);
+    }
+    [data-testid='stMetricLabel'] { color:#8391a5; }
+    [data-testid='stMetricValue'] { font-size:23px; font-weight:750; color:#eef3f9; }
+    [data-baseweb='tab-list'] { gap:8px; border-bottom:1px solid rgba(113,135,164,.18); }
+    [data-baseweb='tab'] { height:46px; padding:0 16px; border-radius:10px 10px 0 0; color:#8795a9; font-weight:650; }
+    [aria-selected='true'][data-baseweb='tab'] { color:#eef4fb; background:rgba(35,54,77,.45); }
+    .stButton > button { border-radius:10px; border:1px solid rgba(111,142,179,.28); font-weight:700; min-height:42px; }
+    .horse-rank-card {
+        border:1px solid rgba(110,137,171,.24); border-radius:16px; padding:18px 12px;
+        min-height:172px; text-align:center; background:linear-gradient(145deg,rgba(20,29,43,.96),rgba(12,17,26,.96));
+        box-shadow:0 9px 30px rgba(0,0,0,.20);
+    }
+    .horse-rank-1 { border-color:rgba(214,173,59,.68); box-shadow:0 9px 30px rgba(214,173,59,.08); }
+    .horse-rank-2 { border-color:rgba(156,169,184,.52); }
+    .horse-rank-3 { border-color:rgba(169,113,66,.52); }
+    .horse-rank-badge { font-size:24px; margin-bottom:7px; }
+    .horse-rank-name { font-size:16px; font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .horse-rank-score { font-size:31px; font-weight:900; line-height:1.2; margin:7px 0; }
+    .horse-rank-score span { font-size:11px; color:#718096; margin-left:3px; }
+    .horse-rank-meta { font-size:12px; color:#8c99aa; margin-top:4px; }
+    hr { border-color:rgba(113,135,164,.16); }
     </style>""", unsafe_allow_html=True)
-    st.markdown('<div class="hero"><div class="hero-title">🐽 부리부리 종합 주식 작전실</div><div class="hero-subtitle">종목 분석 · 수급 · 재무 · 백테스트 · 🐎 달리는 말 · 💎 과대낙폭 유망주</div></div>', unsafe_allow_html=True)
+    st.markdown("""<div class="hero">
+      <div class="hero-eyebrow">MARKET INTELLIGENCE TERMINAL</div>
+      <div class="hero-title">ALPHA DESK</div>
+      <div class="hero-subtitle">Price Action · Investor Flow · Fundamentals · Quant Strategy</div>
+      <div class="hero-meta">Korea Equity Research Dashboard · Systematic screening for momentum and rebound opportunities</div>
+    </div>""", unsafe_allow_html=True)
     for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
                        "candidates": [], "search_message": "", "horse_matches": [],
                        "horse_selected_code": "", "horse_selected_name": "",
@@ -2474,7 +2511,7 @@ def main():
             st.session_state[key] = value
     with st.spinner("시장 표본을 조회하고 있습니다…"):
         market = cached_market()
-    main_tab, horse_tab, oversold_tab = st.tabs(["🐽 종합 작전실", "🐎 달리는 말 탐지기", "💎 과대낙폭 유망주"])
+    main_tab, horse_tab, oversold_tab = st.tabs(["📊 Research Dashboard", "⚡ Momentum Leaders", "💎 Rebound Selection"])
     with main_tab:
         render_original_workspace(market)
     with horse_tab:
