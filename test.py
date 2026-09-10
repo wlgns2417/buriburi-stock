@@ -1075,23 +1075,248 @@ def render_analysis(bundle, code, display_name):
             st.caption(f"Google News RSS · 조회: {news.fetched_at} · 제목 검색 결과이며 기업 공시 확인을 대체하지 않습니다.")
 
 
-def main():
-    st.set_page_config(page_title="부리부리 종합 주식 작전실", page_icon="🐽", layout="wide")
-    st.markdown("""<style>
-    .stApp { background-color: #0c0f17; color: #e1e7f0; }
-    .hero { padding: 22px; border: 1px solid #243249; border-radius: 16px;
-            background: linear-gradient(120deg,#152235,#111826); margin-bottom:20px; }
-    .hero h1 { font-size:26px; margin:0; padding:0; }
-    [data-testid='stMetric'] { border:1px solid #243249; border-radius:12px; padding:12px; }
-    [data-testid='stMetricValue'] { font-size:23px; }
-    </style><div class='hero'><h1>🐽 부리부리 종합 주식 작전실</h1>
-    <p style='color:#94a3b8;margin-bottom:0'>종목 분석 · 수급 확인 · 거래비용을 반영한 전략 검증</p></div>""", unsafe_allow_html=True)
-    for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
-                       "candidates": [], "search_message": ""}.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-    with st.spinner("시장 표본을 조회하고 있습니다…"):
-        market = cached_market()
+
+# ===== 4. 달리는 말 탐지기 =====
+def add_running_indicators(frame):
+    df = add_indicators(frame)
+    df["MA120"] = df.Close.rolling(120, min_periods=120).mean()
+    df["VOL_MA20"] = df.Volume.rolling(20, min_periods=20).mean()
+    df["HIGH20_PREV"] = df.High.shift(1).rolling(20, min_periods=20).max()
+    df["HIGH60_PREV"] = df.High.shift(1).rolling(60, min_periods=60).max()
+    df["RET5"] = df.Close.pct_change(5) * 100
+    df["RET20"] = df.Close.pct_change(20) * 100
+    df["DIST_MA20"] = (df.Close / df.MA20 - 1) * 100
+    df["VOL_RATIO"] = df.Volume / df.VOL_MA20.replace(0, np.nan)
+    df["MA20_SLOPE"] = df.MA20.pct_change(5) * 100
+    df["MA60_SLOPE"] = df.MA60.pct_change(10) * 100
+
+    high, low, close = df.High, df.Low, df.Close
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
+    dx = 100 * (plus_di-minus_di).abs() / (plus_di+minus_di).replace(0, np.nan)
+    df["PLUS_DI"] = plus_di
+    df["MINUS_DI"] = minus_di
+    df["ADX14"] = dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    return df
+
+
+def running_horse_score(frame):
+    try:
+        completed = completed_history(frame)
+        if len(completed) < 130:
+            return None
+        df = add_running_indicators(completed)
+        needed = ["MA120","VOL_MA20","HIGH60_PREV","ADX14","RSI","MACD","MACD_SIGNAL"]
+        ready = df.dropna(subset=needed)
+        if len(ready) < 2:
+            return None
+        r, p = ready.iloc[-1], ready.iloc[-2]
+    except Exception:
+        return None
+
+    score = 0
+    detail = []
+    def add(cond, pts, label):
+        nonlocal score
+        ok = bool(cond)
+        if ok:
+            score += pts
+        detail.append({"판정":"✅" if ok else "➖", "점수":pts if ok else 0, "조건":label})
+
+    # 추세 30
+    add(r.Close > r.MA20, 5, "현재가 > 20일선")
+    add(r.MA20 > r.MA60, 5, "20일선 > 60일선")
+    add(r.MA60 > r.MA120, 5, "60일선 > 120일선")
+    add(r.MA20_SLOPE > 0, 5, "20일선 상승")
+    add(r.MA60_SLOPE > 0, 5, "60일선 상승")
+    add(r.Close >= r.HIGH60_PREV * 0.99, 5, "60일 고점 돌파/근접")
+
+    # 거래량 20
+    add(r.VOL_RATIO >= 1.2, 5, "거래량 > 20일 평균 1.2배")
+    add(r.VOL_RATIO >= 2.0, 5, "거래량 > 20일 평균 2배")
+    add((r.Close > p.Close) and (r.Volume > p.Volume), 5, "상승일 거래량 증가")
+    recent = ready.tail(5)
+    pullback = (recent.Close.pct_change() < 0).any() and r.Volume < r.VOL_MA20
+    add(pullback, 5, "최근 눌림에서 거래량 감소")
+
+    # 모멘텀 20
+    add(55 <= r.RSI <= 70, 7, "RSI 55~70")
+    add((r.MACD > r.MACD_SIGNAL) and (r.MACD > 0), 7, "MACD > Signal 및 0선 위")
+    add((r.ADX14 >= 20) and (r.PLUS_DI > r.MINUS_DI), 6, "ADX 20+ 및 +DI 우위")
+
+    # 돌파/위치 20
+    add(r.Close > r.HIGH20_PREV, 5, "20일 신고가 돌파")
+    add(r.Close > r.HIGH60_PREV, 5, "60일 신고가 돌파")
+    add(-1 <= r.DIST_MA20 <= 6, 5, "20일선 이격 적정")
+    add(r.RET20 > 0, 5, "20거래일 수익률 플러스")
+
+    # 과열 방지 10
+    add(r.RSI < 78, 5, "RSI 극단 과열 아님")
+    add(r.DIST_MA20 < 10, 5, "20일선 과도 이격 아님")
+
+    penalties=[]
+    if r.RSI >= 80:
+        score -= 8; penalties.append("RSI 80 이상 -8")
+    if r.DIST_MA20 >= 15:
+        score -= 8; penalties.append("20일선 +15% 이상 이격 -8")
+    if r.RET5 >= 20:
+        score -= 5; penalties.append("5거래일 +20% 이상 급등 -5")
+    score=max(0,min(100,int(round(score))))
+
+    healthy_pullback = r.Close > r.MA20 and -1 <= r.DIST_MA20 <= 4 and 50 <= r.RSI <= 68
+    breakout = r.Close > r.HIGH60_PREV
+    near = r.Close >= r.HIGH60_PREV * 0.97
+    if score >= 80 and healthy_pullback:
+        status="🔥 최우선 관찰 — 강한 추세 + 좋은 눌림"
+    elif score >= 80 and breakout and r.RSI < 75:
+        status="🚀 강한 돌파 — 추격보다 눌림 대기"
+    elif score >= 70 and near:
+        status="🟢 달리는 말 후보 — 돌파/지지 확인"
+    elif score >= 60:
+        status="🟡 관심 종목 — 조건 일부 미충족"
+    elif score >= 45:
+        status="🟠 애매 — 추세 확인 필요"
+    else:
+        status="🔴 우선순위 낮음"
+
+    return {"score":score,"status":status,"row":r,"df":ready,"detail":pd.DataFrame(detail),
+            "penalties":penalties,"support1":float(r.MA20),"support2":float(r.MA60),
+            "resistance":float(r.HIGH60_PREV)}
+
+
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def cached_running_score(code):
+    result = fetch_history(code)
+    if result.status == "error" or result.data is None or result.data.empty:
+        return None
+    return running_horse_score(result.data)
+
+
+def render_running_chart(result, name):
+    df = result["df"].tail(150)
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                        row_heights=[0.52,0.16,0.16,0.16])
+    fig.add_trace(go.Candlestick(x=df.index, open=df.Open, high=df.High, low=df.Low,
+                                 close=df.Close, name="Price"), row=1,col=1)
+    for ma in [20,60,120]:
+        fig.add_trace(go.Scatter(x=df.index,y=df[f"MA{ma}"],mode="lines",name=f"MA{ma}"),row=1,col=1)
+    fig.add_hline(y=result["resistance"], line_dash="dot", annotation_text="60일 전고점", row=1,col=1)
+    fig.add_trace(go.Bar(x=df.index,y=df.Volume,name="Volume"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=df.VOL_MA20,mode="lines",name="Vol MA20"),row=2,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=df.RSI,mode="lines",name="RSI14"),row=3,col=1)
+    for level in [70,50,30]: fig.add_hline(y=level,line_dash="dot",row=3,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=df.MACD,mode="lines",name="MACD"),row=4,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=df.MACD_SIGNAL,mode="lines",name="Signal"),row=4,col=1)
+    fig.add_trace(go.Bar(x=df.index,y=df.MACD_HIST,name="Histogram"),row=4,col=1)
+    fig.update_layout(template="plotly_dark", title=f"{name} — 달리는 말 분석", height=900,
+                      xaxis_rangeslider_visible=False, legend={"orientation":"h"},
+                      margin={"l":10,"r":10,"t":55,"b":10},
+                      paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig,use_container_width=True)
+
+
+def render_running_horse(market_result):
+    st.markdown("### 🐎 달리는 말 탐지기")
+    st.caption("추세·거래량·RSI·MACD·ADX·신고가·이격도를 100점으로 평가합니다. 점수는 매수 신호가 아니라 후보 선별용입니다.")
+    single, scanner, rules = st.tabs(["🔎 단일 종목","🏇 시장 스캐너","📖 점수 기준"])
+
+    with single:
+        default_code = st.session_state.get("selected_code") or "005930"
+        c1,c2=st.columns([4,1])
+        code=c1.text_input("종목코드",value=default_code,key="horse_code",placeholder="예: 005930")
+        run=c2.button("탐지",key="horse_run",use_container_width=True)
+        if run:
+            if not valid_code(code):
+                st.warning("6자리 종목코드를 입력해 주십시오.")
+            else:
+                with st.spinner("달리는 말 조건을 분석하고 있습니다…"):
+                    result=cached_running_score(code)
+                if result is None:
+                    st.warning("분석 가능한 일봉 데이터가 부족하거나 조회에 실패했습니다.")
+                else:
+                    name=code
+                    if market_result is not None and not market_result.data.empty:
+                        hit=market_result.data[market_result.data.Code.astype(str)==code]
+                        if not hit.empty: name=str(hit.iloc[0].Name)
+                    r=result["row"]
+                    boxes=st.columns(5)
+                    boxes[0].metric("달리는 말 점수",f"{result['score']} / 100")
+                    boxes[1].metric("종가",f"{r.Close:,.0f}원")
+                    boxes[2].metric("RSI",f"{r.RSI:.1f}")
+                    boxes[3].metric("ADX",f"{r.ADX14:.1f}")
+                    boxes[4].metric("거래량",f"{r.VOL_RATIO:.2f}x")
+                    st.subheader(result["status"])
+                    st.caption(f"20일선 {r.MA20:,.0f}원 · 60일선 {r.MA60:,.0f}원 · 60일 전고점 {result['resistance']:,.0f}원 · 20일선 이격 {r.DIST_MA20:+.1f}%")
+                    render_running_chart(result,name)
+                    l,rcol=st.columns([3,2])
+                    with l: st.dataframe(result["detail"],hide_index=True,use_container_width=True)
+                    with rcol:
+                        st.write(f"**1차 지지:** {result['support1']:,.0f}원 (20일선)")
+                        st.write(f"**2차 지지:** {result['support2']:,.0f}원 (60일선)")
+                        st.write(f"**주요 돌파선:** {result['resistance']:,.0f}원")
+                        if result["penalties"]: st.warning(" / ".join(result["penalties"]))
+
+    with scanner:
+        c1,c2,c3=st.columns(3)
+        target_market=c1.selectbox("시장",["KOSPI","KOSDAQ"],key="horse_market")
+        scan_count=c2.slider("스캔 종목 수",10,80,30,10,key="horse_count")
+        min_score=c3.slider("최소 점수",40,90,65,5,key="horse_min")
+        st.caption("Naver 시가총액 표 상위 표본 내에서 시가총액 순으로 후보를 분석합니다. 전체 상장종목 전수 순위는 아닙니다.")
+        if st.button("시장 스캔 시작",type="primary",key="horse_scan"):
+            with st.spinner("시장 표본을 확장 조회하고 있습니다…"):
+                full_market=cached_market(5)
+            candidates=full_market.data[full_market.data.Market==target_market].sort_values("Marcap",ascending=False).head(scan_count)
+            if candidates.empty:
+                st.warning("스캔할 시장 데이터를 확보하지 못했습니다.")
+            else:
+                rows=[]; bar=st.progress(0); msg=st.empty()
+                for i,row in enumerate(candidates.itertuples(),start=1):
+                    msg.text(f"[{i}/{len(candidates)}] {row.Name} 분석 중…")
+                    sr=cached_running_score(str(row.Code))
+                    if sr is not None:
+                        rr=sr["row"]
+                        rows.append({"종목명":row.Name,"코드":row.Code,"점수":sr["score"],"상태":sr["status"],
+                                     "종가":round(rr.Close),"5일수익률(%)":round(rr.RET5,2),"20일수익률(%)":round(rr.RET20,2),
+                                     "RSI":round(rr.RSI,1),"ADX":round(rr.ADX14,1),"거래량배수":round(rr.VOL_RATIO,2),
+                                     "20일선이격(%)":round(rr.DIST_MA20,2),
+                                     "60일고점대비(%)":round((rr.Close/sr['resistance']-1)*100,2)})
+                    bar.progress(i/len(candidates))
+                bar.empty(); msg.empty()
+                if rows:
+                    out=pd.DataFrame(rows)
+                    out=out[out.점수>=min_score].sort_values(["점수","20일수익률(%)"],ascending=[False,False]).reset_index(drop=True)
+                    out.index=out.index+1
+                    st.success(f"{len(candidates)}종목 분석 완료 · {min_score}점 이상 {len(out)}종목")
+                    st.dataframe(out,use_container_width=True)
+                    st.download_button("달리는 말 결과 CSV",out.to_csv(index=False).encode("utf-8-sig"),
+                                       file_name=f"running_horse_{target_market}.csv",mime="text/csv")
+                else:
+                    st.info("분석 가능한 종목이 없었습니다.")
+
+    with rules:
+        st.markdown("""
+**추세 30점** — 현재가>20일선, 20>60>120일선, 20·60일선 상승, 60일 고점 근접/돌파  
+**거래량 20점** — 20일 평균 대비 거래량 증가, 상승일 거래량 증가, 눌림 거래량 감소  
+**모멘텀 20점** — RSI 55~70, MACD 양수·Signal 상회, ADX 20 이상 +DI 우위  
+**돌파/위치 20점** — 20·60일 신고가, 20일선 이격 적정, 20거래일 상승  
+**과열 방지 10점** — RSI 78 미만, 20일선 이격 10% 미만  
+**패널티** — RSI 80 이상 -8, 20일선 +15% 이상 이격 -8, 5일 +20% 이상 급등 -5
+
+- 80점 이상: 강한 후보
+- 70~79점: 우선 관찰
+- 60~69점: 관심
+- 45~59점: 애매
+- 45점 미만: 우선순위 낮음
+        """)
+
+
+def render_original_workspace(market):
     resolve_pending(market.data)
     left, right = st.columns([7, 3])
     with right:
@@ -1115,6 +1340,30 @@ def main():
         with st.spinner("일봉·재무·수급을 조회하고 있습니다…"):
             bundle = cached_bundle(code)
         render_analysis(bundle, code, st.session_state.selected_name)
+
+
+def main():
+    st.set_page_config(page_title="부리부리 종합 주식 작전실", page_icon="🐽", layout="wide")
+    st.markdown("""<style>
+    .stApp { background-color: #0c0f17; color: #e1e7f0; }
+    .hero { padding: 22px; border: 1px solid #243249; border-radius: 16px;
+            background: linear-gradient(120deg,#152235,#111826); margin-bottom:20px; }
+    .hero h1 { font-size:26px; margin:0; padding:0; }
+    [data-testid='stMetric'] { border:1px solid #243249; border-radius:12px; padding:12px; }
+    [data-testid='stMetricValue'] { font-size:23px; }
+    </style><div class='hero'><h1>🐽 부리부리 종합 주식 작전실</h1>
+    <p style='color:#94a3b8;margin-bottom:0'>종목 분석 · 수급 · 재무 · 백테스트 · 🐎 달리는 말 탐지</p></div>""", unsafe_allow_html=True)
+    for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
+                       "candidates": [], "search_message": ""}.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    with st.spinner("시장 표본을 조회하고 있습니다…"):
+        market = cached_market()
+    main_tab, horse_tab = st.tabs(["🐽 종합 작전실", "🐎 달리는 말 탐지기"])
+    with main_tab:
+        render_original_workspace(market)
+    with horse_tab:
+        render_running_horse(market)
 
 
 if __name__ == "__main__":
