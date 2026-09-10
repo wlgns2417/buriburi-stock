@@ -1025,6 +1025,267 @@ def render_backtest(df):
                        file_name=f"backtest_{st.session_state.selected_code}.csv", mime="text/csv")
 
 
+
+def _news_momentum_summary(news_result):
+    """최근 헤드라인을 보조적으로 요약한다. 정량 점수에는 반영하지 않는다."""
+    if news_result is None or getattr(news_result, "status", "error") == "error" or not getattr(news_result, "data", None):
+        return {
+            "label": "미확인",
+            "text": "최근 관련 뉴스 헤드라인을 확인하지 못했습니다.",
+            "headlines": [],
+        }
+
+    positive_words = [
+        "수주", "계약", "공급", "증설", "투자", "흑자", "상향", "성장", "호조",
+        "개선", "회복", "승인", "출시", "협력", "최대", "신사업", "증가", "강세",
+    ]
+    negative_words = [
+        "하향", "적자", "부진", "감소", "손실", "리콜", "소송", "규제", "우려",
+        "중단", "지연", "철회", "감산", "약세", "급락", "하락",
+    ]
+    headlines = [str(x.get("title", "")).strip() for x in news_result.data if str(x.get("title", "")).strip()][:5]
+    pos = sum(sum(1 for word in positive_words if word in title) for title in headlines)
+    neg = sum(sum(1 for word in negative_words if word in title) for title in headlines)
+
+    if pos >= neg + 2:
+        label = "긍정 우위"
+        text = f"최근 헤드라인에서는 실적·수주·성장 계열의 긍정 키워드가 상대적으로 우세합니다(긍정 {pos} / 부정 {neg})."
+    elif neg >= pos + 2:
+        label = "부정 우위"
+        text = f"최근 헤드라인에서는 실적 둔화·우려·하락 계열의 부정 키워드가 상대적으로 우세합니다(긍정 {pos} / 부정 {neg})."
+    else:
+        label = "혼조"
+        text = f"최근 뉴스 헤드라인의 방향성은 혼조입니다(긍정 {pos} / 부정 {neg}). 단일 뉴스보다 실적·수급과 함께 확인할 필요가 있습니다."
+    return {"label": label, "text": text, "headlines": headlines[:3]}
+
+
+def build_general_research_commentary(df, investors, fund, score, news_result=None, short=None, stale=False):
+    """종합 분석 화면용 리서치형 자동 코멘트.
+
+    관측된 가격·기술지표·수급·재무·헤드라인만 사용하며 뉴스는 점수에 반영하지 않는다.
+    """
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+    positives, risks = [], []
+
+    close = number(latest.Close)
+    ma5, ma20, ma60 = [number(latest.get(k)) for k in ["MA5", "MA20", "MA60"]]
+    dist20 = (close / ma20 - 1) * 100 if close and ma20 else None
+    dist60 = (close / ma60 - 1) * 100 if close and ma60 else None
+
+    # 추세 / 이격
+    if ma5 and ma20 and ma60:
+        if ma5 > ma20 > ma60 and close > ma20:
+            trend_label = "상승 추세"
+            positives.append(
+                f"5일·20일·60일 이동평균선이 정배열이며 종가가 20일선 위에 있어 단·중기 추세 구조가 우호적입니다. "
+                f"20일선 이격은 {dist20:+.1f}%, 60일선 이격은 {dist60:+.1f}%입니다."
+            )
+        elif close > ma20:
+            trend_label = "단기 우위"
+            positives.append(
+                f"종가가 20일선을 {dist20:+.1f}% 상회해 단기 가격 모멘텀은 유지되고 있습니다."
+            )
+            risks.append("이동평균선 완전 정배열이 확인되지 않아 중기 추세의 확증은 아직 제한적입니다.")
+        elif close > ma60:
+            trend_label = "중립"
+            risks.append(
+                f"종가가 20일선을 {dist20:+.1f}% 하회해 단기 추세가 약화됐지만 60일선 대비 {dist60:+.1f}% 수준으로 중기 지지 여부를 확인할 구간입니다."
+            )
+        else:
+            trend_label = "추세 약세"
+            risks.append(
+                f"종가가 20일선 {dist20:+.1f}%, 60일선 {dist60:+.1f}% 위치로 주요 이동평균선을 하회해 추세 복원이 확인되지 않았습니다."
+            )
+    else:
+        trend_label = "미확인"
+        risks.append("이동평균 데이터가 부족해 추세 구조와 이격도를 충분히 평가하지 못했습니다.")
+
+    bb = number(latest.get("BB_pct"))
+    if bb is not None:
+        if bb > 1.05:
+            risks.append(f"볼린저 %b가 {bb:.2f}로 상단 밴드를 넘어 단기 과열 및 되돌림 리스크가 확대된 구간입니다.")
+        elif 0.75 <= bb <= 1.05:
+            positives.append(f"볼린저 %b {bb:.2f}로 상단부를 유지해 추세 탄력은 양호한 편입니다.")
+        elif bb < 0.25:
+            risks.append(f"볼린저 %b {bb:.2f}로 하단부에 위치해 가격 압력이 아직 우세합니다.")
+
+    # 모멘텀
+    rsi = number(latest.get("RSI"))
+    macd_hist = number(latest.get("MACD_HIST"))
+    prev_hist = number(prev.get("MACD_HIST"))
+    mfi = number(latest.get("MFI"))
+    obv = number(latest.get("OBV"))
+    obv_avg = number(df.OBV.tail(20).mean()) if "OBV" in df else None
+
+    momentum_parts = []
+    if rsi is not None:
+        if 45 <= rsi <= 65:
+            momentum_parts.append(f"RSI {rsi:.1f}로 과열 없이 추세를 이어가기 좋은 중립~강세 구간")
+            positives.append(f"RSI가 {rsi:.1f}로 극단적 과열 없이 모멘텀이 유지되는 구간입니다.")
+        elif rsi > 70:
+            momentum_parts.append(f"RSI {rsi:.1f} 과열권")
+            risks.append(f"RSI가 {rsi:.1f}로 과열권에 진입해 신규 추격 관점의 손익비가 불리해질 수 있습니다.")
+        elif rsi < 30:
+            momentum_parts.append(f"RSI {rsi:.1f} 과매도권")
+            risks.append(f"RSI가 {rsi:.1f}로 과매도권이나, 과매도 자체는 추세 반전을 의미하지 않으므로 반등 확인이 필요합니다.")
+        else:
+            momentum_parts.append(f"RSI {rsi:.1f}")
+
+    if macd_hist is not None and prev_hist is not None:
+        if macd_hist > 0 and macd_hist >= prev_hist:
+            momentum_parts.append("MACD 양(+)의 모멘텀 확대")
+            positives.append("MACD 히스토그램이 0선 위에서 확대돼 단기 추세 탄력이 개선되고 있습니다.")
+        elif macd_hist > 0:
+            momentum_parts.append("MACD 양(+)이나 둔화")
+            risks.append("MACD는 0선 위를 유지하지만 히스토그램 탄력이 둔화돼 상승 속도 저하 여부를 점검할 필요가 있습니다.")
+        elif macd_hist > prev_hist:
+            momentum_parts.append("MACD 음(-)이나 개선")
+            positives.append("MACD 히스토그램은 아직 음(-)의 영역이지만 전일 대비 개선돼 하락 모멘텀 둔화 신호가 나타나고 있습니다.")
+        else:
+            momentum_parts.append("MACD 음(-)의 모멘텀")
+            risks.append("MACD 히스토그램이 음(-)의 영역에서 약화돼 추세 반전 신호가 아직 부족합니다.")
+
+    if mfi is not None and 50 <= mfi <= 75:
+        positives.append(f"MFI {mfi:.1f}로 가격과 거래량을 결합한 자금 흐름 지표가 우호적인 범위에 있습니다.")
+    elif mfi is not None and mfi < 40:
+        risks.append(f"MFI가 {mfi:.1f}로 낮아 거래량을 동반한 매수 에너지가 강하다고 보기 어렵습니다.")
+    if obv is not None and obv_avg is not None:
+        if obv > obv_avg:
+            positives.append("OBV가 최근 20일 평균을 상회해 누적 거래량 흐름은 매수 우위로 해석할 여지가 있습니다.")
+        else:
+            risks.append("OBV가 최근 20일 평균을 하회해 거래량 기반 추세 확증은 제한적입니다.")
+
+    momentum_label = " · ".join(momentum_parts[:2]) if momentum_parts else "미확인"
+
+    # 외국인 / 기관 수급
+    w5 = investor_window(investors, df, 5, ["ForeignNet", "InstitutionNet"])
+    w20 = investor_window(investors, df, 20, ["ForeignNet", "InstitutionNet"])
+    w10_rate = investor_window(investors, df, 10, ["ForeignRate"])
+    if w5 is not None:
+        f5 = float(w5.ForeignNet.sum())
+        i5 = float(w5.InstitutionNet.sum())
+        if f5 > 0 and i5 > 0:
+            flow_label = "외인·기관 동반 순매수"
+            positives.append(f"최근 5거래일 외국인 {f5:+,.0f}주, 기관 {i5:+,.0f}주로 동반 순매수가 확인돼 수급 확증력이 양호합니다.")
+        elif f5 > 0 and i5 <= 0:
+            flow_label = "외국인 우위"
+            positives.append(f"최근 5거래일 외국인이 {f5:+,.0f}주 순매수하며 수급을 주도하고 있습니다.")
+            risks.append(f"같은 기간 기관은 {i5:+,.0f}주로 동반 수급이 확인되지 않아 매수 주체의 확산 여부를 볼 필요가 있습니다.")
+        elif i5 > 0 and f5 <= 0:
+            flow_label = "기관 우위"
+            positives.append(f"최근 5거래일 기관이 {i5:+,.0f}주 순매수하며 방어적 수급을 형성하고 있습니다.")
+            risks.append(f"같은 기간 외국인은 {f5:+,.0f}주로 외국인 수급의 추세 전환은 아직 확인되지 않았습니다.")
+        else:
+            flow_label = "동반 순매도"
+            risks.append(f"최근 5거래일 외국인 {f5:+,.0f}주, 기관 {i5:+,.0f}주로 동반 순매도여서 수급 측면의 역풍이 존재합니다.")
+    else:
+        flow_label = "수급 미확인"
+        risks.append("최근 5거래일과 일치하는 외국인·기관 데이터가 부족해 수급 방향을 확정하기 어렵습니다.")
+
+    if w20 is not None:
+        f20, i20 = float(w20.ForeignNet.sum()), float(w20.InstitutionNet.sum())
+        if (f20 > 0 and i20 > 0) and flow_label != "외인·기관 동반 순매수":
+            positives.append(f"20거래일 누적으로는 외국인 {f20:+,.0f}주, 기관 {i20:+,.0f}주 순매수여서 중기 수급 기반은 양호합니다.")
+        elif f20 < 0 and i20 < 0:
+            risks.append(f"20거래일 누적 외국인 {f20:+,.0f}주, 기관 {i20:+,.0f}주로 중기 수급 부담이 남아 있습니다.")
+
+    if w10_rate is not None:
+        rate_delta = float(w10_rate.ForeignRate.iloc[-1] - w10_rate.ForeignRate.iloc[0])
+        if rate_delta > 0:
+            positives.append(f"외국인 보유율이 최근 10거래일 기준 {rate_delta:+.2f}%p 증가해 보유 비중 흐름은 우호적입니다.")
+        elif rate_delta < 0:
+            risks.append(f"외국인 보유율이 최근 10거래일 기준 {rate_delta:+.2f}%p 감소해 중기 외국인 수급은 약화된 모습입니다.")
+
+    # 가치 / 펀더멘털
+    target = number(fund.get("Target"))
+    roe = number(fund.get("ROE"))
+    per = number(fund.get("PER"))
+    industry = number(fund.get("IndustryPER"))
+    if not stale and target is not None and target > 0 and close:
+        upside = (target / close - 1) * 100
+        if upside >= 25:
+            positives.append(f"컨센서스 목표가의 종가 대비 상승여력이 {upside:+.1f}%로 가격 메리트가 비교적 크게 관측됩니다.")
+        elif upside < 0:
+            risks.append(f"현재 종가가 컨센서스 목표가를 상회해 괴리율이 {upside:+.1f}%로 밸류에이션 여유가 제한적입니다.")
+    if not stale and roe is not None:
+        if roe >= 15:
+            positives.append(f"최근 확정 연간 ROE가 {roe:.1f}%로 수익성 지표가 양호한 편입니다.")
+        elif roe < 8:
+            risks.append(f"최근 확정 연간 ROE가 {roe:.1f}%로 수익성 측면의 강한 프리미엄 근거는 제한적입니다.")
+    if not stale and per is not None and industry is not None and per > 0 and industry > 0:
+        if per <= industry * 0.7:
+            positives.append(f"PER {per:.1f}배로 동일 업종 {industry:.1f}배 대비 할인돼 상대 밸류에이션 매력이 관측됩니다.")
+        elif per >= industry * 1.3:
+            risks.append(f"PER {per:.1f}배로 동일 업종 {industry:.1f}배 대비 프리미엄이 커 실적 기대가 주가에 선반영됐을 가능성을 점검해야 합니다.")
+
+    # 뉴스는 보조 정보만
+    news = _news_momentum_summary(news_result)
+    if news["label"] == "긍정 우위":
+        positives.append(news["text"] + " 뉴스는 정량 점수에는 반영하지 않습니다.")
+    elif news["label"] == "부정 우위":
+        risks.append(news["text"] + " 뉴스는 정량 점수에는 반영하지 않습니다.")
+    else:
+        risks.append(news["text"] + " 뉴스는 정량 점수에는 반영하지 않습니다.")
+
+    # 점수 / 보류 사유
+    logs = score.get("logs", pd.DataFrame())
+    missing_rows = logs[logs["득점"].isna()] if not logs.empty and "득점" in logs else pd.DataFrame()
+    zero_rows = logs[(logs["득점"] == 0) & logs["배점"].notna()] if not logs.empty and "득점" in logs else pd.DataFrame()
+    earned_rows = logs[(logs["득점"].notna()) & (logs["득점"] > 0)] if not logs.empty and "득점" in logs else pd.DataFrame()
+
+    if score.get("score") is None:
+        missing_names = ", ".join(missing_rows["항목"].astype(str).tolist()) if not missing_rows.empty else "일부 항목"
+        grade_reason = (
+            f"종합등급이 보류된 직접 원인은 점수가 낮아서가 아니라 **{missing_names} 데이터 미확인**으로 "
+            f"전체 100점 중 {score['possible']}점까지만 관측됐기 때문입니다. 현재 확인된 득점은 {score['points']} / {score['possible']}점입니다."
+        )
+    else:
+        grade_reason = f"전체 평가 항목이 확인됐으며 최종 점수는 {score['score']} / 100점, 판정은 '{score['grade']}'입니다."
+
+    limiters = []
+    if not zero_rows.empty:
+        for _, row in zero_rows.sort_values("배점", ascending=False).head(5).iterrows():
+            limiters.append(f"{row['항목']}: 0/{row['배점']}점 — {row['근거']}")
+    if not missing_rows.empty:
+        for _, row in missing_rows.sort_values("배점", ascending=False).head(3).iterrows():
+            limiters.append(f"{row['항목']}: 미확인/{row['배점']}점 — {row['근거']}")
+
+    contributors = []
+    if not earned_rows.empty:
+        for _, row in earned_rows.sort_values(["득점", "배점"], ascending=False).head(5).iterrows():
+            contributors.append(f"{row['항목']}: {row['득점']}/{row['배점']}점 — {row['근거']}")
+
+    # 첫 화면 종합 문장
+    if score["points"] >= 0.75 * max(score["possible"], 1):
+        score_tone = "확인 가능한 항목 기준 조건 충족도가 높은 편"
+    elif score["points"] >= 0.50 * max(score["possible"], 1):
+        score_tone = "확인 가능한 항목 기준 조건 충족도가 중립권"
+    else:
+        score_tone = "확인 가능한 항목 기준 조건 충족도가 낮은 편"
+
+    view = (
+        f"{grade_reason} 기술적으로는 **{trend_label}**, 수급은 **{flow_label}**, 모멘텀은 **{momentum_label}**로 요약됩니다. "
+        f"따라서 현재는 {score_tone}이며, 신규 판단에서는 가격 이격과 수급의 지속성, MACD·RSI 방향을 함께 확인하는 것이 적절합니다. "
+        f"뉴스 모멘텀은 **{news['label']}**으로 분류되며 보조 참고용입니다."
+    )
+
+    return {
+        "view": view,
+        "positives": positives[:7],
+        "risks": risks[:7],
+        "trend_label": trend_label,
+        "flow_label": flow_label,
+        "momentum_label": momentum_label,
+        "news_label": news["label"],
+        "headlines": news["headlines"],
+        "limiters": limiters,
+        "contributors": contributors,
+        "dist20": dist20,
+        "dist60": dist60,
+    }
+
+
 def render_analysis(bundle, code, display_name):
     history = bundle["history"]
     if history.status == "error":
@@ -1068,6 +1329,13 @@ def render_analysis(bundle, code, display_name):
         except (ValueError, UnicodeError, pd.errors.ParserError) as exc:
             st.warning(str(exc))
     score = evaluate_score(df, investors, {} if stale else fund, short)
+    # 종합 분석 화면의 리서치 코멘트를 위해 최근 헤드라인을 캐시 조회합니다.
+    # 뉴스는 점수에는 반영하지 않고 보조 코멘트로만 사용합니다.
+    with st.spinner("추세·수급·모멘텀·최근 뉴스까지 종합 해석하고 있습니다…"):
+        news_for_comment = cached_news(name)
+    research = build_general_research_commentary(
+        df, investors, {} if stale else fund, score, news_for_comment, short, stale
+    )
     cols = st.columns(3)
     cols[0].metric("확인된 항목의 득점", f"{score['points']} / {score['possible']}")
     cols[1].metric("전체 배점 중 데이터 확보", f"{score['coverage']}%")
@@ -1076,6 +1344,61 @@ def render_analysis(bundle, code, display_name):
     st.caption("설명 가능한 규칙 점수입니다. 승률·상승 확률이 아닙니다. 미확인 항목에는 점수를 주지 않고 100점으로 환산하지도 않습니다.")
     if score["score"] is None:
         st.caption(f"미확인 항목까지 확보했을 때의 산술적 점수 범위: {score['points']}~{score['upper_bound']} / 100. 신뢰구간이나 전망 범위가 아닙니다.")
+
+    st.markdown("#### 🧠 종합 리서치 코멘트")
+    st.info(research["view"])
+
+    signal_boxes = st.columns(4)
+    signal_boxes[0].metric("추세", research["trend_label"])
+    signal_boxes[1].metric("수급", research["flow_label"])
+    signal_boxes[2].metric("모멘텀", research["momentum_label"])
+    signal_boxes[3].metric("뉴스 모멘텀", research["news_label"])
+
+    if research["dist20"] is not None or research["dist60"] is not None:
+        st.caption(
+            f"이평선 이격 · 20일선 {fmt(research['dist20'], '%', 1, True)} · "
+            f"60일선 {fmt(research['dist60'], '%', 1, True)}"
+        )
+
+    pos_col, risk_col = st.columns(2)
+    with pos_col:
+        st.markdown("**📈 긍정 요인**")
+        if research["positives"]:
+            for item in research["positives"]:
+                st.markdown(f"- {item}")
+        else:
+            st.caption("현재 확인 가능한 뚜렷한 긍정 요인이 제한적입니다.")
+    with risk_col:
+        st.markdown("**⚠️ 점수 제한·리스크 요인**")
+        if research["risks"]:
+            for item in research["risks"]:
+                st.markdown(f"- {item}")
+        else:
+            st.caption("현재 관측된 주요 리스크가 두드러지지 않습니다.")
+
+    with st.expander("📌 왜 이 점수인가? · 배점 근거 자세히 보기"):
+        left_reason, right_reason = st.columns(2)
+        with left_reason:
+            st.markdown("**점수에 기여한 핵심 항목**")
+            if research["contributors"]:
+                for item in research["contributors"]:
+                    st.markdown(f"- {item}")
+            else:
+                st.caption("가점 항목을 확인하지 못했습니다.")
+        with right_reason:
+            st.markdown("**점수를 제한하거나 등급을 보류한 항목**")
+            if research["limiters"]:
+                for item in research["limiters"]:
+                    st.markdown(f"- {item}")
+            else:
+                st.caption("0점 또는 미확인 항목이 없습니다.")
+
+        if research["headlines"]:
+            st.markdown("**최근 뉴스 헤드라인 참고**")
+            for title in research["headlines"]:
+                st.markdown(f"- {title}")
+            st.caption("헤드라인의 키워드 방향만 보조적으로 요약하며, 뉴스는 종합 점수에 반영하지 않습니다.")
+
     scenario = price_scenario(df)
     if scenario:
         with st.expander("ATR 기준 가격 시나리오"):
