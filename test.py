@@ -544,8 +544,14 @@ def fetch_history(code, days=800):
 
 
 def empty_fund():
-    return {"PER": None, "PBR": None, "DividendYield": None, "IndustryPER": None,
-            "Target": None, "ROE": None, "ROEPeriod": None, "Summary": None}
+    return {
+        "PER": None, "PBR": None, "DividendYield": None, "IndustryPER": None,
+        "Target": None, "ROE": None, "ROEPeriod": None, "Summary": None,
+        "ForwardPeriod": None, "ForwardOperatingProfitGrowth": None,
+        "ForwardOperatingProfitTurnaround": False,
+        "ForwardEPSGrowth": None, "ForwardEPSTurnaround": False,
+        "ForwardROE": None,
+    }
 
 
 def parse_main(body, code):
@@ -592,23 +598,57 @@ def parse_main(body, code):
         fund["Summary"] = "\n\n".join(x.get_text(" ", strip=True) for x in summary)
     table = soup.select_one(".cop_analysis table")
     if table:
-        # Derive annual span from headers, then explicitly exclude all (E) cells.
+        # Parse annual actual/estimate columns. Forward fields remain None when consensus is not published.
         annual = next((th for th in table.select("thead th") if "최근 연간 실적" in th.get_text(" ", strip=True)), None)
         count = int(annual.get("colspan", "0")) if annual else 0
         periods = [compact(th.get_text()) for th in table.select("thead th") if re.search(r"\d{4}\.\d{2}", th.get_text())]
-        for tr in table.select("tbody tr"):
-            th = tr.select_one("th")
-            if not th or "ROE" not in th.get_text():
-                continue
-            cells = tr.find_all("td", recursive=False)
-            if count <= 0 or len(periods) != len(cells):
-                break
-            for i in reversed(range(min(count, len(periods)))):
-                period, value = periods[i], numeric(cells[i].get_text())
-                if "(E)" not in period and value is not None:
-                    fund["ROE"], fund["ROEPeriod"] = value, period
-                    break
-            break
+        if count > 0 and periods:
+            annual_periods = periods[:count]
+            annual_rows = {}
+            for tr in table.select("tbody tr"):
+                th = tr.select_one("th")
+                cells = tr.find_all("td", recursive=False)
+                if not th or len(cells) < count:
+                    continue
+                annual_rows[compact(th.get_text())] = [numeric(cells[i].get_text()) for i in range(count)]
+
+            def row_values(prefix, exclude=None):
+                for label, values in annual_rows.items():
+                    if label.startswith(prefix) and (exclude is None or exclude not in label):
+                        return values
+                return None
+
+            roe_values = row_values("ROE")
+            if roe_values:
+                for i in reversed(range(min(count, len(annual_periods)))):
+                    value = roe_values[i]
+                    if "(E)" not in annual_periods[i] and value is not None:
+                        fund["ROE"], fund["ROEPeriod"] = value, annual_periods[i]
+                        break
+
+            forecast_idx = next((i for i, period in enumerate(annual_periods) if "(E)" in period), None)
+            if forecast_idx is not None:
+                fund["ForwardPeriod"] = annual_periods[forecast_idx]
+                actual_idx = next((i for i in range(forecast_idx - 1, -1, -1)
+                                   if "(E)" not in annual_periods[i]), None)
+                op_values = row_values("영업이익", exclude="률")
+                eps_values = row_values("EPS")
+                if op_values and actual_idx is not None:
+                    actual, estimate = op_values[actual_idx], op_values[forecast_idx]
+                    if estimate is not None:
+                        if actual is not None and actual > 0:
+                            fund["ForwardOperatingProfitGrowth"] = (estimate / actual - 1) * 100
+                        elif actual is not None and actual <= 0 < estimate:
+                            fund["ForwardOperatingProfitTurnaround"] = True
+                if eps_values and actual_idx is not None:
+                    actual, estimate = eps_values[actual_idx], eps_values[forecast_idx]
+                    if estimate is not None:
+                        if actual is not None and actual > 0:
+                            fund["ForwardEPSGrowth"] = (estimate / actual - 1) * 100
+                        elif actual is not None and actual <= 0 < estimate:
+                            fund["ForwardEPSTurnaround"] = True
+                if roe_values and forecast_idx < len(roe_values):
+                    fund["ForwardROE"] = roe_values[forecast_idx]
     return {"quote": quote, "fund": fund}
 
 
@@ -1767,6 +1807,642 @@ def render_original_workspace(market):
         render_analysis(bundle, code, st.session_state.selected_name)
 
 
+# ===== 5. 과대낙폭 유망주 탐지기 =====
+def oversold_technical_profile(frame):
+    """과대낙폭 + 초기 반등 신호만 평가합니다. 기술 예비점수 최대 55점."""
+    try:
+        completed = completed_history(frame)
+        if len(completed) < 260:
+            return None
+        df = add_running_indicators(completed)
+        df["HIGH252"] = df.High.rolling(252, min_periods=200).max()
+        df["HIGH120"] = df.High.rolling(120, min_periods=100).max()
+        df["DD52"] = (df.Close / df.HIGH252 - 1) * 100
+        df["DD120"] = (df.Close / df.HIGH120 - 1) * 100
+        df["DIST_MA60"] = (df.Close / df.MA60 - 1) * 100
+        df["RSI5_MIN"] = df.RSI.rolling(5, min_periods=3).min()
+        ready = df.dropna(subset=["MA120", "VOL_MA20", "HIGH252", "HIGH120", "RSI", "MACD", "MACD_SIGNAL"])
+        if len(ready) < 3:
+            return None
+        r, p = ready.iloc[-1], ready.iloc[-2]
+    except Exception:
+        return None
+
+    score = 0
+    detail = []
+
+    def add(cond, pts, label):
+        nonlocal score
+        ok = bool(cond)
+        if ok:
+            score += pts
+        detail.append({"영역": "낙폭·반등", "판정": "✅" if ok else "➖", "점수": pts if ok else 0,
+                       "조건": label, "근거": "충족" if ok else "미충족"})
+
+    # 낙폭·가격 위치 30점
+    add(r.DD52 <= -15, 8, "52주 고점 대비 -15% 이하")
+    add(r.DD52 <= -25, 7, "52주 고점 대비 -25% 이하")
+    add(r.DD120 <= -12, 5, "120일 고점 대비 -12% 이하")
+    add(28 <= r.RSI <= 45, 5, "RSI 28~45의 과매도 탐색 구간")
+    add(r.DIST_MA60 <= -5, 5, "60일선 대비 -5% 이하 이격")
+
+    # 반등 모멘텀 25점
+    add(r.RET5 > 0, 5, "최근 5거래일 수익률 플러스")
+    add(r.MACD_HIST > p.MACD_HIST, 5, "MACD 히스토그램 개선")
+    add(r.MACD > r.MACD_SIGNAL, 5, "MACD가 Signal 상회")
+    add((r.RSI - r.RSI5_MIN) >= 4, 5, "RSI가 최근 저점에서 4p 이상 반등")
+    add((r.Close > p.Close) and (r.VOL_RATIO >= 1.2), 5, "상승일 거래량 20일 평균 1.2배 이상")
+
+    penalties = []
+    if r.DD52 <= -55 and r.MA20_SLOPE < 0 and r.MA60_SLOPE < 0:
+        score -= 8
+        penalties.append("52주 -55% 이하 + 20·60일선 동반 하락 -8")
+    if r.RSI < 25 and r.RET5 < 0:
+        score -= 4
+        penalties.append("RSI 25 미만 + 단기 하락 지속 -4")
+
+    score = max(0, min(55, int(round(score))))
+    return {
+        "technical_score": score,
+        "row": r,
+        "df": ready,
+        "detail": detail,
+        "penalties": penalties,
+        "high52": float(r.HIGH252),
+        "dd52": float(r.DD52),
+        "dd120": float(r.DD120),
+    }
+
+
+def _fundamental_outlook_points(fund, close):
+    """실적·컨센서스 최대 30점. 미확인 데이터에는 점수를 부여하지 않습니다."""
+    points = 0
+    observed = 0
+    details = []
+
+    def add_known(known, pts, max_pts, label, evidence):
+        nonlocal points, observed
+        if known:
+            observed += max_pts
+            pts = int(pts)
+            points += pts
+            details.append({"영역": "실적·전망", "판정": "✅" if pts else "➖", "점수": pts,
+                            "조건": label, "근거": evidence})
+        else:
+            details.append({"영역": "실적·전망", "판정": "❔", "점수": 0,
+                            "조건": label, "근거": "데이터 미확인"})
+
+    target = number(fund.get("Target"))
+    upside = (target / close - 1) * 100 if target is not None and target > 0 and close > 0 else None
+    add_known(upside is not None, 8 if upside >= 20 else 4 if upside >= 10 else 0, 8,
+              "컨센서스 목표가 상승여력", f"종가 대비 {upside:+.1f}%" if upside is not None else "")
+
+    roe = number(fund.get("ROE"))
+    add_known(roe is not None, 5 if roe >= 10 else 2 if roe >= 5 else 0, 5,
+              "최근 확정 연간 ROE", f"{roe:.1f}%" if roe is not None else "")
+
+    op_growth = number(fund.get("ForwardOperatingProfitGrowth"))
+    op_turn = bool(fund.get("ForwardOperatingProfitTurnaround"))
+    op_known = op_growth is not None or op_turn
+    op_pts = 8 if op_turn or (op_growth is not None and op_growth >= 10) else 4 if op_growth is not None and op_growth >= 0 else 0
+    op_text = "비양수 → 흑자 추정" if op_turn else (f"{fund.get('ForwardPeriod') or ''} {op_growth:+.1f}%" if op_growth is not None else "")
+    add_known(op_known, op_pts, 8, "향후 연간 영업이익 컨센서스", op_text)
+
+    eps_growth = number(fund.get("ForwardEPSGrowth"))
+    eps_turn = bool(fund.get("ForwardEPSTurnaround"))
+    eps_known = eps_growth is not None or eps_turn
+    eps_pts = 5 if eps_turn or (eps_growth is not None and eps_growth >= 10) else 3 if eps_growth is not None and eps_growth >= 0 else 0
+    eps_text = "비양수 → 양수 추정" if eps_turn else (f"{fund.get('ForwardPeriod') or ''} {eps_growth:+.1f}%" if eps_growth is not None else "")
+    add_known(eps_known, eps_pts, 5, "향후 연간 EPS 컨센서스", eps_text)
+
+    per, industry = number(fund.get("PER")), number(fund.get("IndustryPER"))
+    comparable = per is not None and industry is not None and per > 0 and industry > 0
+    add_known(comparable, 4 if comparable and per <= industry else 0, 4,
+              "업종 대비 PER", f"PER {per:.1f}배 / 업종 {industry:.1f}배" if comparable else "")
+
+    return points, observed, details, upside
+
+
+def _combine_oversold_score(tech, fund=None, investors=None):
+    if tech is None:
+        return None
+    fund = fund or empty_fund()
+    r = tech["row"]
+    score = tech["technical_score"]
+    detail = list(tech["detail"])
+
+    f_points, f_observed, f_details, upside = _fundamental_outlook_points(fund, float(r.Close))
+    score += f_points
+    detail.extend(f_details)
+
+    supply = _horse_supply_metrics(investors, tech["df"])
+    supply_points = 0
+    supply_observed = 0
+
+    def supply_add(value, pts, label):
+        nonlocal supply_points, supply_observed
+        if value is None:
+            detail.append({"영역": "수급", "판정": "❔", "점수": 0, "조건": label, "근거": "데이터 미확인"})
+            return
+        supply_observed += pts
+        hit = value > 0
+        if hit:
+            supply_points += pts
+        detail.append({"영역": "수급", "판정": "✅" if hit else "➖", "점수": pts if hit else 0,
+                       "조건": label, "근거": _fmt_shares(value)})
+
+    supply_add(supply["foreign5"], 4, "최근 5거래일 외국인 순매수")
+    supply_add(supply["institution5"], 4, "최근 5거래일 기관 순매수")
+    supply_add(supply["foreign20"], 3, "최근 20거래일 외국인 순매수")
+    supply_add(supply["institution20"], 2, "최근 20거래일 기관 순매수")
+
+    frc = supply["foreign_rate_change10"]
+    if frc is None:
+        detail.append({"영역": "수급", "판정": "❔", "점수": 0, "조건": "10거래일 외국인 보유율 증가", "근거": "데이터 미확인"})
+    else:
+        supply_observed += 2
+        hit = frc > 0
+        if hit:
+            supply_points += 2
+        detail.append({"영역": "수급", "판정": "✅" if hit else "➖", "점수": 2 if hit else 0,
+                       "조건": "10거래일 외국인 보유율 증가", "근거": f"{frc:+.2f}%p"})
+
+    score += supply_points
+    score = max(0, min(100, int(round(score))))
+    coverage = 55 + f_observed + supply_observed
+    prev = tech["df"].iloc[-2]
+    rebound = bool(r.RET5 > 0 and r.MACD_HIST > prev.MACD_HIST)
+    outlook_ok = f_points >= 12
+    supply_ok = supply_points >= 6
+
+    if score >= 80 and tech["dd52"] <= -20 and rebound and outlook_ok:
+        status = "💎 최우선 관찰 — 낙폭 대비 실적·반등 신호 우수"
+    elif score >= 70 and outlook_ok:
+        status = "🟢 유망 낙폭과대 — 펀더멘털 대비 가격 메리트"
+    elif score >= 60:
+        status = "🟡 관심 — 반등 또는 실적 확증 추가 필요"
+    elif score >= 45:
+        status = "🟠 애매 — 하락 추세 리스크 잔존"
+    else:
+        status = "🔴 우선순위 낮음 — 낙폭보다 훼손 가능성 우세"
+
+    return {
+        **tech,
+        "score": score,
+        "status": status,
+        "detail": pd.DataFrame(detail),
+        "fund": fund,
+        "supply": supply,
+        "fund_points": f_points,
+        "supply_points": supply_points,
+        "coverage": coverage,
+        "target_upside": upside,
+        "rebound": rebound,
+        "outlook_ok": outlook_ok,
+        "supply_ok": supply_ok,
+    }
+
+
+def oversold_quality_score(frame, fund=None, investors=None):
+    return _combine_oversold_score(oversold_technical_profile(frame), fund, investors)
+
+
+def build_oversold_commentary(result):
+    """관측된 낙폭·컨센서스·수급만으로 만드는 리서치 데스크형 코멘트."""
+    r, fund, supply = result["row"], result["fund"], result["supply"]
+    positives, risks = [], []
+
+    dd = result["dd52"]
+    if -50 <= dd <= -15:
+        positives.append(f"52주 고점 대비 {dd:.1f}% 조정돼 과거 고점 대비 가격 부담이 상당 부분 완화된 구간입니다.")
+    elif dd < -50:
+        risks.append(f"52주 고점 대비 {dd:.1f}% 하락해 단순 가격 메리트보다 펀더멘털 훼손 여부를 우선 점검해야 하는 구간입니다.")
+    else:
+        risks.append(f"52주 고점 대비 낙폭이 {dd:.1f}%로 전형적인 과대낙폭 구간으로 보기에는 조정 폭이 제한적입니다.")
+
+    op_growth = number(fund.get("ForwardOperatingProfitGrowth"))
+    eps_growth = number(fund.get("ForwardEPSGrowth"))
+    if fund.get("ForwardOperatingProfitTurnaround"):
+        positives.append("연간 영업이익 컨센서스가 비양수 구간에서 흑자로 전환되는 추정 구조여서 실적 턴어라운드 모멘텀을 기대할 여지가 있습니다.")
+    elif op_growth is not None and op_growth >= 10:
+        positives.append(f"향후 연간 영업이익 컨센서스가 직전 확정치 대비 {op_growth:+.1f}% 개선되는 구조로 주가 낙폭과 실적 방향의 괴리가 존재합니다.")
+    elif op_growth is not None and op_growth < 0:
+        risks.append(f"향후 연간 영업이익 컨센서스가 {op_growth:+.1f}%로 감소 추정돼 낙폭만으로 저평가를 단정하기 어렵습니다.")
+
+    if fund.get("ForwardEPSTurnaround"):
+        positives.append("EPS 컨센서스도 양수 전환이 추정돼 이익 정상화 신호가 동반되고 있습니다.")
+    elif eps_growth is not None and eps_growth >= 10:
+        positives.append(f"향후 EPS 컨센서스가 {eps_growth:+.1f}% 개선 추정돼 이익 모멘텀은 우호적인 편입니다.")
+    elif eps_growth is not None and eps_growth < 0:
+        risks.append(f"향후 EPS 컨센서스가 {eps_growth:+.1f}%로 둔화돼 밸류에이션 리레이팅의 동력은 제한적일 수 있습니다.")
+
+    upside = result.get("target_upside")
+    if upside is not None and upside >= 20:
+        positives.append(f"컨센서스 목표주가와 확정 종가의 괴리율이 {upside:+.1f}%로 시장 기대치 대비 가격 여력이 비교적 크게 남아 있습니다.")
+    elif upside is not None and upside < 5:
+        risks.append(f"컨센서스 목표주가 상승여력이 {upside:+.1f}%에 그쳐 가격 메리트에 대한 증권가 기대는 제한적입니다.")
+
+    prev = result["df"].iloc[-2]
+    if r.RET5 > 0 and r.MACD_HIST > prev.MACD_HIST:
+        positives.append("최근 5거래일 수익률이 플러스로 전환되고 MACD 히스토그램도 개선돼 낙폭 이후 단기 모멘텀 회복 조짐이 확인됩니다.")
+    elif r.MA20_SLOPE < 0 and r.MA60_SLOPE < 0:
+        risks.append("20·60일 이동평균선의 기울기가 모두 하락 중이어서 가격은 싸졌지만 추세 전환의 기술적 확증은 아직 부족합니다.")
+    else:
+        risks.append("반등 신호가 일부 관찰되지만 이동평균선과 모멘텀 지표가 동시에 추세 전환을 확인한 단계는 아닙니다.")
+
+    f5, i5 = supply.get("foreign5"), supply.get("institution5")
+    if f5 is not None and i5 is not None:
+        if f5 > 0 and i5 > 0:
+            positives.append(f"최근 5거래일 외국인({_fmt_shares(f5)})·기관({_fmt_shares(i5)}) 동반 순매수가 확인돼 저가 매수 수급이 유입되고 있습니다.")
+        elif f5 <= 0 and i5 <= 0:
+            risks.append("최근 5거래일 외국인과 기관이 모두 순매도여서 가격 하락을 흡수하는 주도 수급은 아직 확인되지 않습니다.")
+        else:
+            risks.append("외국인과 기관의 수급 방향이 엇갈려 저점 매수의 주체가 명확하게 형성됐다고 보기 어렵습니다.")
+    else:
+        risks.append("기관·외국인 수급 데이터가 충분하지 않아 저가 매수 주체의 유입 여부는 별도 확인이 필요합니다.")
+
+    if result["score"] >= 80 and result["outlook_ok"] and result["rebound"]:
+        view = "가격 낙폭은 충분한 반면 이익 전망과 단기 반등 신호가 함께 개선되는 유형입니다. 다만 과대낙폭주는 추세 전환 전 재차 저점을 시험할 수 있어 20일선 회복 또는 저점 상향 확인 후 접근하는 전략이 합리적입니다."
+    elif result["score"] >= 70:
+        view = "가격 메리트와 실적 전망 중 상당 부분이 우호적입니다. 낙폭 자체보다 거래량을 동반한 20일선 회복과 외국인·기관 수급 개선을 함께 확인할 필요가 있습니다."
+    elif result["score"] >= 55:
+        view = "과대낙폭 후보로는 분류되지만 실적·수급·기술적 반등 중 한 축 이상이 아직 부족합니다. 현재는 선취매보다 펀더멘털 훼손이 멈췄는지 확인하는 관찰 구간에 가깝습니다."
+    else:
+        view = "현재 낙폭은 크지만 가격 하락을 정당화한 요인이 해소됐다는 증거가 부족합니다. 실적 추정치 개선과 추세 반전이 확인될 때까지 우선순위를 낮게 두는 편이 적절합니다."
+
+    return {"view": view, "positives": positives[:5], "risks": risks[:5]}
+
+
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def cached_oversold_technical(code):
+    result = fetch_history(code)
+    if result.status == "error" or result.data is None or result.data.empty:
+        return None
+    return oversold_technical_profile(result.data)
+
+
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def cached_oversold_fund(code):
+    result = fetch_main(code)
+    if result.status == "error":
+        return empty_fund()
+    return result.data.get("fund", empty_fund())
+
+
+@st.cache_data(ttl=900, max_entries=256, show_spinner=False)
+def cached_oversold_score(code):
+    history = fetch_history(code)
+    if history.status == "error" or history.data is None or history.data.empty:
+        return None
+    fund = cached_oversold_fund(code)
+    investors = cached_horse_investors(code)
+    return oversold_quality_score(history.data, fund, investors)
+
+
+def render_oversold_chart(result, name):
+    df = result["df"].tail(180)
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                        row_heights=[0.52, 0.16, 0.16, 0.16])
+    fig.add_trace(go.Candlestick(x=df.index, open=df.Open, high=df.High, low=df.Low,
+                                 close=df.Close, name="Price"), row=1, col=1)
+    for ma in [20, 60, 120]:
+        fig.add_trace(go.Scatter(x=df.index, y=df[f"MA{ma}"], mode="lines", name=f"MA{ma}"), row=1, col=1)
+    fig.add_hline(y=result["high52"], line_dash="dot", annotation_text="52주 고점", row=1, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df.Volume, name="Volume"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df.VOL_MA20, mode="lines", name="Vol MA20"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df.RSI, mode="lines", name="RSI14"), row=3, col=1)
+    for level in [70, 50, 30]:
+        fig.add_hline(y=level, line_dash="dot", row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df.MACD, mode="lines", name="MACD"), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df.MACD_SIGNAL, mode="lines", name="Signal"), row=4, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df.MACD_HIST, name="Histogram"), row=4, col=1)
+    fig.update_layout(template="plotly_dark", title=f"{name} — 과대낙폭·반등 분석", height=900,
+                      xaxis_rangeslider_visible=False, legend={"orientation": "h"},
+                      margin={"l": 10, "r": 10, "t": 55, "b": 10},
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _oversold_prefilter_kospi(stocks, deep_count=80):
+    """시총·유동성 중심 1차 압축. 실제 낙폭은 일봉 조회 후 계산합니다."""
+    if stocks is None or stocks.empty:
+        return stocks
+    df = stocks.copy()
+    for col in ["Close", "Chg", "Volume", "Marcap"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Close", "Chg", "Volume", "Marcap"])
+    df = df[(df.Close > 0) & (df.Volume > 0) & (df.Marcap > 0)].copy()
+    if df.empty:
+        return df
+    df["AmountEstimate"] = df.Close * df.Volume
+    turn_rank = df.AmountEstimate.rank(pct=True)
+    cap_rank = df.Marcap.rank(pct=True)
+    liquid = df[(turn_rank >= 0.35) | (cap_rank >= 0.70)].copy()
+    liquid["PreScore"] = (
+        45 * liquid.Marcap.rank(pct=True)
+        + 40 * liquid.AmountEstimate.rank(pct=True)
+        + 15 * ((-liquid.Chg).clip(lower=-5, upper=10) + 5) / 15
+    )
+    parts = [
+        liquid.sort_values("PreScore", ascending=False).head(deep_count),
+        liquid.sort_values("Marcap", ascending=False).head(max(30, deep_count // 2)),
+        liquid.sort_values("AmountEstimate", ascending=False).head(max(30, deep_count // 2)),
+        liquid.sort_values("Chg", ascending=True).head(max(20, deep_count // 3)),
+    ]
+    merged = pd.concat(parts, ignore_index=True).drop_duplicates("Code")
+    return merged.sort_values("PreScore", ascending=False).head(deep_count)
+
+
+def _deep_scan_oversold_candidates(candidates, workers=6):
+    if candidates is None or candidates.empty:
+        return []
+    records = candidates.to_dict("records")
+
+    def analyze(rec):
+        code = str(rec["Code"])
+        tech = cached_oversold_technical(code)
+        if tech is None:
+            return None
+        r = tech["row"]
+        return {
+            "종목명": rec.get("Name", code), "코드": code,
+            "기술예비점수": tech["technical_score"], "종가": round(float(r.Close)),
+            "52주고점대비(%)": round(float(tech["dd52"]), 2),
+            "120일고점대비(%)": round(float(tech["dd120"]), 2),
+            "5일수익률(%)": round(float(r.RET5), 2), "20일수익률(%)": round(float(r.RET20), 2),
+            "RSI": round(float(r.RSI), 1), "거래량배수": round(float(r.VOL_RATIO), 2),
+            "_tech": tech,
+        }
+
+    rows = []
+    with ThreadPoolExecutor(max_workers=max(2, min(int(workers), 8))) as pool:
+        futures = [pool.submit(analyze, rec) for rec in records]
+        for future in futures:
+            try:
+                item = future.result()
+                if item is not None:
+                    rows.append(item)
+            except Exception:
+                pass
+    return rows
+
+
+def _finalize_oversold_candidates(raw, final_pool=35, workers=6):
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    shortlist = raw.sort_values(["기술예비점수", "52주고점대비(%)"], ascending=[False, True]).head(final_pool).copy()
+    records = shortlist.to_dict("records")
+
+    def enrich(rec):
+        code = str(rec["코드"])
+        tech = rec["_tech"]
+        fund = cached_oversold_fund(code)
+        inv = cached_horse_investors(code)
+        result = _combine_oversold_score(tech, fund, inv)
+        if result is None:
+            return None
+        commentary = build_oversold_commentary(result)
+        f5, i5 = result["supply"]["foreign5"], result["supply"]["institution5"]
+        if f5 is not None and i5 is not None:
+            flow = "외인·기관 동반매수" if f5 > 0 and i5 > 0 else "외국인 우위" if f5 > 0 else "기관 우위" if i5 > 0 else "동반매도"
+        else:
+            flow = "수급 미확인"
+        op_growth = number(fund.get("ForwardOperatingProfitGrowth"))
+        eps_growth = number(fund.get("ForwardEPSGrowth"))
+        op_text = "흑자전환" if fund.get("ForwardOperatingProfitTurnaround") else (f"{op_growth:+.1f}%" if op_growth is not None else "미확인")
+        eps_text = "양수전환" if fund.get("ForwardEPSTurnaround") else (f"{eps_growth:+.1f}%" if eps_growth is not None else "미확인")
+        return {
+            "종목명": rec["종목명"], "코드": code, "점수": result["score"], "상태": result["status"],
+            "종가": rec["종가"], "52주고점대비(%)": rec["52주고점대비(%)"], "RSI": rec["RSI"],
+            "5일수익률(%)": rec["5일수익률(%)"], "거래량배수": rec["거래량배수"],
+            "목표가상승여력(%)": round(result["target_upside"], 1) if result["target_upside"] is not None else np.nan,
+            "영업이익전망": op_text, "EPS전망": eps_text,
+            "수급": flow, "데이터확보(%)": result["coverage"], "전략 코멘트": commentary["view"],
+            "_result": result,
+        }
+
+    out = []
+    with ThreadPoolExecutor(max_workers=max(2, min(int(workers), 8))) as pool:
+        futures = [pool.submit(enrich, rec) for rec in records]
+        for future in futures:
+            try:
+                item = future.result()
+                if item is not None:
+                    out.append(item)
+            except Exception:
+                pass
+    if not out:
+        return pd.DataFrame()
+    return pd.DataFrame(out).sort_values(["점수", "52주고점대비(%)"], ascending=[False, True]).head(20).reset_index(drop=True)
+
+
+def _render_oversold_leaderboard(out):
+    if out is None or out.empty:
+        return
+    st.markdown("#### 💎 과대낙폭 유망주 TOP")
+    st.caption("낙폭·반등 모멘텀·실적 컨센서스·외국인/기관 수급을 합산한 후보 순위입니다.")
+    top = out.head(5).reset_index(drop=True)
+    cols = st.columns(len(top))
+    for i, row in top.iterrows():
+        rank = i + 1
+        with cols[i]:
+            target_txt = "미확인" if pd.isna(row["목표가상승여력(%)"]) else f"{row['목표가상승여력(%)']:+.0f}%"
+            html = (
+                f'<div class="horse-rank-card horse-rank-{rank}">'
+                f'<div class="horse-rank-badge">{_horse_rank_badge(rank)}</div>'
+                f'<div class="horse-rank-name">{escape(str(row["종목명"]))}</div>'
+                f'<div class="horse-rank-score">{int(row["점수"])}<span>/100</span></div>'
+                f'<div class="horse-rank-meta">52주 {row["52주고점대비(%)"]:+.1f}% · RSI {row["RSI"]:.1f}</div>'
+                f'<div class="horse-rank-meta">목표가 여력 {target_txt}</div>'
+                '</div>'
+            )
+            st.markdown(html, unsafe_allow_html=True)
+    st.markdown("##### 📋 전체 순위")
+    display = out.drop(columns=["_result"], errors="ignore").copy().reset_index(drop=True)
+    display.insert(0, "순위", np.arange(1, len(display) + 1))
+    st.dataframe(
+        display, hide_index=True, use_container_width=True,
+        column_config={
+            "순위": st.column_config.NumberColumn("순위", width="small", format="%d위"),
+            "점수": st.column_config.ProgressColumn("과대낙폭 유망 점수", min_value=0, max_value=100, format="%d점"),
+            "상태": st.column_config.TextColumn("판정", width="large"),
+            "전략 코멘트": st.column_config.TextColumn("리서치 코멘트", width="large"),
+        },
+    )
+
+
+def render_oversold_hunter(market_result):
+    st.markdown("### 💎 과대낙폭 유망주 탐지기")
+    st.caption("많이 빠졌다는 이유만으로 고르지 않습니다. 52주 낙폭 + 반등 모멘텀 + 실적/컨센서스 + 외국인·기관 수급을 함께 평가합니다.")
+    single, scanner, rules = st.tabs(["🔎 단일 종목", "💎 시장 스캐너", "📖 점수 기준"])
+
+    with single:
+        default_query = st.session_state.get("selected_name") or st.session_state.get("selected_code") or "삼성전자"
+        c1, c2 = st.columns([4, 1])
+        query = c1.text_input("종목명 또는 종목코드", value=default_query, key="oversold_query",
+                              placeholder="예: 삼성전자 또는 005930")
+        run = c2.button("탐지", key="oversold_run", use_container_width=True, type="primary")
+        if run:
+            matches = _resolve_horse_query(query, market_result)
+            st.session_state.oversold_matches = matches
+            if len(matches) == 1:
+                st.session_state.oversold_selected_code = matches[0]["Code"]
+                st.session_state.oversold_selected_name = matches[0]["Name"]
+            elif not matches:
+                st.session_state.oversold_selected_code = ""
+                st.session_state.oversold_selected_name = ""
+
+        matches = st.session_state.get("oversold_matches", [])
+        if run and not matches:
+            st.warning("종목을 찾지 못했습니다. 정확한 종목명 또는 6자리 종목코드를 입력해 주십시오.")
+        if len(matches) > 1:
+            st.caption("검색 결과가 여러 개입니다. 분석할 종목을 선택해 주십시오.")
+            labels = [f"{x['Name']} ({x['Code']})" for x in matches]
+            chosen = st.selectbox("검색 결과", labels, key="oversold_match_select", label_visibility="collapsed")
+            if st.button("선택 종목 분석", key="oversold_match_run", use_container_width=True):
+                idx = labels.index(chosen)
+                st.session_state.oversold_selected_code = matches[idx]["Code"]
+                st.session_state.oversold_selected_name = matches[idx]["Name"]
+
+        code = st.session_state.get("oversold_selected_code", "")
+        name = st.session_state.get("oversold_selected_name", code)
+        if code:
+            with st.spinner(f"{name}의 낙폭·실적·수급을 분석하고 있습니다…"):
+                result = cached_oversold_score(code)
+            if result is None:
+                st.warning("분석 가능한 데이터가 부족하거나 조회에 실패했습니다.")
+            else:
+                r, fund = result["row"], result["fund"]
+                st.markdown(f"#### {escape(str(name))} ({code})")
+                boxes = st.columns(6)
+                boxes[0].metric("유망 낙폭 점수", f"{result['score']} / 100")
+                boxes[1].metric("종가", f"{r.Close:,.0f}원")
+                boxes[2].metric("52주 고점 대비", f"{result['dd52']:+.1f}%")
+                boxes[3].metric("RSI", f"{r.RSI:.1f}")
+                boxes[4].metric("목표가 여력", fmt(result["target_upside"], "%", 1, True))
+                boxes[5].metric("데이터 확보", f"{result['coverage']}%")
+                st.subheader(result["status"])
+
+                op = number(fund.get("ForwardOperatingProfitGrowth"))
+                eps = number(fund.get("ForwardEPSGrowth"))
+                op_text = "흑자전환 추정" if fund.get("ForwardOperatingProfitTurnaround") else (f"{op:+.1f}%" if op is not None else "미확인")
+                eps_text = "양수전환 추정" if fund.get("ForwardEPSTurnaround") else (f"{eps:+.1f}%" if eps is not None else "미확인")
+                st.caption(f"향후 연간 영업이익 {op_text} · EPS {eps_text} · 추정 기준 {fund.get('ForwardPeriod') or '미확인'}")
+
+                commentary = build_oversold_commentary(result)
+                st.markdown("##### 🏦 리서치 데스크 코멘트")
+                st.info(commentary["view"])
+                cpos, crisk = st.columns(2)
+                with cpos:
+                    st.markdown("**투자 포인트**")
+                    if commentary["positives"]:
+                        for item in commentary["positives"]:
+                            st.markdown(f"- {item}")
+                    else:
+                        st.caption("현재 확인 가능한 강한 투자 포인트가 제한적입니다.")
+                with crisk:
+                    st.markdown("**리스크 체크**")
+                    if commentary["risks"]:
+                        for item in commentary["risks"]:
+                            st.markdown(f"- {item}")
+                    else:
+                        st.caption("주요 위험 신호가 두드러지지 않습니다.")
+
+                render_oversold_chart(result, name)
+                st.dataframe(result["detail"], hide_index=True, use_container_width=True)
+                if result["penalties"]:
+                    st.warning(" / ".join(result["penalties"]))
+
+    with scanner:
+        st.markdown("#### 🇰🇷 KOSPI 자동 과대낙폭 유망주 TOP 20")
+        st.caption("KOSPI를 1차 경량 압축한 뒤 일봉 낙폭/반등을 분석하고, 상위 후보에만 실적 컨센서스와 외국인·기관 수급을 붙여 부하를 줄입니다.")
+        c1, c2, c3 = st.columns(3)
+        deep_count = c1.slider("일봉 정밀 후보 수", 50, 120, 80, 10, key="oversold_deep_count",
+                               help="클수록 시장 커버리지는 넓어지지만 일봉 조회 시간이 증가합니다.")
+        final_pool = c2.slider("실적·수급 정밀 후보", 20, 50, 35, 5, key="oversold_final_pool",
+                               help="이 단계에서 컨센서스와 외국인·기관 데이터를 추가 조회합니다.")
+        pages = c3.slider("KOSPI 시장 페이지", 10, 25, 20, 5, key="oversold_kospi_pages")
+
+        if st.button("💎 KOSPI 과대낙폭 TOP 20 자동 분석", type="primary", key="oversold_auto_top20", use_container_width=True):
+            with st.spinner("1단계: KOSPI 후보군을 수집하고 있습니다…"):
+                universe = cached_horse_kospi_universe(pages)
+            if universe.data.empty:
+                st.warning("KOSPI 후보군을 확보하지 못했습니다.")
+            else:
+                candidates = _oversold_prefilter_kospi(universe.data, deep_count)
+                progress = st.progress(10)
+                st.caption(f"1차 수집 {len(universe.data)}종목 → 일봉 정밀 후보 {len(candidates)}종목")
+                with st.spinner(f"2단계: {len(candidates)}종목의 52주 낙폭과 반등 모멘텀을 분석하고 있습니다…"):
+                    rows = _deep_scan_oversold_candidates(candidates, workers=6)
+                progress.progress(65)
+                if not rows:
+                    progress.empty()
+                    st.warning("일봉 정밀 분석 결과를 확보하지 못했습니다.")
+                else:
+                    raw = pd.DataFrame(rows)
+                    with st.spinner(f"3단계: 상위 {min(final_pool, len(raw))}개 후보의 실적 컨센서스와 수급을 분석하고 있습니다…"):
+                        top20 = _finalize_oversold_candidates(raw, final_pool=final_pool, workers=6)
+                    progress.progress(100)
+                    progress.empty()
+                    st.session_state.oversold_auto_raw = raw
+                    st.session_state.oversold_auto_top20 = top20
+                    st.session_state.oversold_auto_meta = {
+                        "universe": len(universe.data), "deep": len(candidates),
+                        "final_pool": min(final_pool, len(raw)), "pages": pages,
+                    }
+
+        top20 = st.session_state.get("oversold_auto_top20")
+        meta = st.session_state.get("oversold_auto_meta") or {}
+        if isinstance(top20, pd.DataFrame) and not top20.empty:
+            st.success(
+                f"KOSPI {meta.get('universe', 0)}종목 1차 탐색 → {meta.get('deep', 0)}종목 일봉 분석 → "
+                f"{meta.get('final_pool', 0)}종목 실적·수급 분석 → TOP {len(top20)}"
+            )
+            _render_oversold_leaderboard(top20)
+            st.markdown("##### 🏦 TOP 20 리서치 요약")
+            for idx, row in top20.reset_index(drop=True).iterrows():
+                rank = idx + 1
+                with st.expander(
+                    f"{_horse_rank_badge(rank)} {rank}위 · {row['종목명']} ({row['코드']}) · "
+                    f"{int(row['점수'])}점 · 52주 {row['52주고점대비(%)']:+.1f}% · {row['수급']}"
+                ):
+                    result = row["_result"]
+                    commentary = build_oversold_commentary(result)
+                    st.info(commentary["view"])
+                    cpos, crisk = st.columns(2)
+                    with cpos:
+                        st.markdown("**투자 포인트**")
+                        for item in commentary["positives"]:
+                            st.markdown(f"- {item}")
+                    with crisk:
+                        st.markdown("**리스크 요인**")
+                        for item in commentary["risks"]:
+                            st.markdown(f"- {item}")
+                    fund = result["fund"]
+                    st.caption(
+                        f"목표가 여력 {fmt(result['target_upside'], '%', 1, True)} · "
+                        f"최근 확정 ROE {fmt(fund.get('ROE'), '%', 1)} · 데이터 확보 {result['coverage']}%"
+                    )
+
+            export = top20.drop(columns=["_result"], errors="ignore").copy()
+            st.download_button(
+                "KOSPI 과대낙폭 유망주 TOP20 CSV",
+                export.to_csv(index=False).encode("utf-8-sig"),
+                file_name="oversold_quality_KOSPI_TOP20.csv", mime="text/csv", use_container_width=True,
+            )
+            st.caption("※ 점수는 미래 수익률 예측값이 아닙니다. 실적 추정치 하향이 지속되는 종목은 낙폭이 커도 가치함정이 될 수 있어 추정치·반등·수급을 함께 평가합니다.")
+
+    with rules:
+        st.markdown("""
+**낙폭·가격 위치 30점** — 52주/120일 고점 대비 하락폭, RSI 28~45, 60일선 하방 이격  
+**반등 모멘텀 25점** — 5일 수익률, MACD 개선/Signal 상회, RSI 저점 반등, 상승일 거래량 증가  
+**실적·전망 30점** — 컨센서스 목표가 여력, 확정 ROE, 향후 영업이익/EPS 추정 개선, 업종 대비 PER  
+**수급 15점** — 외국인·기관 5/20거래일 순매수, 외국인 보유율 증가  
+**가치함정 패널티** — 52주 -55% 이하이면서 20·60일선이 동반 하락하거나 RSI 25 미만에서 단기 하락이 지속되는 경우 감점
+
+점수가 높더라도 '많이 빠졌으니 오른다'는 의미가 아닙니다. **실적 추정치 방향 + 저점 상향 + 거래량을 동반한 20일선 회복**을 최종 확인 신호로 보십시오.
+""")
+
 def main():
     st.set_page_config(page_title="부리부리 종합 주식 작전실", page_icon="🐽", layout="wide")
     st.markdown("""<style>
@@ -1786,21 +2462,25 @@ def main():
     .horse-rank-score span { font-size:12px; color:#7f8b9b; margin-left:2px; }
     .horse-rank-meta { font-size:12px; color:#9aa6b6; margin-top:3px; }
     </style>""", unsafe_allow_html=True)
-    st.markdown('<div class="hero"><div class="hero-title">🐽 부리부리 종합 주식 작전실</div><div class="hero-subtitle">종목 분석 · 수급 · 재무 · 백테스트 · 🐎 달리는 말 탐지</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="hero"><div class="hero-title">🐽 부리부리 종합 주식 작전실</div><div class="hero-subtitle">종목 분석 · 수급 · 재무 · 백테스트 · 🐎 달리는 말 · 💎 과대낙폭 유망주</div></div>', unsafe_allow_html=True)
     for key, value in {"query": "", "selected_code": "", "selected_name": "", "needs_search": False,
                        "candidates": [], "search_message": "", "horse_matches": [],
                        "horse_selected_code": "", "horse_selected_name": "",
                        "horse_scan_raw": None, "horse_scan_out": None, "horse_scan_meta": None,
-                       "horse_auto_raw": None, "horse_auto_top20": None, "horse_auto_meta": None}.items():
+                       "horse_auto_raw": None, "horse_auto_top20": None, "horse_auto_meta": None,
+                       "oversold_matches": [], "oversold_selected_code": "", "oversold_selected_name": "",
+                       "oversold_auto_raw": None, "oversold_auto_top20": None, "oversold_auto_meta": None}.items():
         if key not in st.session_state:
             st.session_state[key] = value
     with st.spinner("시장 표본을 조회하고 있습니다…"):
         market = cached_market()
-    main_tab, horse_tab = st.tabs(["🐽 종합 작전실", "🐎 달리는 말 탐지기"])
+    main_tab, horse_tab, oversold_tab = st.tabs(["🐽 종합 작전실", "🐎 달리는 말 탐지기", "💎 과대낙폭 유망주"])
     with main_tab:
         render_original_workspace(market)
     with horse_tab:
         render_running_horse(market)
+    with oversold_tab:
+        render_oversold_hunter(market)
 
 
 if __name__ == "__main__":
