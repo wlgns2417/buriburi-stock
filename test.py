@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""개미 투자전략실 — 데이터 기반 주식 분석 플랫폼
+"""퀀트 투자전략실 — 데이터 기반 주식 분석 플랫폼
 
 GitHub에 있는 기존 실행 .py 파일의 내용을 이 파일 전체로 교체하십시오.
 기존 파일명과 실행 설정은 유지하실 수 있습니다.
@@ -14,11 +14,11 @@ core.py, providers.py, fdr_worker.py, 테마 설정 파일을 별도로 올릴 �
     https://github.com/FinanceData/FinanceDataReader
     https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs
 미국 탐지기 순위는 사용자가 입력한 최대 30개 종목의 표본 순위입니다.
-미국 재무/수급을 제외한 종합점수는 미확인 배점을 환산하지 않습니다.
+공통 기술 점수와 한국 수급 점수는 별도이며 합산하지 않습니다. 탐지기와 시장 랭킹은 목적과 배점이 다른 별도 모델입니다.
 
 데이터 수집 실패는 미확인으로 표시하며 임의 가격으로 대체하지 않습니다.
 공매도 자동 수집은 미제공이며 선택적 CSV 입력을 사용합니다.
-v5.4: 독립 종목 디렉터리, 한국 KRX 백업, 미국 NASDAQ/NYSE 분석 및 표본 탐지기.
+v5.5: 한국·미국 공통 기술 점수 100점, 한국 수급 독립 평가, 조건부 리서치 코멘트.
 미국 재무/수급 미제공 항목은 미확인 처리합니다. 외부 공급원 접근은 배포 환경에 따라 실패할 수 있습니다.
 """
 from __future__ import annotations
@@ -667,7 +667,7 @@ def parse_investors(body):
         if not all(key in labels for key in ["날짜", "종가", "기관", "외국인", "보유율"]):
             continue
         # Two-level header: 5 common fields + institution net + foreign net/held/rate.
-        if not all(key in labels for key in ["전일비", "등락률", "거래량", "순매매량", "보유주수"]):
+        if not all(key in labels for key in ["전일비", "등락률", "거래량", "보유주수"]):
             continue
         for tr in table.select("tr"):
             cells = tr.find_all("td", recursive=False)
@@ -679,6 +679,8 @@ def parse_investors(body):
             close, institution, foreign, rate = [numeric(values[i]) for i in [1, 5, 6, 8]]
             if close is None or close <= 0:
                 continue
+            if rate is not None and not 0 <= rate <= 100:
+                rate = None
             rows.append({"Date": pd.Timestamp(values[0].replace(".", "-")), "Close": close,
                          "InstitutionNet": institution, "ForeignNet": foreign, "ForeignRate": rate,
                          "InstitutionAmountEstimate": institution * close / 1e8 if institution is not None else None,
@@ -986,6 +988,10 @@ def render_chart(df):
 
 
 def render_supply(df, investors):
+    flow = assess_investor_flow(investors, df)
+    st.write(flow['text'])
+    if pd.notna(flow['asof']):
+        st.caption(f"수급 최근 자료 {flow['asof']:%Y-%m-%d} · 분석 일봉 {df.index[-1]:%Y-%m-%d}")
     columns = st.columns(4)
     for box, sessions, field, title in [
         (columns[0], 5, "ForeignAmountEstimate", "5거래일 외국인 추정"),
@@ -1105,231 +1111,6 @@ def _news_momentum_summary(news_result):
     return {"label": label, "text": text, "headlines": headlines[:3]}
 
 
-def build_general_research_commentary(df, investors, fund, score, news_result=None, short=None, stale=False):
-    """종합 분석 화면용 리서치형 자동 코멘트.
-
-    관측된 가격·기술지표·수급·재무·헤드라인만 사용하며 뉴스는 점수에 반영하지 않는다.
-    """
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    positives, risks = [], []
-
-    close = number(latest.Close)
-    ma5, ma20, ma60 = [number(latest.get(k)) for k in ["MA5", "MA20", "MA60"]]
-    dist20 = (close / ma20 - 1) * 100 if close and ma20 else None
-    dist60 = (close / ma60 - 1) * 100 if close and ma60 else None
-
-    # 추세 / 이격
-    if ma5 and ma20 and ma60:
-        if ma5 > ma20 > ma60 and close > ma20:
-            trend_label = "상승 추세"
-            positives.append(
-                f"5일·20일·60일 이동평균선이 정배열이며 종가가 20일선 위에 있어 단·중기 추세 구조가 우호적입니다. "
-                f"20일선 이격은 {dist20:+.1f}%, 60일선 이격은 {dist60:+.1f}%입니다."
-            )
-        elif close > ma20:
-            trend_label = "단기 우위"
-            positives.append(
-                f"종가가 20일선을 {dist20:+.1f}% 상회해 단기 가격 모멘텀은 유지되고 있습니다."
-            )
-            risks.append("이동평균선 완전 정배열이 확인되지 않아 중기 추세의 확증은 아직 제한적입니다.")
-        elif close > ma60:
-            trend_label = "중립"
-            risks.append(
-                f"종가가 20일선을 {dist20:+.1f}% 하회해 단기 추세가 약화됐지만 60일선 대비 {dist60:+.1f}% 수준으로 중기 지지 여부를 확인할 구간입니다."
-            )
-        else:
-            trend_label = "추세 약세"
-            risks.append(
-                f"종가가 20일선 {dist20:+.1f}%, 60일선 {dist60:+.1f}% 위치로 주요 이동평균선을 하회해 추세 복원이 확인되지 않았습니다."
-            )
-    else:
-        trend_label = "미확인"
-        risks.append("이동평균 데이터가 부족해 추세 구조와 이격도를 충분히 평가하지 못했습니다.")
-
-    bb = number(latest.get("BB_pct"))
-    if bb is not None:
-        if bb > 1.05:
-            risks.append(f"볼린저 %b가 {bb:.2f}로 상단 밴드를 넘어 단기 과열 및 되돌림 리스크가 확대된 구간입니다.")
-        elif 0.75 <= bb <= 1.05:
-            positives.append(f"볼린저 %b {bb:.2f}로 상단부를 유지해 추세 탄력은 양호한 편입니다.")
-        elif bb < 0.25:
-            risks.append(f"볼린저 %b {bb:.2f}로 하단부에 위치해 가격 압력이 아직 우세합니다.")
-
-    # 모멘텀
-    rsi = number(latest.get("RSI"))
-    macd_hist = number(latest.get("MACD_HIST"))
-    prev_hist = number(prev.get("MACD_HIST"))
-    mfi = number(latest.get("MFI"))
-    obv = number(latest.get("OBV"))
-    obv_avg = number(df.OBV.tail(20).mean()) if "OBV" in df else None
-
-    momentum_parts = []
-    if rsi is not None:
-        if 45 <= rsi <= 65:
-            momentum_parts.append(f"RSI {rsi:.1f}로 과열 없이 추세를 이어가기 좋은 중립~강세 구간")
-            positives.append(f"RSI가 {rsi:.1f}로 극단적 과열 없이 모멘텀이 유지되는 구간입니다.")
-        elif rsi > 70:
-            momentum_parts.append(f"RSI {rsi:.1f} 과열권")
-            risks.append(f"RSI가 {rsi:.1f}로 과열권에 진입해 신규 추격 관점의 손익비가 불리해질 수 있습니다.")
-        elif rsi < 30:
-            momentum_parts.append(f"RSI {rsi:.1f} 과매도권")
-            risks.append(f"RSI가 {rsi:.1f}로 과매도권이나, 과매도 자체는 추세 반전을 의미하지 않으므로 반등 확인이 필요합니다.")
-        else:
-            momentum_parts.append(f"RSI {rsi:.1f}")
-
-    if macd_hist is not None and prev_hist is not None:
-        if macd_hist > 0 and macd_hist >= prev_hist:
-            momentum_parts.append("MACD 양(+)의 모멘텀 확대")
-            positives.append("MACD 히스토그램이 0선 위에서 확대돼 단기 추세 탄력이 개선되고 있습니다.")
-        elif macd_hist > 0:
-            momentum_parts.append("MACD 양(+)이나 둔화")
-            risks.append("MACD는 0선 위를 유지하지만 히스토그램 탄력이 둔화돼 상승 속도 저하 여부를 점검할 필요가 있습니다.")
-        elif macd_hist > prev_hist:
-            momentum_parts.append("MACD 음(-)이나 개선")
-            positives.append("MACD 히스토그램은 아직 음(-)의 영역이지만 전일 대비 개선돼 하락 모멘텀 둔화 신호가 나타나고 있습니다.")
-        else:
-            momentum_parts.append("MACD 음(-)의 모멘텀")
-            risks.append("MACD 히스토그램이 음(-)의 영역에서 약화돼 추세 반전 신호가 아직 부족합니다.")
-
-    if mfi is not None and 50 <= mfi <= 75:
-        positives.append(f"MFI {mfi:.1f}로 가격과 거래량을 결합한 자금 흐름 지표가 우호적인 범위에 있습니다.")
-    elif mfi is not None and mfi < 40:
-        risks.append(f"MFI가 {mfi:.1f}로 낮아 거래량을 동반한 매수 에너지가 강하다고 보기 어렵습니다.")
-    if obv is not None and obv_avg is not None:
-        if obv > obv_avg:
-            positives.append("OBV가 최근 20일 평균을 상회해 누적 거래량 흐름은 매수 우위로 해석할 여지가 있습니다.")
-        else:
-            risks.append("OBV가 최근 20일 평균을 하회해 거래량 기반 추세 확증은 제한적입니다.")
-
-    momentum_label = " · ".join(momentum_parts[:2]) if momentum_parts else "미확인"
-
-    # 외국인 / 기관 수급
-    w5 = investor_window(investors, df, 5, ["ForeignNet", "InstitutionNet"])
-    w20 = investor_window(investors, df, 20, ["ForeignNet", "InstitutionNet"])
-    w10_rate = investor_window(investors, df, 10, ["ForeignRate"])
-    if w5 is not None:
-        f5 = float(w5.ForeignNet.sum())
-        i5 = float(w5.InstitutionNet.sum())
-        if f5 > 0 and i5 > 0:
-            flow_label = "외인·기관 동반 순매수"
-            positives.append(f"최근 5거래일 외국인 {f5:+,.0f}주, 기관 {i5:+,.0f}주로 동반 순매수가 확인돼 수급 확증력이 양호합니다.")
-        elif f5 > 0 and i5 <= 0:
-            flow_label = "외국인 우위"
-            positives.append(f"최근 5거래일 외국인이 {f5:+,.0f}주 순매수하며 수급을 주도하고 있습니다.")
-            risks.append(f"같은 기간 기관은 {i5:+,.0f}주로 동반 수급이 확인되지 않아 매수 주체의 확산 여부를 볼 필요가 있습니다.")
-        elif i5 > 0 and f5 <= 0:
-            flow_label = "기관 우위"
-            positives.append(f"최근 5거래일 기관이 {i5:+,.0f}주 순매수하며 방어적 수급을 형성하고 있습니다.")
-            risks.append(f"같은 기간 외국인은 {f5:+,.0f}주로 외국인 수급의 추세 전환은 아직 확인되지 않았습니다.")
-        else:
-            flow_label = "동반 순매도"
-            risks.append(f"최근 5거래일 외국인 {f5:+,.0f}주, 기관 {i5:+,.0f}주로 동반 순매도여서 수급 측면의 역풍이 존재합니다.")
-    else:
-        flow_label = "수급 미확인"
-        risks.append("최근 5거래일과 일치하는 외국인·기관 데이터가 부족해 수급 방향을 확정하기 어렵습니다.")
-
-    if w20 is not None:
-        f20, i20 = float(w20.ForeignNet.sum()), float(w20.InstitutionNet.sum())
-        if (f20 > 0 and i20 > 0) and flow_label != "외인·기관 동반 순매수":
-            positives.append(f"20거래일 누적으로는 외국인 {f20:+,.0f}주, 기관 {i20:+,.0f}주 순매수여서 중기 수급 기반은 양호합니다.")
-        elif f20 < 0 and i20 < 0:
-            risks.append(f"20거래일 누적 외국인 {f20:+,.0f}주, 기관 {i20:+,.0f}주로 중기 수급 부담이 남아 있습니다.")
-
-    if w10_rate is not None:
-        rate_delta = float(w10_rate.ForeignRate.iloc[-1] - w10_rate.ForeignRate.iloc[0])
-        if rate_delta > 0:
-            positives.append(f"외국인 보유율이 최근 10거래일 기준 {rate_delta:+.2f}%p 증가해 보유 비중 흐름은 우호적입니다.")
-        elif rate_delta < 0:
-            risks.append(f"외국인 보유율이 최근 10거래일 기준 {rate_delta:+.2f}%p 감소해 중기 외국인 수급은 약화된 모습입니다.")
-
-    # 가치 / 펀더멘털
-    target = number(fund.get("Target"))
-    roe = number(fund.get("ROE"))
-    per = number(fund.get("PER"))
-    industry = number(fund.get("IndustryPER"))
-    if not stale and target is not None and target > 0 and close:
-        upside = (target / close - 1) * 100
-        if upside >= 25:
-            positives.append(f"컨센서스 목표가의 종가 대비 상승여력이 {upside:+.1f}%로 가격 메리트가 비교적 크게 관측됩니다.")
-        elif upside < 0:
-            risks.append(f"현재 종가가 컨센서스 목표가를 상회해 괴리율이 {upside:+.1f}%로 밸류에이션 여유가 제한적입니다.")
-    if not stale and roe is not None:
-        if roe >= 15:
-            positives.append(f"최근 확정 연간 ROE가 {roe:.1f}%로 수익성 지표가 양호한 편입니다.")
-        elif roe < 8:
-            risks.append(f"최근 확정 연간 ROE가 {roe:.1f}%로 수익성 측면의 강한 프리미엄 근거는 제한적입니다.")
-    if not stale and per is not None and industry is not None and per > 0 and industry > 0:
-        if per <= industry * 0.7:
-            positives.append(f"PER {per:.1f}배로 동일 업종 {industry:.1f}배 대비 할인돼 상대 밸류에이션 매력이 관측됩니다.")
-        elif per >= industry * 1.3:
-            risks.append(f"PER {per:.1f}배로 동일 업종 {industry:.1f}배 대비 프리미엄이 커 실적 기대가 주가에 선반영됐을 가능성을 점검해야 합니다.")
-
-    # 뉴스는 보조 정보만
-    news = _news_momentum_summary(news_result)
-    if news["label"] == "긍정 우위":
-        positives.append(news["text"] + " 뉴스는 정량 점수에는 반영하지 않습니다.")
-    elif news["label"] == "부정 우위":
-        risks.append(news["text"] + " 뉴스는 정량 점수에는 반영하지 않습니다.")
-    else:
-        risks.append(news["text"] + " 뉴스는 정량 점수에는 반영하지 않습니다.")
-
-    # 점수 / 보류 사유
-    logs = score.get("logs", pd.DataFrame())
-    missing_rows = logs[logs["득점"].isna()] if not logs.empty and "득점" in logs else pd.DataFrame()
-    zero_rows = logs[(logs["득점"] == 0) & logs["배점"].notna()] if not logs.empty and "득점" in logs else pd.DataFrame()
-    earned_rows = logs[(logs["득점"].notna()) & (logs["득점"] > 0)] if not logs.empty and "득점" in logs else pd.DataFrame()
-
-    if score.get("score") is None:
-        missing_names = ", ".join(missing_rows["항목"].astype(str).tolist()) if not missing_rows.empty else "일부 항목"
-        grade_reason = (
-            f"종합등급이 보류된 직접 원인은 점수가 낮아서가 아니라 **{missing_names} 데이터 미확인**으로 "
-            f"전체 100점 중 {score['possible']}점까지만 관측됐기 때문입니다. 현재 확인된 득점은 {score['points']} / {score['possible']}점입니다."
-        )
-    else:
-        grade_reason = f"전체 평가 항목이 확인됐으며 최종 점수는 {score['score']} / 100점, 판정은 '{score['grade']}'입니다."
-
-    limiters = []
-    if not zero_rows.empty:
-        for _, row in zero_rows.sort_values("배점", ascending=False).head(5).iterrows():
-            limiters.append(f"{row['항목']}: 0/{row['배점']}점 — {row['근거']}")
-    if not missing_rows.empty:
-        for _, row in missing_rows.sort_values("배점", ascending=False).head(3).iterrows():
-            limiters.append(f"{row['항목']}: 미확인/{row['배점']}점 — {row['근거']}")
-
-    contributors = []
-    if not earned_rows.empty:
-        for _, row in earned_rows.sort_values(["득점", "배점"], ascending=False).head(5).iterrows():
-            contributors.append(f"{row['항목']}: {row['득점']}/{row['배점']}점 — {row['근거']}")
-
-    # 첫 화면 종합 문장
-    if score["points"] >= 0.75 * max(score["possible"], 1):
-        score_tone = "확인 가능한 항목 기준 조건 충족도가 높은 편"
-    elif score["points"] >= 0.50 * max(score["possible"], 1):
-        score_tone = "확인 가능한 항목 기준 조건 충족도가 중립권"
-    else:
-        score_tone = "확인 가능한 항목 기준 조건 충족도가 낮은 편"
-
-    view = (
-        f"{grade_reason} 기술적으로는 **{trend_label}**, 수급은 **{flow_label}**, 모멘텀은 **{momentum_label}**로 요약됩니다. "
-        f"따라서 현재는 {score_tone}이며, 신규 판단에서는 가격 이격과 수급의 지속성, MACD·RSI 방향을 함께 확인하는 것이 적절합니다. "
-        f"뉴스 모멘텀은 **{news['label']}**으로 분류되며 보조 참고용입니다."
-    )
-
-    return {
-        "view": view,
-        "positives": positives[:7],
-        "risks": risks[:7],
-        "trend_label": trend_label,
-        "flow_label": flow_label,
-        "momentum_label": momentum_label,
-        "news_label": news["label"],
-        "headlines": news["headlines"],
-        "limiters": limiters,
-        "contributors": contributors,
-        "dist20": dist20,
-        "dist60": dist60,
-    }
 
 
 def render_analysis(bundle, code, display_name):
@@ -1374,7 +1155,21 @@ def render_analysis(bundle, code, display_name):
             short = read_short_csv(uploaded.getvalue(), code, df.index[-1])
         except (ValueError, UnicodeError, pd.errors.ParserError) as exc:
             st.warning(str(exc))
-    score = evaluate_score(df, investors, {} if stale else fund, short)
+    with st.expander("수급 수집 상태 · 대체 자료 입력"):
+        result = bundle['investors']
+        st.caption('수급 출처: ' + result.source + ' · 상태: ' + result.status)
+        st.caption(' / '.join(result.notes))
+        st.caption('수집 실패 시 증권사 등에서 확인한 CSV를 입력하실 수 있습니다. 필수 열: Code, Date, ForeignNet, InstitutionNet. 수량 단위는 주이며, ForeignRate(%)는 선택입니다. 업로드 자료가 자동 수집 자료를 대신합니다.')
+        supply_upload=st.file_uploader('수급 CSV (선택)',type=['csv'],key='investor_csv_'+code)
+        if supply_upload is not None:
+            try:
+                investors=read_investor_csv(supply_upload.getvalue(),code,df)
+                st.caption(f'사용자 제공 수급 {len(investors)}거래일을 적용했습니다. 금액은 확정 종가로 추정합니다.')
+            except (ValueError, UnicodeError, pd.errors.ParserError) as exc:
+                st.error(str(exc))
+                investors=pd.DataFrame(columns=INV_COLS)
+                st.caption('잘못된 업로드 자료로 수급을 해석하지 않습니다. 파일을 제거하시면 자동 수집 자료를 사용합니다.')
+    score = evaluate_technical_score(df)
     # 종합 분석 화면의 리서치 코멘트를 위해 최근 헤드라인을 캐시 조회합니다.
     # 뉴스는 점수에는 반영하지 않고 보조 코멘트로만 사용합니다.
     with st.spinner("추세·수급·모멘텀·최근 뉴스까지 종합 해석하고 있습니다…"):
@@ -1383,22 +1178,21 @@ def render_analysis(bundle, code, display_name):
         df, investors, {} if stale else fund, score, news_for_comment, short, stale
     )
     cols = st.columns(3)
-    cols[0].metric("확인된 항목의 득점", f"{score['points']} / {score['possible']}")
-    cols[1].metric("전체 배점 중 데이터 확보", f"{score['coverage']}%")
+    cols[0].metric("기술 점수 (100점 기준)", f"{score['points']} / {score['possible']}")
+    cols[1].metric("기술 지표 확보율", f"{score['coverage']}%")
     cols[2].metric("공매도 거래량 비중", fmt((short or {}).get("ShortRatio"), "%", 2))
     st.write(score["grade"])
-    st.caption("설명 가능한 규칙 점수입니다. 승률·상승 확률이 아닙니다. 미확인 항목에는 점수를 주지 않고 100점으로 환산하지도 않습니다.")
+    st.caption("기술 점수: 추세 35 · 모멘텀 25 · 거래량 20 · 진입 부담 20. 한국·미국에 같은 규칙을 적용합니다. 수급·재무는 별도 해석하며 기술 점수에 합산하지 않습니다. 승률이나 상승 확률이 아닙니다.")
     if score["score"] is None:
         st.caption(f"미확인 항목까지 확보했을 때의 산술적 점수 범위: {score['points']}~{score['upper_bound']} / 100. 신뢰구간이나 전망 범위가 아닙니다.")
 
-    st.markdown("#### 🧠 종합 리서치 코멘트")
-    st.info(research["view"])
-
-    signal_boxes = st.columns(4)
-    signal_boxes[0].metric("추세", research["trend_label"])
-    signal_boxes[1].metric("수급", research["flow_label"])
-    signal_boxes[2].metric("모멘텀", research["momentum_label"])
-    signal_boxes[3].metric("뉴스 모멘텀", research["news_label"])
+    render_research_cards(research)
+    flow = research['flow']
+    st.metric('외국인·기관 수급 점수', f"{flow['score']} / 100" if flow['score'] is not None else '확인 대기')
+    st.caption('수급 점수는 최근 5거래일의 매수 방향 20 · 거래량 대비 순매수 60 · 순매수 지속성 20입니다. 기술 점수와 별도입니다.')
+    if flow['detail']:
+        with st.expander('수급 점수 산정 근거'):
+            st.dataframe(pd.DataFrame(flow['detail']), hide_index=True, use_container_width=True)
 
     if research["dist20"] is not None or research["dist60"] is not None:
         st.caption(
@@ -1443,7 +1237,7 @@ def render_analysis(bundle, code, display_name):
             st.markdown("**최근 뉴스 헤드라인 참고**")
             for title in research["headlines"]:
                 st.markdown(f"- {title}")
-            st.caption("헤드라인의 키워드 방향만 보조적으로 요약하며, 뉴스는 종합 점수에 반영하지 않습니다.")
+            st.caption("뉴스 제목만으로 호재·악재를 단정하지 않습니다. 원문의 발표 시점과 실적·공시를 함께 확인해 주십시오. 뉴스는 기술 점수에 반영하지 않습니다.")
 
     scenario = price_scenario(df)
     if scenario:
@@ -1582,7 +1376,7 @@ def running_horse_score(frame):
     breakout = r.Close > r.HIGH60_PREV
     near = r.Close >= r.HIGH60_PREV * 0.97
     if score >= 80 and healthy_pullback:
-        status="🔥 최우선 관찰 — 강한 추세 + 좋은 눌림"
+        status="🟢 우선 관찰 — 상승 추세와 이격 양호"
     elif score >= 80 and breakout and r.RSI < 75:
         status="🚀 강한 돌파 — 추격보다 눌림 대기"
     elif score >= 70 and near:
@@ -1590,7 +1384,7 @@ def running_horse_score(frame):
     elif score >= 60:
         status="🟡 관심 종목 — 조건 일부 미충족"
     elif score >= 45:
-        status="🟠 애매 — 추세 확인 필요"
+        status="🟠 관찰 유지 — 추세 확인 필요"
     else:
         status="🔴 우선순위 낮음"
 
@@ -1670,9 +1464,9 @@ def build_horse_commentary(result, investors=None):
 
     # Volume
     if r.VOL_RATIO >= 1.5 and r.Close > result["resistance"]:
-        positives.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배로 확대돼 돌파 과정에 거래 에너지가 동반되고 있습니다.")
+        positives.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배로 확대돼 돌파 과정에 거래 참여가 동반되고 있습니다.")
     elif r.VOL_RATIO < 0.8:
-        risks.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배에 그쳐 가격 상승을 뒷받침하는 거래 에너지는 다소 제한적입니다.")
+        risks.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배에 그쳐 가격 상승을 뒷받침하는 거래 참여는 다소 제한적입니다.")
     elif r.VOL_RATIO < 1.2:
         risks.append(f"거래량이 20일 평균의 {r.VOL_RATIO:.2f}배 수준으로, 추세 확장 국면으로 보기에는 수급 확산 신호가 아직 약합니다.")
 
@@ -1680,7 +1474,7 @@ def build_horse_commentary(result, investors=None):
     f5, i5, f20, i20 = supply["foreign5"], supply["institution5"], supply["foreign20"], supply["institution20"]
     if f5 is not None and i5 is not None:
         if f5 > 0 and i5 > 0:
-            positives.append(f"최근 5거래일 외국인({_fmt_shares(f5)})과 기관({_fmt_shares(i5)})이 동반 순매수해 수급의 방향성이 가격 추세와 일치합니다.")
+            positives.append(f"최근 5거래일 외국인({_fmt_shares(f5)})과 기관({_fmt_shares(i5)})이 동반 순매수해 두 투자자 집단에서 매수 우위가 관측됩니다. 가격 추세와의 일치 여부도 함께 살펴볼 필요가 있습니다.")
         elif f5 > 0 or i5 > 0:
             buyer = "외국인" if f5 > 0 else "기관"
             risks.append(f"최근 5거래일 {buyer}은 순매수이나 외국인·기관 동반 매수는 확인되지 않아 수급의 폭은 제한적입니다.")
@@ -1698,7 +1492,7 @@ def build_horse_commentary(result, investors=None):
     # Final house view
     score = result["score"]
     if score >= 82 and len(positives) >= 3 and not (r.RSI >= 78 or r.DIST_MA20 >= 10):
-        view = "추세·모멘텀·수급의 정합성이 높은 편입니다. 다만 돌파 직후 추격보다는 전고점 또는 20일선 부근의 지지 확인 시 손익비가 개선될 수 있습니다."
+        view = "추세와 모멘텀의 기술적 조건은 비교적 우호적입니다. 수급의 동반 여부는 별도 확인이 필요합니다. 다만 돌파 직후 추격보다는 전고점 또는 20일선 부근의 지지 확인 시 손익비가 개선될 수 있습니다."
     elif score >= 70:
         view = "기술적 추세는 우호적이지만 일부 수급 또는 거래량 조건의 추가 확인이 필요합니다. 신규 진입은 돌파 유지와 눌림 구간의 거래량 감소 여부를 함께 확인하는 전략이 적절합니다."
     elif score >= 55:
@@ -2149,7 +1943,7 @@ def render_running_horse(market_result):
 - **80점 이상:** 강한 후보
 - **70~79점:** 우선 관찰
 - **60~69점:** 관심
-- **45~59점:** 애매
+- **45~59점:** 추세 확인 필요
 - **45점 미만:** 우선순위 낮음
         """)
 
@@ -2354,13 +2148,13 @@ def _combine_oversold_score(tech, fund=None, investors=None):
     supply_ok = supply_points >= 6
 
     if score >= 80 and tech["dd52"] <= -20 and rebound and outlook_ok:
-        status = "💎 최우선 관찰 — 낙폭 대비 실적·반등 신호 우수"
+        status = "💎 우선 관찰 — 실적 전망과 반등 신호 동반"
     elif score >= 70 and outlook_ok:
         status = "🟢 과대낙폭 유망 후보 — 펀더멘털 대비 가격 메리트"
     elif score >= 60:
         status = "🟡 관심 — 반등 또는 실적 확증 추가 필요"
     elif score >= 45:
-        status = "🟠 애매 — 하락 추세 리스크 잔존"
+        status = "🟠 신중한 관찰 — 하락 추세 지속 가능"
     else:
         status = "🔴 우선순위 낮음 — 낙폭보다 훼손 가능성 우세"
 
@@ -2424,7 +2218,7 @@ def build_oversold_commentary(result):
     if r.RET5 > 0 and r.MACD_HIST > prev.MACD_HIST:
         positives.append("최근 5거래일 수익률이 플러스로 전환되고 MACD 히스토그램도 개선돼 낙폭 이후 단기 모멘텀 회복 조짐이 확인됩니다.")
     elif r.MA20_SLOPE < 0 and r.MA60_SLOPE < 0:
-        risks.append("20·60일 이동평균선의 기울기가 모두 하락 중이어서 가격은 싸졌지만 추세 전환의 기술적 확증은 아직 부족합니다.")
+        risks.append("20·60일 이동평균선의 기울기가 모두 하락 중이어서 주가는 조정되었지만 추세 전환의 기술적 확증은 아직 부족합니다.")
     else:
         risks.append("반등 신호가 일부 관찰되지만 이동평균선과 모멘텀 지표가 동시에 추세 전환을 확인한 단계는 아닙니다.")
 
@@ -2432,7 +2226,7 @@ def build_oversold_commentary(result):
     if f5 is not None and i5 is not None:
         if f5 > 0 and i5 > 0:
             positives.append(f"최근 5거래일 외국인({_fmt_shares(f5)})·기관({_fmt_shares(i5)}) 동반 순매수가 확인돼 저가 매수 수급이 유입되고 있습니다.")
-        elif f5 <= 0 and i5 <= 0:
+        elif f5 < 0 and i5 < 0:
             risks.append("최근 5거래일 외국인과 기관이 모두 순매도여서 가격 하락을 흡수하는 주도 수급은 아직 확인되지 않습니다.")
         else:
             risks.append("외국인과 기관의 수급 방향이 엇갈려 저점 매수의 주체가 명확하게 형성됐다고 보기 어렵습니다.")
@@ -3068,7 +2862,7 @@ def us_profile(code):
             raise ValueError('최소 61개 확정 일봉이 필요합니다.')
         horse = running_horse_score(result.data)
         oversold = oversold_technical_profile(result.data)
-        score = evaluate_score(df, pd.DataFrame(columns=INV_COLS), empty_fund())
+        score = evaluate_technical_score(df)
         return {'Code': code, 'df': df, 'horse': horse, 'oversold': oversold, 'score': score,
                 'source': result.source, 'fetched_at': result.fetched_at}
     except Exception as exc:
@@ -3174,22 +2968,28 @@ def render_us_workspace():
             cols[1].metric('5거래일', fmt(period_return(df, 5), '%', 2, True))
             cols[2].metric('20거래일', fmt(period_return(df, 20), '%', 2, True))
             cols[3].metric('RSI', fmt(df.RSI.iloc[-1], digits=1))
-            st.metric('종합점수 중 확인된 득점', f"{score['points']} / 확인 배점 {score['possible']}")
-            st.caption('100점 종합등급은 보류합니다. 미국 재무·기관 수급·공매도 공급원을 연결하지 않아 기술 지표만 평가합니다. 부족한 배점을 환산하지 않습니다.')
+            st.metric('기술 점수 (100점 기준)', f"{score['points']} / 확인 배점 {score['possible']}")
+            st.write(score['grade'])
+            st.caption('추세 35 · 모멘텀 25 · 거래량 20 · 진입 부담 20. 한국과 같은 기술 규칙입니다. 기관 수급·재무 점수는 포함하지 않으며, 승률이나 상승 확률을 의미하지 않습니다.')
             scenario = price_scenario(df)
             if scenario:
                 cols = st.columns(5)
                 for box, label in zip(cols, ["1차 참고 진입가", "2차 참고 진입가", "1차 참고 목표가", "2차 참고 목표가", "참고 손절가"]):
                     box.metric(label, '$' + fmt(scenario[label], digits=2))
                 st.caption('ATR 변동성으로 계산한 가격 시나리오입니다. 애널리스트 목표가나 주문 가격이 아닙니다.')
-            direction = '20일 이동평균 위' if df.Close.iloc[-1] > df.MA20.iloc[-1] else '20일 이동평균 아래'
-            st.write(f"현재 확정 종가는 {direction}에 있습니다. RSI는 {df.RSI.iloc[-1]:.1f}, 최근 20거래일 수익률은 {period_return(df, 20):+.2f}%입니다.")
-            st.caption('코멘트와 점수는 공개된 기술 규칙에 따른 계산이며 생성형 AI 분석은 아닙니다.')
+            research = build_general_research_commentary(df, pd.DataFrame(columns=INV_COLS), {}, score, None,
+                stale=(datetime.now(EXCHANGE_TZ['US']).date()-df.index[-1].date()).days>7)
+            render_research_cards(research)
+            with st.expander('긍정 요인과 유의 사항'):
+                for item in research['positives']:
+                    st.write('• ' + item)
+                for item in research['risks']:
+                    st.write('• ' + item)
             render_chart(df)
             st.bar_chart(df.Volume.tail(100), height=150)
             with st.expander('채점 근거'):
                 st.dataframe(score['logs'], hide_index=True, use_container_width=True)
-            with st.expander('개미 백테스트'):
+            with st.expander('퀀트 백테스트'):
                 render_backtest(df)
             with st.expander('뉴스 브리핑'):
                 news = cached_us_news(selected)
@@ -3205,6 +3005,7 @@ def render_us_workspace():
             if horse:
                 st.metric(selected + ' 기술 모멘텀', f"{horse['score']} / 100")
                 st.write(horse['status'])
+                st.info(f"20일선 대비 이격은 {horse['row'].DIST_MA20:+.1f}%, 거래량은 20일 평균의 {horse['row'].VOL_RATIO:.2f}배입니다. 돌파가 이어지려면 가격 상승에 거래량이 동반되고, 조정 시 주요 이동평균선의 지지가 유지되는지 확인하실 필요가 있습니다.")
                 st.dataframe(horse['detail'], hide_index=True)
             else:
                 st.info('모멘텀 탐지에는 최소 130개 확정 일봉이 필요합니다.')
@@ -3216,6 +3017,7 @@ def render_us_workspace():
             over = profile['oversold']
             if over:
                 st.metric(selected + ' 낙폭·반등', f"{over['technical_score']} / 55", f"52주 고점 대비 {over['dd52']:.1f}%", delta_color='off')
+                st.info(f"52주 고점 대비 {abs(over['dd52']):.1f}% 조정된 상태이며, RSI는 {over['row'].RSI:.1f}입니다. 낙폭만으로 저평가를 판단하기보다는 최근 저점의 지지, MACD 개선, 20일선 회복이 함께 나타나는지 살펴보시기를 권해드립니다. 이 점수는 기술적 반등 후보 평가이며 기업의 실적 회복을 확인한 결과는 아닙니다.")
                 st.dataframe(pd.DataFrame(over['detail']), hide_index=True)
             else:
                 st.info('과대낙폭 탐지에는 최소 260개 확정 일봉이 필요합니다.')
@@ -3265,8 +3067,192 @@ def render_us_scan(mode):
 
 
 
+# ===== v5.5: 공통 기술 평가와 독립 수급 해석 =====
+def evaluate_technical_score(df):
+    """Fixed 100-point technical rubric; missing evidence is never rescaled."""
+    r, p = df.iloc[-1], df.iloc[-2]
+    rows = []
+    def add(group, label, weight, value, detail):
+        pts = None if value is None else round(float(np.clip(value, 0, weight)), 1)
+        rows.append({'영역': group, '항목': label, '배점': weight, '득점': pts,
+                     '상태': '미확인' if pts is None else '확인', '근거': detail})
+    ready = all(number(r.get(k)) is not None for k in ['Close','MA5','MA20','MA60'])
+    add('추세', '이동평균 구조', 15,
+        sum([5*(r.Close>r.MA20), 5*(r.MA5>r.MA20), 5*(r.MA20>r.MA60)]) if ready else None,
+        '종가>20일선, 5일선>20일선, 20일선>60일선 각각 5점')
+    slope = r.MA20/df.MA20.iloc[-6]-1 if len(df)>=26 and number(df.MA20.iloc[-6]) else None
+    add('추세','20일선 방향',10, None if slope is None else 10 if slope>0.005 else 7 if slope>0 else 3 if slope>=-0.005 else 0,
+        '5거래일 전 대비: +0.5% 초과 10 / 0% 초과 7 / -0.5% 이상 3 / 그 외 0')
+    macd = number(r.get('MACD_HIST'))
+    add('추세','MACD 방향',10, None if macd is None or number(p.get('MACD_HIST')) is None else
+        (6 if macd>0 else 0)+(4 if macd>p.MACD_HIST else 0), '히스토그램 양수 6점 + 전일 대비 개선 4점')
+    rsi = number(r.get('RSI'))
+    add('모멘텀','RSI 위치',10,None if rsi is None else 10 if 50<=rsi<=65 else 7 if 45<=rsi<50 or 65<rsi<=70 else 4 if 35<=rsi<45 or 70<rsi<=75 else 0,
+        '50~65:10 / 45~50·65~70:7 / 35~45·70~75:4 / 그 외 0')
+    ret = period_return(df,20)
+    add('모멘텀','20거래일 수익률',10,None if ret is None else 10 if 3<=ret<=15 else 7 if ret>0 else 3 if ret>=-5 else 0,
+        '3~15%:10 / 그 밖의 양수:7 / -5~0%:3 / -5% 미만:0')
+    bb = number(r.get('BB_pct'))
+    add('모멘텀','볼린저 위치',5,None if bb is None else 5 if .5<=bb<=1 else 3 if .2<=bb<.5 or 1<bb<=1.1 else 0,
+        '%b 0.5~1:5 / 0.2~0.5·1~1.1:3 / 그 외 0')
+    active = df.Volume.tail(20).sum()>0 and r.Volume>0
+    mfi=number(r.get('MFI'))
+    add('거래량','MFI',10,None if not active or mfi is None else 10 if 50<=mfi<=75 else 6 if 40<=mfi<50 or 75<mfi<=80 else 2 if 20<=mfi<40 else 0,
+        '50~75:10 / 40~50·75~80:6 / 20~40:2 / 그 외 0; 투자자 신원은 구분하지 않음')
+    obv = number(r.get('OBV'))
+    add('거래량','OBV 흐름',10,None if not active or obv is None else
+        5*(obv>df.OBV.tail(20).mean())+5*(obv>df.OBV.iloc[-6]), '20일 평균 상회 5 + 5거래일 전 대비 증가 5')
+    dist=(r.Close/r.MA20-1)*100 if ready else None
+    add('진입 부담','20일선 이격',10,None if dist is None else 10 if 0<=dist<=5 else 6 if -3<=dist<0 or 5<dist<=10 else 2 if -8<=dist<-3 or 10<dist<=15 else 0,
+        '0~5%:10 / -3~0·5~10%:6 / -8~-3·10~15%:2 / 그 외 0')
+    atr = number(r.get('ATR14'))
+    atr_pct=atr/r.Close*100 if atr is not None and r.Close>0 else None
+    add('진입 부담','상대 변동성',10,None if not active or atr_pct is None else 10 if atr_pct<=2 else 7 if atr_pct<=4 else 3 if atr_pct<=6 else 0,
+        'ATR/종가 2% 이하:10 / 4% 이하:7 / 6% 이하:3 / 그 외 0; 거래량 0이면 보류')
+    logs=pd.DataFrame(rows)
+    points=round(sum(x['득점'] for x in rows if x['득점'] is not None),1)
+    possible=sum(x['배점'] for x in rows if x['득점'] is not None)
+    grade='기술 지표 일부 미확인' if possible<100 else '추세 조건 우호' if points>=75 else '선별 관찰 구간' if points>=55 else '추세 회복 확인 구간' if points>=35 else '보수적 접근 구간'
+    return {'points':points,'possible':possible,'coverage':possible,'score':points if possible==100 else None,
+            'upper_bound':points+100-possible,'grade':grade,'logs':logs}
+
+
+def read_investor_csv(content, code, history):
+    required=['Code','Date','ForeignNet','InstitutionNet']
+    table=pd.read_csv(StringIO(content.decode('utf-8-sig')),dtype={'Code':str})
+    if not set(required).issubset(table):
+        raise ValueError('Code, Date, ForeignNet, InstitutionNet 열이 필요합니다.')
+    table=table[table.Code.astype(str).str.zfill(6).eq(code)].copy()
+    if table.empty:
+        raise ValueError('선택한 종목코드에 해당하는 수급이 없습니다.')
+    table['Date']=pd.to_datetime(table.Date,errors='coerce').dt.normalize()
+    if table.Date.isna().any() or table.Date.duplicated().any():
+        raise ValueError('날짜 형식 또는 중복 날짜를 확인해 주십시오.')
+    for column in ['ForeignNet','InstitutionNet']:
+        table[column]=pd.to_numeric(table[column],errors='coerce')
+        if not np.isfinite(table[column]).all() or (table[column]%1!=0).any():
+            raise ValueError('순매수 수량은 결측 없는 정수(주)여야 합니다.')
+    table['ForeignRate']=pd.to_numeric(table.get('ForeignRate',pd.Series(np.nan,index=table.index)),errors='coerce')
+    if ((table.ForeignRate.dropna()<0)|(table.ForeignRate.dropna()>100)).any():
+        raise ValueError('외국인 보유율은 0~100% 범위여야 합니다.')
+    table=table[table.Date.isin(history.index)].copy()
+    if table.empty:
+        raise ValueError('확정 일봉과 일치하는 거래일이 없습니다.')
+    table['Close']=table.Date.map(history.Close)
+    table['ForeignAmountEstimate']=table.ForeignNet*table.Close/1e8
+    table['InstitutionAmountEstimate']=table.InstitutionNet*table.Close/1e8
+    return table[INV_COLS].sort_values('Date')
+
+
+def assess_investor_flow(investors, df):
+    columns=['ForeignNet','InstitutionNet']
+    w=investor_window(investors,df,5,columns)
+    dates=pd.to_datetime(investors.get('Date',pd.Series(dtype='datetime64[ns]')),errors='coerce')
+    available=dates[dates<=df.index[-1]].max() if len(dates) else pd.NaT
+    base={'score':None,'label':'수급 확인 대기','foreign':None,'institution':None,'ratio':None,
+          'buy_days':None,'asof':available,'detail':[]}
+    if w is None or df.Volume.tail(5).sum()<=0:
+        base['text']='분석 기준일과 일치하는 최근 5거래일 수급이 충분하지 않아 외국인·기관의 매수 방향은 판단을 유보하겠습니다. 거래량 지표만으로 특정 투자자의 매집을 단정하지 않습니다.'
+        return base
+    volume=df.Volume.tail(5)
+    # 서로 다른 거래 범위·수정주가 자료가 섞인 경우 강한 매수로 해석하지 않습니다.
+    bad = (w.ForeignNet.abs()>volume) | (w.InstitutionNet.abs()>volume) | ((w.ForeignNet+w.InstitutionNet).abs()>volume)
+    if bad.any():
+        base['text']='순매수 수량과 일봉 거래량의 범위가 일치하지 않아 수급 강도 계산을 보류하겠습니다. 자료의 거래시장·수량 단위·기업행사 조정 여부를 먼저 확인할 필요가 있습니다.'
+        return base
+    foreign,institution=float(w.ForeignNet.sum()),float(w.InstitutionNet.sum())
+    total=foreign+institution
+    ratio=total/float(df.Volume.tail(5).sum())*100
+    days=int(((w.ForeignNet+w.InstitutionNet)>0).sum())
+    direction=20 if foreign>0 and institution>0 else 10 if total>0 else 0
+    intensity=60 if ratio>=3 else 40 if ratio>=1 else 20 if ratio>=.2 else 5 if ratio>0 else 0
+    persistence=days*4
+    points=direction+intensity+persistence
+    label='동반 매수 우위' if foreign>0 and institution>0 else '엇갈린 매매' if foreign*institution<0 else '합산 매수 우위' if total>0 else '동반 매도 우위' if foreign<0 and institution<0 else '방향성 제한'
+    text=f'최근 5거래일 외국인은 {foreign:+,.0f}주, 기관은 {institution:+,.0f}주 순매수하여 {label}가 관측됩니다. 두 주체의 합산 순매수는 같은 기간 거래량의 {ratio:+.2f}%이며, 합산 순매수일은 5일 중 {days}일입니다.'
+    w20=investor_window(investors,df,20,columns)
+    if w20 is not None:
+        total20=float(w20[columns].sum().sum())
+        text+=f' 20거래일 합산 순매수는 {total20:+,.0f}주로, '+('단기·중기 방향이 일치합니다.' if total*total20>0 else '최근 흐름과 중기 방향을 함께 점검할 필요가 있습니다.')
+    else:
+        text+=' 20거래일 수급의 지속성은 자료가 부족하여 추가 확인이 필요합니다.'
+    return dict(base,score=points,label=label,foreign=foreign,institution=institution,ratio=ratio,buy_days=days,text=text,
+                detail=[{'항목':'매수 주체 방향','득점':direction,'배점':20,'기준':'동반 양수 20 / 합산 양수 10 / 그 외 0'},
+                        {'항목':'거래량 대비 합산 순매수','득점':intensity,'배점':60,'기준':'3% 이상 60 / 1% 이상 40 / 0.2% 이상 20 / 양수 5 / 그 외 0'},
+                        {'항목':'매수 지속성','득점':persistence,'배점':20,'기준':'최근 5일 합산 순매수일당 4점'}])
+
+
+def build_general_research_commentary(df, investors, fund, score, news_result, short=None, stale=False):
+    r,p=df.iloc[-1],df.iloc[-2]
+    dist20=(r.Close/r.MA20-1)*100
+    dist60=(r.Close/r.MA60-1)*100
+    aligned=r.MA5>r.MA20>r.MA60
+    support=r.Close>r.MA20
+    trend='정배열 유지' if aligned and support else '단기 회복 시도' if support else '추세 회복 대기'
+    improving=r.MACD_HIST>p.MACD_HIST
+    momentum='개선 흐름' if improving else '탄력 둔화'
+    trend_text=(f'5일·20일·60일 이동평균선이 정배열을 유지하고 있으며, 종가는 20일선보다 {dist20:.1f}% 높은 수준입니다.' if aligned and support else
+                f'종가가 20일선을 {dist20:.1f}% 웃돌며 단기 회복을 시도하고 있습니다. 중기 상승 추세로 판단하려면 이동평균선의 정배열 전환이 함께 확인되어야 합니다.' if support else
+                f'종가가 20일선을 {abs(dist20):.1f}% 밑돌고 있어, 현재는 상승 추세의 재개보다 지지력과 회복 신호를 확인할 구간으로 판단됩니다.')
+    momentum_text=f'RSI는 {r.RSI:.1f}이며, MACD 히스토그램은 전일 대비 '+('개선되고 있습니다.' if improving else '둔화되고 있습니다.')
+    flow=assess_investor_flow(investors,df)
+    us=df.attrs.get('region')=='US'
+    if us:
+        vol_ratio=r.Volume/df.Volume.iloc[-21:-1].mean() if df.Volume.iloc[-21:-1].mean()>0 else None
+        flow_label='거래 활발' if vol_ratio is not None and vol_ratio>=1.2 else '거래량 보통' if vol_ratio is not None else '거래량 미확인'
+        flow_text=(f'최근 거래량은 직전 20거래일 평균의 {vol_ratio:.2f}배입니다. MFI {r.MFI:.1f}와 OBV를 함께 보면 가격 움직임에 거래가 동반되는지 살펴보실 수 있습니다. ' if vol_ratio is not None else '최근 거래량을 확인하기 어렵습니다. ')+ '해당 지표는 기관 매수의 직접적인 증거는 아닙니다.'
+    else:
+        flow_label,flow_text=flow['label'],flow['text']
+    if stale:
+        action='최근 가격 자료가 지연되어 신규 진입에 관한 판단은 보류하겠습니다. 최신 거래일 자료를 확보한 뒤 다시 평가하시는 편이 적절합니다.'
+    elif score['score'] is None:
+        action='기술 지표 일부가 부족하여 진입 판단은 유보하겠습니다. 우선 데이터 확보 후 추세와 거래량의 일치 여부를 확인하시기를 권해드립니다.'
+    elif aligned and support and 0<=dist20<=6 and 45<=r.RSI<=70 and score['points']>=55 and (us or flow['score'] is None or flow['foreign']+flow['institution']>=0):
+        action=('정배열과 외국인·기관의 동반 순매수가 함께 확인되어 관심 종목으로 우선 검토하실 만합니다. 20일선 부근의 지지와 매수 지속성을 확인한 뒤 분할 접근을 고려하시는 전략이 적절합니다.'
+                if not us and flow['score'] is not None and flow['foreign']>0 and flow['institution']>0 and flow['buy_days']>=3 and flow['ratio']>=1 else
+                '추세와 가격 이격을 고려하면 관심 종목으로 검토하실 만합니다. 조정 과정에서 20일선 지지와 거래량 회복을 확인한 뒤 분할 접근을 고려하시는 편이 적절합니다.')
+    elif dist20>10 or r.RSI>75:
+        action='상승 탄력이 이어지더라도 단기 진입 부담이 커진 구간입니다. 추격 매수보다는 가격 이격이 줄어드는 조정을 기다리며 지지력을 확인하시기를 권해드립니다.'
+    elif not support and improving:
+        action='단기 반등의 단서는 나타나고 있으나 추세 전환이 확인된 단계는 아닙니다. 20일선 회복과 후속 거래량을 확인한 뒤 접근 여부를 판단하시는 편이 적절합니다.'
+    else:
+        action='현재는 신규 비중 확대보다 추세 회복을 확인하는 접근을 권해드립니다. 20일선 회복 여부와 모멘텀 개선이 함께 나타나는지 관찰하실 필요가 있습니다.'
+    if not us and flow['score'] is not None and flow['foreign']<0 and flow['institution']<0:
+        action+=' 외국인과 기관의 동반 매도가 이어지고 있어, 기술적 반등만으로 비중을 늘리는 데에는 신중한 접근이 필요합니다.'
+    positives=[];risks=[]
+    (positives if support else risks).append(trend_text)
+    (positives if improving else risks).append(momentum_text)
+    if not us:
+        (positives if flow['score'] is not None and flow['score']>=60 else risks).append(flow_text)
+    else:
+        positives.append(flow_text)
+    if abs(dist20)>10: risks.append(f'20일선 대비 이격은 {dist20:+.1f}%로, 평소보다 가격 변동과 진입 위치를 세심하게 점검할 필요가 있습니다.')
+    logs=score['logs']
+    earned=logs[logs['득점'].fillna(0)>0].sort_values('득점',ascending=False)
+    limited=logs[logs['득점'].isna() | (logs['득점']<logs['배점'])]
+    headlines=[item.get('title','') for item in (news_result.data if news_result is not None else [])][:3]
+    return {'view':trend_text+' '+momentum_text+' '+action,'action':action,'flow_text':flow_text,'flow':flow,
+            'positives':positives,'risks':risks,'trend_label':trend,'flow_label':flow_label,'momentum_label':momentum,
+            'news_label':'기사 확인' if headlines else '자료 대기','headlines':headlines,
+            'dist20':dist20,'dist60':dist60,
+            'contributors':[f"{x['항목']}: {x['득점']:g}/{x['배점']}점 — {x['근거']}" for x in earned.to_dict('records')],
+            'limiters':[f"{x['항목']}: {'미확인' if pd.isna(x['득점']) else format(x['득점'],'g')} / {x['배점']}점 — {x['근거']}" for x in limited.to_dict('records')]}
+
+
+def render_research_cards(research):
+    st.markdown('#### 🧠 종합 리서치 코멘트')
+    st.info(research['view'])
+    cols=st.columns(3)
+    for box,label,key in zip(cols,['추세','수급·거래량','모멘텀'],['trend_label','flow_label','momentum_label']):
+        box.metric(label,research[key])
+    st.markdown('**수급·거래량 해석**')
+    st.write(research['flow_text'])
+    st.caption('지표에 따른 조건부 해석입니다. 수익 확률이나 매수 적합성이 검증된 추천 모델은 아닙니다.')
+
+
+
 def main():
-    st.set_page_config(page_title="개미 투자전략실", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="퀀트 투자전략실", page_icon="📊", layout="wide")
     st.markdown("""<style>
     :root {
         --bg:#070b12;
@@ -3528,7 +3514,7 @@ def main():
     </style>""", unsafe_allow_html=True)
     st.markdown("""<div class="hero">
       <div class="hero-badge">● 데이터 기반 투자 리서치</div>
-      <div class="hero-title">개미 투자전략실</div>
+      <div class="hero-title">퀀트 투자전략실</div>
       <div class="hero-subtitle">차트 · 수급 · 실적 · 전략 검증을 한 화면에서 분석합니다.</div>
       <div class="hero-meta">
         <span class="hero-chip">KOSPI · KOSDAQ · NASDAQ · NYSE</span>
