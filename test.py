@@ -1,18 +1,25 @@
 # -*- coding: utf-8 -*-
-"""퀀트 투자전략실 — 데이터 기반 주식 분석 플랫폼
+"""개미 투자전략실 — 데이터 기반 주식 분석 플랫폼
 
 GitHub에 있는 기존 실행 .py 파일의 내용을 이 파일 전체로 교체하십시오.
 기존 파일명과 실행 설정은 유지하실 수 있습니다.
 core.py, providers.py, fdr_worker.py, 테마 설정 파일을 별도로 올릴 필요가 없습니다.
 
-실행: python -m streamlit run app.py
+실행: python -m streamlit run test.py
 필요 패키지(기존 앱과 동일):
     streamlit, finance-datareader, numpy, pandas, plotly, requests, beautifulsoup4
 권장 Python: 3.12. 기존 requirements.txt는 설치 목록이므로 유지하십시오.
+추가 API 키는 필요하지 않습니다. 미국 뉴스는 영문 헤드라인입니다.
+출처 문서:
+    https://github.com/FinanceData/FinanceDataReader
+    https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs
+미국 탐지기 순위는 사용자가 입력한 최대 30개 종목의 표본 순위입니다.
+미국 재무/수급을 제외한 종합점수는 미확인 배점을 환산하지 않습니다.
 
 데이터 수집 실패는 미확인으로 표시하며 임의 가격으로 대체하지 않습니다.
 공매도 자동 수집은 미제공이며 선택적 CSV 입력을 사용합니다.
-이 파일로 합치는 과정에서 이전 수정본의 계산·데이터 처리 규칙은 유지했습니다.
+v5.4: 독립 종목 디렉터리, 한국 KRX 백업, 미국 NASDAQ/NYSE 분석 및 표본 탐지기.
+미국 재무/수급 미제공 항목은 미확인 처리합니다. 외부 공급원 접근은 배포 환경에 따라 실패할 수 있습니다.
 """
 from __future__ import annotations
 
@@ -76,15 +83,6 @@ def clean_history(frame):
     return df.astype(float)
 
 
-def completed_history(frame, now=None):
-    now = now or datetime.now(KST)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=KST)
-    today = pd.Timestamp(now.astimezone(KST).date())
-    # Deliberately exclude the entire current KST date, even after the close.
-    # No holiday calendar, exchange closing-time assumption, or snapshot merge.
-    df = clean_history(frame)
-    return df.loc[df.index < today].copy()
 
 
 def _oscillator(positive, negative):
@@ -218,6 +216,15 @@ def evaluate_score(df, investors, fund, short=None):
 def price_scenario(df):
     """ATR-based reference scenario. No claimed trend support or executable ticks."""
     price, atr = float(df.Close.iloc[-1]), number(df.ATR14.iloc[-1])
+    if df.attrs.get("region") == "US":
+        if atr is None or atr <= 0 or price <= 0:
+            return None
+        d = min(max(atr, price * 0.01), price * 0.15)
+        values = [round(v, 2) for v in [price - d * 2.5, price - d, price - d * .5, price + d * 1.5, price + d * 3]]
+        stop, e2, e1, t1, t2 = values
+        if not (0 < stop < e2 < e1 < price < t1 < t2):
+            return None
+        return {"1차 참고 진입가": e1, "2차 참고 진입가": e2, "1차 참고 목표가": t1, "2차 참고 목표가": t2, "참고 손절가": stop, "reward_risk": (t1-e1)/(e1-stop)}
     if atr is None or atr <= 0 or price < 10:
         return None
     distance = min(max(atr, price * 0.01), price * 0.15)
@@ -342,7 +349,6 @@ def market_rankings(stocks):
     return df.sort_values(["ScreenScore", "AmountEstimate"], ascending=False).reset_index(drop=True)
 
 # ===== 2. 데이터 수집 (일봉 수집 코드도 이 파일에 포함) =====
-_FDR_WORKER_CODE = '"""A killable FDR worker; prevents upstream requests without timeouts hanging UI."""\nimport contextlib\nimport re\nimport sys\n\n\ndef main():\n    if len(sys.argv) != 4 or not re.fullmatch(r"\\d{6}", sys.argv[1]):\n        raise ValueError("Expected code, start, end")\n    # Keep stdout machine-readable even if FDR writes progress text.\n    with contextlib.redirect_stdout(sys.stderr):\n        import FinanceDataReader as fdr\n        frame = fdr.DataReader(f"NAVER:{sys.argv[1]}", sys.argv[2], sys.argv[3])\n    if frame is None or frame.empty:\n        raise ValueError("No daily prices returned")\n    print(frame.to_json(orient="split", date_format="iso"))\n\n\nif __name__ == "__main__":\n    main()\n'
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -457,7 +463,7 @@ def parse_market(body, market):
     return pd.DataFrame(rows, columns=MARKET_COLS)
 
 
-def fetch_market(pages_per_market=2):
+def _naver_market(pages_per_market=2):
     pages_per_market = max(1, min(int(pages_per_market), 5))
     jobs = [(sosok, page) for sosok in (0, 1) for page in range(1, pages_per_market + 1)]
 
@@ -479,7 +485,7 @@ def fetch_market(pages_per_market=2):
     return Result(df, BASE + "/sise/sise_market_sum.naver", "ok" if not errors else "partial" if frames else "error", notes)
 
 
-def local_search(query, stocks):
+def _original_local_search(query, stocks):
     query = query.strip()
     if not query or stocks.empty:
         return pd.DataFrame(columns=["Code", "Name"])
@@ -526,21 +532,6 @@ def search_remote(query):
         return failure(source, pd.DataFrame(columns=["Code", "Name"]), exc)
 
 
-def fetch_history(code, days=800):
-    _require_code(code)
-    today = datetime.now(KST).date()
-    source = f"FinanceDataReader / NAVER:{code}"
-    try:
-        process = subprocess.run(
-            [sys.executable, "-c", _FDR_WORKER_CODE, code,
-             str(today - timedelta(days=days)), str(today)],
-            capture_output=True, text=True, encoding="utf-8", timeout=25, check=True,
-        )
-        data = json.loads(process.stdout)
-        frame = pd.DataFrame(data["data"], columns=data["columns"], index=pd.to_datetime(data["index"]))
-        return Result(frame, source)
-    except Exception as exc:
-        return failure(source, pd.DataFrame(), exc)
 
 
 def empty_fund():
@@ -885,13 +876,13 @@ def resolve_pending(stocks):
 def render_rankings(result):
     st.markdown("#### 📡 오늘의 시장 흐름")
     st.caption(result.notes[0])
-    st.button("시장 데이터 새로고침", key="refresh_market", on_click=cached_market.clear, use_container_width=True)
+    st.button("시장 데이터 새로고침", key="refresh_market", on_click=refresh_market_sources, use_container_width=True)
     if result.status != "ok":
         st.warning("일부 또는 전체 페이지를 수집하지 못했습니다. 확보된 종목만 표시합니다.")
 
     ranked = market_rankings(result.data)
     if ranked.empty:
-        st.info("시장 흐름을 계산할 유효한 시세가 없습니다. 종목코드로 개별 분석을 진행하실 수 있습니다.")
+        render_kr_daily_sample()
         return
 
     st.info(
@@ -1077,7 +1068,7 @@ def render_backtest(df):
     if not result["trades"].empty:
         st.dataframe(result["trades"].drop(columns=["Capital", "Units"]), hide_index=True, use_container_width=True)
     st.download_button("백테스트 일별 결과 CSV", bt.to_csv().encode("utf-8-sig"),
-                       file_name=f"backtest_{st.session_state.selected_code}.csv", mime="text/csv")
+                       file_name=f"backtest_{st.session_state.get('us_selected', '') if st.session_state.get('market_region') == '🇺🇸 미국주식' else st.session_state.selected_code}.csv", mime="text/csv")
 
 
 
@@ -1776,7 +1767,7 @@ def _resolve_horse_query(query, market_result):
         return []
 
     frames = []
-    if market_result is not None and not market_result.data.empty:
+    if market_result is not None:
         local = local_search(query, market_result.data)
         if not local.empty:
             frames.append(local)
@@ -1835,7 +1826,7 @@ def _render_horse_leaderboard(out):
 
 
 @st.cache_data(ttl=600, max_entries=4, show_spinner=False)
-def cached_horse_kospi_universe(max_pages=20):
+def _naver_horse_universe(max_pages=20):
     """Fetch KOSPI market-cap pages only. Lightweight first-stage universe collection."""
     max_pages = max(1, min(int(max_pages), 25))
     jobs = [(0, page) for page in range(1, max_pages + 1)]
@@ -1861,6 +1852,9 @@ def _horse_prefilter_kospi(stocks, deep_count=60):
     """Diversified lightweight pre-filter so deep OHLCV calls stay bounded."""
     if stocks is None or stocks.empty:
         return stocks
+    if 'AsOf' in stocks.columns and stocks.Marcap.isna().all():
+        # 시장 전체 수집 장애 시 명시된 기본 종목 표본만 정밀 분석합니다.
+        return stocks[(stocks.Close > 0) & (stocks.Volume > 0)].head(deep_count).copy()
     df = stocks.copy()
     for col in ["Close", "Chg", "Volume", "Marcap"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -2161,6 +2155,12 @@ def render_running_horse(market_result):
 
 def render_original_workspace(market):
     resolve_pending(market.data)
+    with st.expander("종목명 검색 목록 상태"):
+        st.caption("종목명 목록과 시장 시세는 별도로 수집합니다. 기본 이름 별칭에는 가격 정보가 없습니다.")
+        if st.button("종목명 목록 새로고침", key="refresh_kr_directory"):
+            stock_directory.clear('KR')
+            cached_search.clear()
+            st.rerun()
     left, right = st.columns([7, 3])
     with right:
         render_rankings(market)
@@ -2505,6 +2505,9 @@ def _oversold_prefilter_kospi(stocks, deep_count=80):
     """시총·유동성 중심 1차 압축. 실제 낙폭은 일봉 조회 후 계산합니다."""
     if stocks is None or stocks.empty:
         return stocks
+    if 'AsOf' in stocks.columns and stocks.Marcap.isna().all():
+        # 시장 전체 수집 장애 시 명시된 기본 종목 표본만 정밀 분석합니다.
+        return stocks[(stocks.Close > 0) & (stocks.Volume > 0)].head(deep_count).copy()
     df = stocks.copy()
     for col in ["Close", "Chg", "Volume", "Marcap"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -2821,6 +2824,447 @@ def render_oversold_hunter(market_result):
 점수가 높더라도 '많이 빠졌으니 오른다'는 의미가 아닙니다. **실적 추정치 방향 + 저점 상향 + 거래량을 동반한 20일선 회복**을 최종 확인 신호로 보십시오.
 """)
 
+# ===== 6. 한국/미국 독립 종목 검색 및 공급원 장애 복구 =====
+# 가격이 없는 내장 목록은 이름 검색만 돕습니다. 시세나 랭킹에 사용하지 않습니다.
+SEED_KR = [('009830', '한화솔루션'), ('005930', '삼성전자'), ('000660', 'SK하이닉스'),
+           ('035420', 'NAVER'), ('035720', '카카오'), ('005380', '현대차'),
+           ('000270', '기아'), ('042660', '한화오션'), ('012450', '한화에어로스페이스')]
+SEED_US = [('NVDA', 'NVIDIA 엔비디아'), ('AAPL', 'Apple 애플'), ('TSLA', 'Tesla 테슬라'),
+           ('PLTR', 'Palantir 팔란티어'), ('AMD', 'Advanced Micro Devices AMD'),
+           ('MSFT', 'Microsoft 마이크로소프트'), ('AMZN', 'Amazon 아마존'),
+           ('GOOGL', 'Alphabet 알파벳 구글'), ('META', 'Meta 메타'),
+           ('AVGO', 'Broadcom 브로드컴'), ('JPM', 'JPMorgan 제이피모건'),
+           ('V', 'Visa 비자'), ('WMT', 'Walmart 월마트'), ('XOM', 'Exxon Mobil 엑슨모빌'),
+           ('BRK.B', 'Berkshire Hathaway 버크셔 해서웨이')]
+EXCHANGE_TZ = {'KR': KST, 'US': ZoneInfo('America/New_York')}
+
+# 자식 프로세스로 외부 라이브러리의 무기한 대기를 제한합니다.
+_DATA_WORKER = r'''
+import sys, json, contextlib
+import FinanceDataReader as fdr
+with contextlib.redirect_stdout(sys.stderr):
+    df = fdr.StockListing(sys.argv[2]) if sys.argv[1] == 'listing' else fdr.DataReader(sys.argv[2], sys.argv[3], sys.argv[4])
+print(df.to_json(orient='split', date_format='iso'))
+'''
+
+
+def fdr_table(kind, symbol, days=800):
+    today = datetime.now(KST).date()
+    result = subprocess.run([sys.executable, '-c', _DATA_WORKER, kind, symbol,
+                             str(today - timedelta(days=days)), str(today)],
+                            capture_output=True, text=True, encoding='utf-8', timeout=22, check=True)
+    payload = json.loads(result.stdout)
+    return pd.DataFrame(payload['data'], columns=payload['columns'], index=payload['index'])
+
+
+def normalize_directory(frame, region):
+    df = frame.rename(columns={'Symbol': 'Code', 'Security Name': 'Name', '회사명': 'Name', '종목코드': 'Code'}).copy()
+    if not {'Code', 'Name'}.issubset(df):
+        raise ValueError('종목 목록의 필수 열을 확인하지 못했습니다.')
+    df = df.dropna(subset=['Code', 'Name'])
+    df['Code'] = df.Code.astype(str).str.strip().str.upper()
+    if region == 'KR':
+        df['Code'] = df.Code.str.zfill(6)
+        df = df[df.Code.map(valid_code)]
+    else:
+        df = df[df.Code.str.fullmatch(r'[A-Z]{1,6}(?:[.-][A-Z]{1,2})?')]
+    return df.drop_duplicates('Code').reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400, max_entries=2, show_spinner=False)
+def stock_directory(region):
+    seeds = pd.DataFrame(SEED_KR if region == 'KR' else SEED_US, columns=['Code', 'Name'])
+    frames, notes = [], []
+    if region == 'KR':
+        # KIND 상장회사 목록은 네이버 시장 랭킹과 독립된 이름/코드 공급원입니다.
+        try:
+            body = request_bytes('https://kind.krx.co.kr/corpgeneral/corpList.do',
+                                 {'method': 'download', 'searchType': '13'})
+            frame = pd.read_html(StringIO(body.decode('euc-kr', errors='replace')), converters={'종목코드': str})[0]
+            frames.append(normalize_directory(frame, region))
+            notes.append('KRX KIND 상장회사 목록')
+        except Exception:
+            try:
+                frames.append(normalize_directory(fdr_table('listing', 'KRX-DESC'), region))
+                notes.append('FinanceDataReader KRX-DESC')
+            except Exception:
+                notes.append('전체 한국 종목 목록 수집 실패')
+    else:
+        for filename, symbol_col in [('nasdaqlisted.txt', 'Symbol'), ('otherlisted.txt', 'ACT Symbol')]:
+            try:
+                body = request_bytes('https://www.nasdaqtrader.com/dynamic/SymDir/' + filename)
+                df = pd.read_csv(StringIO(body.decode('utf-8-sig')), sep='|', dtype=str)
+                df = df[df['Test Issue'].eq('N')]
+                if 'ETF' in df:
+                    df = df[df.ETF.eq('N')]
+                if 'Exchange' in df:
+                    df = df[df.Exchange.eq('N')]  # NYSE only; NASDAQ comes from first file.
+                df = df.rename(columns={symbol_col: 'Code', 'Security Name': 'Name'})
+                frames.append(normalize_directory(df, region))
+                notes.append(filename)
+            except Exception:
+                notes.append(filename + ' 수집 실패')
+        if not frames:
+            for exchange in ['NASDAQ', 'NYSE']:
+                try:
+                    frames.append(normalize_directory(fdr_table('listing', exchange), region))
+                    notes.append('FinanceDataReader ' + exchange)
+                except Exception:
+                    notes.append(exchange + ' 대체 목록 실패')
+    count = sum(len(f) for f in frames)
+    # 한글 별칭은 원래 회사명에 덧붙여 영문 검색도 보존합니다.
+    df = pd.concat(frames + [seeds], ignore_index=True).drop_duplicates('Code')
+    aliases = dict(seeds.values)
+    df['Name'] = [str(n) + (' / ' + aliases[c] if c in aliases and aliases[c] != n else '') for c, n in zip(df.Code, df.Name)]
+    return Result(df[['Code', 'Name']], ' · '.join(notes), 'ok' if count and not any('실패' in n for n in notes) else 'partial',
+                  [f'검색 전용 목록 {len(df):,}개 · 가격 없음', '전체 목록 실패 시 내장 이름 별칭과 직접 코드/티커 입력을 지원합니다.'])
+
+
+
+
+def local_search(query, stocks):
+    # 세 한국 탭의 검색이 시장 스냅샷 실패와 무관하게 동작합니다.
+    directory = stock_directory('KR').data
+    merged = pd.concat([stocks[['Code', 'Name']], directory], ignore_index=True).drop_duplicates('Code')
+    return _original_local_search(query, merged)
+
+
+def us_search(query, directory):
+    q = query.strip()
+    if not q:
+        return directory.iloc[:0]
+    codes = directory.Code.str.upper()
+    exact = codes.eq(q.upper())
+    names = directory.Name.str.contains(q, case=False, regex=False, na=False)
+    matches = directory[exact | codes.str.startswith(q.upper()) | names]
+    return pd.concat([directory[exact], matches]).drop_duplicates('Code').head(15)
+
+
+@st.cache_data(ttl=300, max_entries=2, show_spinner=False)
+def kr_market_backup():
+    try:
+        df = normalize_directory(fdr_table('listing', 'KRX'), 'KR')
+        df = df.rename(columns={'ChagesRatio': 'Chg', 'ChangeRatio': 'Chg'})
+        if not set(MARKET_COLS).issubset(df):
+            raise ValueError('KRX 시세 열 부족')
+        for col in ['Close', 'Chg', 'Volume', 'Marcap']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['Close', 'Chg', 'Volume', 'Marcap'])
+        df = df[(df.Close > 0) & (df.Volume >= 0) & (df.Marcap > 0)]
+        if df.empty:
+            raise ValueError('KRX 시세 없음')
+        return Result(df[MARKET_COLS], 'FinanceDataReader / KRX', notes=[f'KRX 시장 스냅샷 {len(df):,}종목 · 체결 기준시각 미제공'])
+    except Exception as exc:
+        return failure('FinanceDataReader / KRX', pd.DataFrame(columns=MARKET_COLS), exc)
+
+
+
+
+def fetch_market(pages_per_market=2):
+    primary = _naver_market(pages_per_market)
+    if primary.status == 'ok':
+        return primary
+    backup = kr_market_backup()
+    if not backup.data.empty:
+        backup.notes += ['네이버 수집 장애로 KRX 대체 공급원 사용']
+        return backup
+    primary.notes += ['KRX 대체 공급원도 조회 실패. 이름 검색과 개별 일봉 조회는 별도로 이용할 수 있습니다.']
+    return primary
+
+
+
+
+@st.cache_data(ttl=600, max_entries=4, show_spinner=False)
+def cached_horse_kospi_universe(max_pages=20):
+    # 20페이지의 실패 요청을 반복하기 전에 현재 시장과 KRX 대체 공급원을 확인합니다.
+    market = cached_market()
+    if market.source == 'FinanceDataReader / KRX':
+        df = market.data[market.data.Market.eq('KOSPI')].copy()
+        return Result(df, market.source, notes=[f'KRX KOSPI {len(df)}종목'])
+    if market.data.empty:
+        return cached_kr_daily_sample()
+    return _naver_horse_universe(max_pages)
+
+
+def yahoo_history(symbol, region, days=800):
+    from urllib.parse import quote
+    tz = EXCHANGE_TZ[region]
+    end = datetime.now(tz)
+    url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='')
+    payload = json.loads(request_bytes(url, {'period1': int((end - timedelta(days=days)).timestamp()),
+                                           'period2': int(end.timestamp()), 'interval': '1d'}))
+    chart = payload['chart']
+    if chart.get('error') or not chart.get('result'):
+        raise ValueError('Yahoo 일봉 없음')
+    item = chart['result'][0]
+    if region == 'US' and item.get('meta', {}).get('currency') != 'USD':
+        raise ValueError('USD 종목이 아닙니다.')
+    values = item['indicators']['quote'][0]
+    index = pd.to_datetime(item['timestamp'], unit='s', utc=True).tz_convert(tz).tz_localize(None).normalize()
+    frame = pd.DataFrame({col: values[col.lower()] for col in OHLCV}, index=index)
+    # 완전히 비어 있는 공급원 행만 제거; 일부 결측/비정상 봉은 clean_history에서 거부합니다.
+    frame = frame.dropna(how='all')
+    return clean_history(frame)
+
+
+def fetch_history(code, days=800, region='KR'):
+    if region == 'KR':
+        _require_code(code)
+        sources = [('fdr', 'NAVER:' + code), ('fdr', 'KRX:' + code)]
+    else:
+        if not re.fullmatch(r'[A-Z]{1,6}(?:[.-][A-Z]{1,2})?', str(code)):
+            return failure('US', pd.DataFrame(), ValueError('티커 형식 오류'))
+        sources = [('yahoo', code.replace('.', '-')), ('fdr', 'YAHOO:' + code.replace('.', '-'))]
+    errors = []
+    for kind, symbol in sources:
+        try:
+            df = yahoo_history(symbol, region, days) if kind == 'yahoo' else fdr_table('history', symbol, days)
+            df = clean_history(df)
+            df.attrs['region'] = region
+            return Result(df, ('Yahoo chart / ' if kind == 'yahoo' else 'FinanceDataReader / ') + symbol,
+                          notes=errors + ['공급원별 기업행사/수정주가 방식이 다를 수 있습니다.'])
+        except Exception as exc:
+            errors.append(symbol + ': ' + type(exc).__name__)
+    return Result(pd.DataFrame(), ' / '.join(s for _, s in sources), 'error', errors)
+
+
+def completed_history(frame, now=None):
+    region = frame.attrs.get('region', 'KR')
+    tz = EXCHANGE_TZ[region]
+    now = now or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    copy = frame.copy()
+    if isinstance(copy.index, pd.DatetimeIndex) and copy.index.tz is not None:
+        copy.index = copy.index.tz_convert(tz).tz_localize(None)
+    df = clean_history(copy)
+    df = df.loc[df.index < pd.Timestamp(now.astimezone(tz).date())].copy()
+    df.attrs['region'] = region
+    return df
+
+
+@st.cache_data(ttl=600, max_entries=128, show_spinner=False)
+def cached_us_history(code):
+    return fetch_history(code, region='US')
+
+
+@st.cache_data(ttl=900, max_entries=64, show_spinner=False)
+def cached_us_news(code):
+    source = 'https://news.google.com/rss/search'
+    try:
+        body = request_bytes(source, {'q': f'"{code}" stock', 'hl': 'en-US', 'gl': 'US', 'ceid': 'US:en'})
+        return Result(parse_news(body), source)
+    except Exception as exc:
+        return failure(source, [], exc)
+
+
+def us_profile(code):
+    result = cached_us_history(code)
+    if result.status == 'error':
+        return {'Code': code, 'error': ' / '.join(result.notes)}
+    try:
+        df = add_indicators(completed_history(result.data))
+        if len(df) < 61:
+            raise ValueError('최소 61개 확정 일봉이 필요합니다.')
+        horse = running_horse_score(result.data)
+        oversold = oversold_technical_profile(result.data)
+        score = evaluate_score(df, pd.DataFrame(columns=INV_COLS), empty_fund())
+        return {'Code': code, 'df': df, 'horse': horse, 'oversold': oversold, 'score': score,
+                'source': result.source, 'fetched_at': result.fetched_at}
+    except Exception as exc:
+        return {'Code': code, 'error': str(exc)}
+
+
+@st.cache_data(ttl=1800, max_entries=1, show_spinner=False)
+def cached_kr_daily_sample():
+    """Verified completed bars only. Missing market caps stay missing."""
+    def get(pair):
+        code, name = pair
+        result = fetch_history(code)
+        if result.status == 'error':
+            return None
+        df = completed_history(result.data)
+        if len(df) < 2 or (datetime.now(KST).date() - df.index[-1].date()).days > 7:
+            return None
+        return {'Code': code, 'Name': name, 'Market': 'KOSPI',
+                'Close': float(df.Close.iloc[-1]), 'Chg': period_return(df, 1),
+                'Volume': float(df.Volume.iloc[-1]), 'Marcap': np.nan,
+                'AsOf': df.index[-1], 'AmountEstimate': float(df.Close.iloc[-1] * df.Volume.iloc[-1])}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        rows = [row for row in pool.map(get, SEED_KR) if row is not None]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # 서로 다른 날짜를 같은 일간 순위로 섞지 않습니다.
+        df = df[df.AsOf.eq(df.AsOf.max())].reset_index(drop=True)
+    else:
+        df = pd.DataFrame(columns=MARKET_COLS + ['AsOf', 'AmountEstimate'])
+    return Result(df, '기본 한국 종목의 확정 일봉 표본', 'partial' if len(df) else 'error',
+                  [f'기본 {len(SEED_KR)}종목 중 동일 기준일 {len(df)}종목 · 전체 시장/당일 실시간 순위가 아닙니다.'])
+
+
+def refresh_market_sources():
+    cached_market.clear()
+    kr_market_backup.clear()
+    cached_kr_daily_sample.clear()
+    cached_horse_kospi_universe.clear()
+
+
+def render_kr_daily_sample():
+    st.info('시장 전체 시세를 조회하지 못했습니다. 종목명 검색과 개별 분석은 계속 이용할 수 있습니다.')
+    if st.button('확정 일봉으로 기본 표본 흐름 조회', key='load_kr_daily_sample'):
+        st.session_state.show_kr_daily_sample = True
+    if not st.session_state.get('show_kr_daily_sample'):
+        return
+    with st.spinner('기본 종목의 확정 일봉을 조회하고 있습니다…'):
+        result = cached_kr_daily_sample()
+    st.caption(result.notes[0])
+    if result.data.empty:
+        st.warning('개별 일봉 표본도 수집하지 못했습니다. 잠시 후 새로고침해 주십시오.')
+        return
+    st.caption(f"확정 일봉 기준: {result.data.AsOf.max():%Y-%m-%d} · 시가총액 주목도 점수는 산출하지 않습니다.")
+    for row in result.data.sort_values('Chg', ascending=False).itertuples():
+        st.button(f'{row.Name} · {row.Chg:+.2f}%', key='daily_sample_' + row.Code,
+                  on_click=select_stock, args=(row.Code, row.Name), use_container_width=True)
+        st.caption(f'{row.Close:,.0f}원 · 종가×거래량 추정 {row.AmountEstimate/1e8:,.1f}억원')
+
+
+def render_us_workspace():
+    st.caption('NASDAQ · NYSE | USD | 뉴욕 현지 당일 봉 제외 | 한국/미국 점수는 데이터 범위가 다릅니다.')
+    directory = stock_directory('US')
+    if directory.status != 'ok':
+        st.info('미국 종목 목록의 일부 또는 전체를 수집하지 못했습니다. 기본 별칭 검색 또는 티커 직접 입력을 이용해 주십시오.')
+    query = st.text_input('미국 종목 검색', placeholder='NVDA, 애플, Tesla, Palantir', key='us_query')
+    matches = us_search(query, directory.data)
+    options = {row.Code: row.Name for row in matches.itertuples()}
+    raw = query.strip().upper()
+    if re.fullmatch(r'[A-Z]{1,6}(?:[.-][A-Z]{1,2})?', raw):
+        options.setdefault(raw, '직접 티커 조회')
+    if options:
+        chosen = st.selectbox('분석 종목', list(options), format_func=lambda c: f'{c} · {options[c]}', key='us_choice')
+        if st.button('미국 종목 정밀 분석', type='primary'):
+            st.session_state.us_selected = chosen
+    elif query:
+        st.info('검색 결과가 없습니다. 회사의 미국 상장 티커를 입력해 주십시오.')
+    if st.button('미국 데이터 새로고침'):
+        cached_us_history.clear()
+        cached_us_news.clear()
+        stock_directory.clear('US')
+        st.session_state.pop('us_scan_horse', None)
+        st.session_state.pop('us_scan_oversold', None)
+        st.rerun()
+    main_tab, horse_tab, over_tab = st.tabs(['📊 종합 분석', '🐎 달리는 말 탐지기', '💎 과대낙폭 유망주'])
+    selected = st.session_state.get('us_selected', '')
+    profile = None
+    if selected:
+        with st.spinner(f'{selected} 미국 일봉 조회 중…'):
+            profile = us_profile(selected)
+    with main_tab:
+        if not profile:
+            st.info('종목을 검색하고 정밀 분석을 눌러 주십시오.')
+        elif 'error' in profile:
+            st.error(profile['error'])
+        else:
+            df, score = profile['df'], profile['score']
+            st.subheader(selected + ' · USD')
+            st.caption(f"일봉 기준 {df.index[-1]:%Y-%m-%d} · {profile['source']} · 조회 {profile['fetched_at']}")
+            if (datetime.now(EXCHANGE_TZ['US']).date() - df.index[-1].date()).days > 7:
+                st.warning('최근 일봉이 7일 이상 경과했습니다. 거래정지 또는 수집 지연을 확인해 주십시오.')
+            cols = st.columns(4)
+            cols[0].metric('확정 종가', '$' + fmt(df.Close.iloc[-1], digits=2))
+            cols[1].metric('5거래일', fmt(period_return(df, 5), '%', 2, True))
+            cols[2].metric('20거래일', fmt(period_return(df, 20), '%', 2, True))
+            cols[3].metric('RSI', fmt(df.RSI.iloc[-1], digits=1))
+            st.metric('종합점수 중 확인된 득점', f"{score['points']} / 확인 배점 {score['possible']}")
+            st.caption('100점 종합등급은 보류합니다. 미국 재무·기관 수급·공매도 공급원을 연결하지 않아 기술 지표만 평가합니다. 부족한 배점을 환산하지 않습니다.')
+            scenario = price_scenario(df)
+            if scenario:
+                cols = st.columns(5)
+                for box, label in zip(cols, ["1차 참고 진입가", "2차 참고 진입가", "1차 참고 목표가", "2차 참고 목표가", "참고 손절가"]):
+                    box.metric(label, '$' + fmt(scenario[label], digits=2))
+                st.caption('ATR 변동성으로 계산한 가격 시나리오입니다. 애널리스트 목표가나 주문 가격이 아닙니다.')
+            direction = '20일 이동평균 위' if df.Close.iloc[-1] > df.MA20.iloc[-1] else '20일 이동평균 아래'
+            st.write(f"현재 확정 종가는 {direction}에 있습니다. RSI는 {df.RSI.iloc[-1]:.1f}, 최근 20거래일 수익률은 {period_return(df, 20):+.2f}%입니다.")
+            st.caption('코멘트와 점수는 공개된 기술 규칙에 따른 계산이며 생성형 AI 분석은 아닙니다.')
+            render_chart(df)
+            st.bar_chart(df.Volume.tail(100), height=150)
+            with st.expander('채점 근거'):
+                st.dataframe(score['logs'], hide_index=True, use_container_width=True)
+            with st.expander('개미 백테스트'):
+                render_backtest(df)
+            with st.expander('뉴스 브리핑'):
+                news = cached_us_news(selected)
+                if not news.data:
+                    st.caption('뉴스를 수집하지 못했습니다.')
+                else:
+                    for item in news.data:
+                        st.markdown(f"- [{item.get('Title', item.get('title', '뉴스'))}]({item.get('Link', item.get('link', '#'))})")
+    with horse_tab:
+        st.subheader('🐎 미국 달리는 말 탐지기')
+        if profile and 'error' not in profile:
+            horse = profile['horse']
+            if horse:
+                st.metric(selected + ' 기술 모멘텀', f"{horse['score']} / 100")
+                st.write(horse['status'])
+                st.dataframe(horse['detail'], hide_index=True)
+            else:
+                st.info('모멘텀 탐지에는 최소 130개 확정 일봉이 필요합니다.')
+        render_us_scan('horse')
+    with over_tab:
+        st.subheader('💎 미국 과대낙폭 유망주 · 기술 예비 후보')
+        st.caption('낙폭·반등 기술점수 최대 55점입니다. 재무 건전성·실적 전망을 검증한 유망주 확정 판정은 제공하지 않습니다.')
+        if profile and 'error' not in profile:
+            over = profile['oversold']
+            if over:
+                st.metric(selected + ' 낙폭·반등', f"{over['technical_score']} / 55", f"52주 고점 대비 {over['dd52']:.1f}%", delta_color='off')
+                st.dataframe(pd.DataFrame(over['detail']), hide_index=True)
+            else:
+                st.info('과대낙폭 탐지에는 최소 260개 확정 일봉이 필요합니다.')
+        render_us_scan('oversold')
+
+
+def render_us_scan(mode):
+    default = ', '.join(c for c, _ in SEED_US)
+    text = st.text_area('스캔할 티커 목록 (최대 30개)', value=default, key='us_scan_input_' + mode)
+    st.caption('입력한 표본 안에서만 비교합니다. 미국 시장 전체 순위가 아닙니다. 기본 표본에는 NYSE와 NASDAQ 종목이 함께 있습니다.')
+    key = 'us_scan_' + mode
+    if st.button('후보 스캔', key='start_' + mode):
+        symbols = list(dict.fromkeys(x.upper() for x in re.split(r'[,\s]+', text.strip()) if x))
+        if len(symbols) > 30 or any(not re.fullmatch(r'[A-Z]{1,6}(?:[.-][A-Z]{1,2})?', c) for c in symbols):
+            st.error('유효한 티커를 30개 이하로 입력해 주십시오.')
+            return
+        rows, failures = [], []
+        progress = st.progress(0, text='미국 후보 조회 중…')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(us_profile, c): c for c in symbols}
+            from concurrent.futures import as_completed
+            for i, future in enumerate(as_completed(futures)):
+                try:
+                    item = future.result()
+                    candidate = item.get(mode)
+                    if 'error' in item or not candidate:
+                        failures.append(futures[future] + ': ' + item.get('error', '지표 준비 일봉 부족'))
+                    else:
+                        df = item['df']
+                        if (datetime.now(EXCHANGE_TZ['US']).date() - df.index[-1].date()).days > 7:
+                            raise ValueError('일봉이 7일 이상 경과하여 순위 제외')
+                        rows.append({'Ticker': item['Code'], '종가(USD)': round(df.Close.iloc[-1], 2),
+                                     '점수': candidate['score'] if mode == 'horse' else candidate['technical_score'],
+                                     '기준일': str(df.index[-1].date()), '5일(%)': period_return(df, 5)})
+                except Exception as exc:
+                    failures.append(futures[future] + ': ' + str(exc))
+                progress.progress((i + 1) / len(symbols), text=f'{i+1}/{len(symbols)} 조회')
+        st.session_state[key] = (rows, failures, len(symbols))
+    if key in st.session_state:
+        rows, failures, total = st.session_state[key]
+        st.caption(f'요청 {total}개 · 평가 성공 {len(rows)}개 · 제외 {len(failures)}개')
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values('점수', ascending=False), hide_index=True, use_container_width=True)
+        if failures:
+            with st.expander('제외 종목과 사유'):
+                st.write('\n\n'.join(failures))
+
+
+
 def main():
     st.set_page_config(page_title="개미 투자전략실", page_icon="📊", layout="wide")
     st.markdown("""<style>
@@ -3087,7 +3531,7 @@ def main():
       <div class="hero-title">개미 투자전략실</div>
       <div class="hero-subtitle">차트 · 수급 · 실적 · 전략 검증을 한 화면에서 분석합니다.</div>
       <div class="hero-meta">
-        <span class="hero-chip">KOSPI · KOSDAQ</span>
+        <span class="hero-chip">KOSPI · KOSDAQ · NASDAQ · NYSE</span>
         <span class="hero-chip">모멘텀 스크리닝</span>
         <span class="hero-chip">과대낙폭 탐색</span>
         <span class="hero-chip">외국인 · 기관 수급</span>
@@ -3102,6 +3546,10 @@ def main():
                        "oversold_auto_raw": None, "oversold_auto_top20_results": None, "oversold_auto_meta": None}.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    region = st.radio("분석 시장", ["🇰🇷 한국주식", "🇺🇸 미국주식"], horizontal=True, key="market_region")
+    if region == "🇺🇸 미국주식":
+        render_us_workspace()
+        return
     with st.spinner("시장 표본을 조회하고 있습니다…"):
         market = cached_market()
     main_tab, horse_tab, oversold_tab = st.tabs(["📊 종합 분석", "🐎 달리는 말 탐지기", "💎 과대낙폭 유망주"])
