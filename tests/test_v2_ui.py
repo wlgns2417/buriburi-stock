@@ -92,3 +92,44 @@ def test_sector_flow_news_and_us_scan():
     assert not at.exception
     assert at.session_state['v2_job_US']['cursor']==15
     assert all(p['region']=='US' for p in at.session_state['v2_profiles_US'])
+
+
+def test_automatic_radar_starts_on_menu_entry_and_keeps_manual_optional():
+    at=app()
+    assert any('개미 투자전략실' in m.value for m in at.markdown)
+    at.radio(key='v2_menu').set_value('🚨 급등 전조').run(timeout=30)
+    assert not at.exception
+    job=at.session_state['v21_job_KR']
+    assert job['cursor']==4 and len(job['profiles'])==4
+    assert all(p['evidence']['flow_known'] is False for p in job['profiles'])
+    assert any('수급 미확인' in c.value for c in at.caption)
+    at.radio(key='v2_menu').set_value('🐋 수급 추적').run(timeout=30)
+    assert not at.exception
+    assert at.session_state['v21_job_KR']['cursor']==8
+    assert any('충족한 종목이 없습니다' in m.value for m in at.info)
+
+
+def test_automatic_flow_table_has_evidence_levels_and_analysis_navigation():
+    import streamlit as st
+    st.cache_data.clear()
+    positive=r'''
+def fixture_investors(code):
+    df=completed_history(fixture_history(code).data)
+    inv=pd.DataFrame({'Date':df.index[-20:],'ForeignNet':200.,'InstitutionNet':100.,'ForeignRate':10.,'Close':df.Close.tail(20).to_numpy()})
+    inv['ForeignAmountEstimate']=inv.ForeignNet*inv.Close/1e8
+    inv['InstitutionAmountEstimate']=inv.InstitutionNet*inv.Close/1e8
+    return Result(inv, 'synthetic flow')
+fetch_investors=fixture_investors
+main()
+'''
+    at=AppTest.from_string(SOURCE+FIXTURE.rsplit('main()',1)[0]+positive).run(timeout=30)
+    at.radio(key='v2_menu').set_value('🐋 수급 추적').run(timeout=30)
+    assert not at.exception
+    tables=[x.value for x in at.dataframe if '손절 참고선' in x.value.columns]
+    assert len(tables)==1 and len(tables[0])==4
+    assert all(tables[0]['손절 참고선']<tables[0]['지지선'])
+    assert all(tables[0]['수급 확인']=='양매수 지속 확인')
+    assert all(tables[0]['선별 근거'].str.contains('양매수'))
+    at.button(key='v21_open_flow').click().run(timeout=30)
+    assert not at.exception
+    assert at.radio(key='v2_menu').value=='📊 종목 분석'

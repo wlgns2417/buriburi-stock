@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""퀀트 투자전략실 — 데이터 기반 주식 분석 플랫폼
+"""개미 투자전략실 — 데이터 기반 주식 분석 플랫폼
 
 GitHub에 있는 기존 실행 .py 파일의 내용을 이 파일 전체로 교체하십시오.
 기존 파일명과 실행 설정은 유지하실 수 있습니다.
@@ -3601,31 +3601,42 @@ def v2_pick(region,prefix):
 
 @st.cache_data(ttl=1800,max_entries=3,show_spinner=False)
 def v2_index(symbol,region):
-    try:
-        df=fdr_table('history',symbol,400)
-        df.attrs['region']=region
-        df=add_indicators(completed_history(df))
-        if len(df)<61 or (datetime.now(EXCHANGE_TZ[region]).date()-df.index[-1].date()).days>7:
-            raise ValueError('최근 지수 일봉 부족')
-        r=df.iloc[-1]
-        temperature=20*sum([r.Close>r.MA20,r.Close>r.MA60,r.MA20>df.MA20.iloc[-6],period_return(df,5)>0,period_return(df,20)>0])
-        return {'close':float(r.Close),'ret':period_return(df,1),'temperature':int(temperature),'asof':str(df.index[-1].date())}
-    except Exception:
-        return None
+    for provider in ['fdr','yahoo']:
+        try:
+            df=(fdr_table('history',symbol,400) if provider=='fdr' else
+                yahoo_history({'KS11':'^KS11','KQ11':'^KQ11','IXIC':'^IXIC'}[symbol],region,400))
+            df.attrs['region']=region
+            df=add_indicators(completed_history(df))
+            if len(df)<61 or (datetime.now(EXCHANGE_TZ[region]).date()-df.index[-1].date()).days>7:
+                raise ValueError('최근 지수 일봉 부족')
+            r=df.iloc[-1]
+            temperature=20*sum([r.Close>r.MA20,r.Close>r.MA60,r.MA20>df.MA20.iloc[-6],period_return(df,5)>0,period_return(df,20)>0])
+            return {'close':float(r.Close),'ret':period_return(df,1),'temperature':int(temperature),
+                    'asof':str(df.index[-1].date()),'source':provider}
+        except Exception:
+            continue
+    return None
 
 
 def v2_render_market(region):
     st.subheader('🧭 시장 상황판')
     st.caption('확정 일봉 기준입니다. 시장 온도는 20·60일선 상회, 20일선 상승, 5·20일 수익률 양수 각 20점이며 투자 확률이 아닙니다.')
-    if st.button('지수 상황 조회',key='v2_indices'):
+    refresh_indices=st.button('지수 상황 조회',key='v2_indices')
+    index_date=datetime.now(KST).date().isoformat()
+    if refresh_indices: v2_index.clear()
+    if refresh_indices or st.session_state.get('v21_index_date')!=index_date:
         with st.spinner('지수 일봉 확인 중…'):
-            st.session_state['v2_index_results']={name:v2_index(code,reg) for name,code,reg in [('KOSPI','KS11','KR'),('KOSDAQ','KQ11','KR'),('NASDAQ','IXIC','US')]}
+            records=[('KOSPI','KS11','KR'),('KOSDAQ','KQ11','KR'),('NASDAQ','IXIC','US')]
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                results=list(pool.map(lambda item:v2_index(item[1],item[2]),records))
+            st.session_state['v2_index_results']=dict(zip([r[0] for r in records],results))
+            st.session_state['v21_index_date']=index_date
     values=st.session_state.get('v2_index_results',{})
     for box,name in zip(st.columns(3),['KOSPI','KOSDAQ','NASDAQ']):
         item=values.get(name)
         box.metric(name,fmt(item['close'],digits=2) if item else '조회 대기·미확인',fmt(item['ret'],'%',2,True) if item else None)
         if item:
-            box.caption(f"시장 온도 {item['temperature']} / 100 · {item['asof']}")
+            box.caption(f"시장 온도 {item['temperature']} / 100 · {item['asof']} · {item.get('source','FDR')}")
     st.caption('시장 전체 외국인·기관·개인 순매수 금액은 검증된 공급원이 연결되지 않아 표시하지 않습니다.')
     profiles=st.session_state.get('v2_profiles_'+region,[])
     if profiles:
@@ -3634,8 +3645,7 @@ def v2_render_market(region):
         st.write(f'최근 스캔 표본 {len(same)}종목 중 상승 종목 {sum(p["ret1"]>0 for p in same)}개 · 기준일 {date}')
         st.caption('전체 시장의 상승 종목 비율이 아닙니다.')
         st.dataframe(v2_sector_table(same,region),hide_index=True,use_container_width=True)
-    else:
-        st.info('급등 전조나 섹터 순환에서 스캔하시면 표본 강도도 함께 표시합니다.')
+    v21_render_auto(region, 'market')
 
 
 def v2_start_job(region,records,scope):
@@ -3686,7 +3696,7 @@ def v2_scheduler(region):
         st.caption('아래 결과를 최신 상태로 보시려면 결과 갱신을 눌러 주십시오.')
 
 
-def v2_render_scan(region):
+def v2_render_scan_manual(region):
     st.subheader('🚨 급등 전조 · 종목 레이더')
     st.caption('급등을 예측하는 확률 모델이 아닙니다. 기술적 전조 조건의 충족도를 평가하며, 수급은 선택 종목에서 별도 확인합니다. 75점 이상·과열 감점 없음 조건을 충족하면 신호 이력에 자동 기록합니다.')
     scope=st.radio('스캔 범위',['직접 입력 표본','전체 목록 순차 스캔'],horizontal=True,key='v2_scope_'+region)
@@ -3786,7 +3796,7 @@ def v2_render_profile_choice(profiles,region,prefix):
     st.button('기존 종목 분석으로 이동',key='v2_open_'+prefix,on_click=v2_go_stock,args=(region,code,p['name']))
 
 
-def v2_render_sectors(region):
+def v2_render_sectors_manual(region):
     st.subheader('🔥 섹터 순환 · 표본 비교')
     st.caption('수동으로 정의한 테마 표본입니다. 공식 업종 전체 구성이나 실제 자금 유입액을 의미하지 않습니다. 같은 종목들의 전조 점수 5일 변화를 비교합니다.')
     with st.expander('테마 구성 종목'):
@@ -3813,7 +3823,7 @@ def v2_render_sectors(region):
             st.dataframe(pd.DataFrame(errors),hide_index=True)
 
 
-def v2_render_flow(region):
+def v2_render_flow_manual(region):
     st.subheader('🐋 외국인·기관 수급 추적')
     if region=='US':
         st.info('미국 기관 보유 공시는 일별 순매수 자료가 아닙니다. 한국식 연속 순매수를 추정하지 않습니다. 뉴스·공시에서 SEC 공시를 조회하실 수 있습니다.')
@@ -4018,8 +4028,306 @@ def render_v2_terminal(region):
     return True
 
 
+# ===== V2.1: 메뉴 진입 시 자동 선별, 확정 일봉 기준 =====
+V21_MODEL = 'rules-2.1'
+V21_NAMES = {'042700':'한미반도체','010120':'LS ELECTRIC','267260':'HD현대일렉트릭',
+             '298040':'효성중공업','068270':'셀트리온','207940':'삼성바이오로직스',
+             '326030':'SK바이오팜','012450':'한화에어로스페이스','064350':'현대로템',
+             '047810':'한국항공우주','373220':'LG에너지솔루션','006400':'삼성SDI','051910':'LG화학'}
+
+
+def v21_trade_levels(df):
+    """Observed reference levels, not tick-rounded executable orders."""
+    close=float(df.Close.iloc[-1]); atr=float(df.ATR14.iloc[-1])
+    support=min(float(df.Low.iloc[-11:-1].min()),close)
+    breakout=float(df.High.iloc[-21:-1].max())
+    stop=support-.5*atr
+    return {'support':support,'breakout':breakout,'stop':stop if stop>0 else None,
+            'level_basis':'지지: 직전 10일 저점 / 돌파: 직전 20일 고점 / 손절 참고: 지지−0.5 ATR(14)'}
+
+
+def v21_turnover(raw, history):
+    """Only dated observed value / same-day market cap; never close*volume."""
+    missing={'turnover':None,'turnover_multiple':None,'turnover_ok':False}
+    if raw is None or raw.empty or not {'Amount','MarCap'}.issubset(raw.columns):
+        return missing
+    raw=raw.copy()
+    raw.index=pd.to_datetime(raw.index,errors='coerce')
+    if raw.index.isna().any() or raw.index.duplicated().any() or len(history)<21:
+        return missing
+    w=raw.reindex(history.index[-21:])[['Amount','MarCap']].apply(pd.to_numeric,errors='coerce')
+    if not np.isfinite(w).all().all() or (w.Amount<0).any() or (w.MarCap<=0).any():
+        return missing
+    ratio=w.Amount/w.MarCap*100
+    baseline=ratio.iloc[:-1].mean()
+    if baseline<=0:
+        return missing
+    latest=float(ratio.iloc[-1]); multiple=float(latest/baseline)
+    return {'turnover':latest,'turnover_multiple':multiple,'turnover_ok':latest>=1 and multiple>=2}
+
+
+def v21_joint_flow(inv, df):
+    flow=assess_investor_flow(inv,df)
+    answer={'flow_ok':False,'flow_known':False,'joint_days':None,'joint_streak':None,
+            'flow_ratio':None,'flow_text':flow['text'],'foreign':None,'institution':None}
+    w=investor_window(inv,df,5,['ForeignNet','InstitutionNet'])
+    if flow['score'] is None or w is None:
+        return answer
+    joint=(w.ForeignNet>0)&(w.InstitutionNet>0)
+    days=int(joint.sum()); streak=v2_streak(joint.astype(int))
+    ok=flow['foreign']>0 and flow['institution']>0 and days>=3 and streak>=2 and flow['ratio']>=1
+    return dict(answer,flow_known=True,flow_ok=bool(ok),joint_days=days,joint_streak=streak,
+                flow_ratio=flow['ratio'],foreign=flow['foreign'],institution=flow['institution'],
+                flow_text=f"최근 5일 양매수 {days}일, 기준일 포함 {streak}일 연속; 합산 순매수/거래량 {flow['ratio']:+.2f}%. "+flow['text'])
+
+
+def v21_evidence(df, inv=None, liquidity=None):
+    if len(df)<81:
+        raise ValueError('자동 선별에는 최소 81개 확정 일봉이 필요합니다.')
+    r=df.iloc[-1]; previous=df.iloc[-2]
+    dist=(r.Close/r.MA20-1)*100
+    volbase=df.Volume.iloc[-21:-1].mean()
+    if volbase<=0 or r.Volume<=0:
+        raise ValueError('거래량이 없는 종목은 자동 선별에서 제외합니다.')
+    relvol=float(r.Volume/volbase)
+    width=(df.BB_Upper-df.BB_Lower)/df.MA20
+    compressed=bool(width.iloc[-2]<=width.iloc[-62:-2].quantile(.25))
+    breakout=bool(r.Close>df.High.iloc[-21:-1].max())
+    quality=bool(r.Close>r.MA20 and r.MA20>df.MA20.iloc[-6] and 0<=dist<=10 and 45<=r.RSI<=75)
+    volume_breakout=bool(breakout and relvol>=1.5 and r.Close>previous.Close)
+    squeeze_breakout=bool(compressed and volume_breakout)
+    flow=v21_joint_flow(inv if inv is not None else pd.DataFrame(),df)
+    turnover=v21_turnover(liquidity,df)
+    reasons=[]
+    if volume_breakout: reasons.append(f'20일 고점 종가 돌파·거래량 {relvol:.2f}배')
+    if squeeze_breakout: reasons.append('전일 밴드폭 직전 60일 하위 25% 이후 돌파')
+    if turnover['turnover_ok']: reasons.append(f"거래대금/시총 {turnover['turnover']:.2f}%·평소 {turnover['turnover_multiple']:.2f}배")
+    if flow['flow_ok']: reasons.append(f"5일 양매수 {flow['joint_days']}일·최근 {flow['joint_streak']}일 연속·매수강도 {flow['flow_ratio']:.2f}%")
+    return dict(flow,**turnover,**v21_trade_levels(df),quality=quality,volume_breakout=volume_breakout,
+                squeeze_breakout=squeeze_breakout,relvol=relvol,dist20=float(dist),reasons=reasons,
+                above20=bool(r.Close>r.MA20),above20_past=bool(df.Close.iloc[-6]>df.MA20.iloc[-6]),
+                positive5=bool(period_return(df,5)>0))
+
+
+@st.cache_data(ttl=1800,max_entries=1,show_spinner=False)
+def v21_liquidity_probe():
+    try:
+        return fdr_table('history','KRX:005930',100)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800,max_entries=96,show_spinner=False)
+def v21_liquidity(code):
+    # One failed connectivity probe stops repeated expensive KRX requests per stock.
+    probe=v21_liquidity_probe()
+    if probe.empty or not {'Amount','MarCap'}.issubset(probe.columns):
+        return pd.DataFrame()
+    if code=='005930':
+        return probe
+    try:
+        return fdr_table('history','KRX:'+code,100)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800,max_entries=256,show_spinner=False)
+def v21_profile(region,code,name):
+    try:
+        p=v2_profile(region,code,name)
+    except ValueError:
+        if region!='KR':
+            raise
+        # Yahoo is independent of Naver/KRX. A failed code is never given invented prices.
+        p=None
+        for suffix in ['.KS','.KQ']:
+            try:
+                raw=yahoo_history(code+suffix,region)
+                raw.attrs['region']=region
+                df=add_indicators(completed_history(raw))
+                if len(df)<81 or (datetime.now(EXCHANGE_TZ[region]).date()-df.index[-1].date()).days>7:
+                    continue
+                signal=v2_precursor(df)
+                p={'region':region,'code':code,'name':name,'asof':str(df.index[-1].date()),
+                   'close':float(df.Close.iloc[-1]),'ret1':period_return(df,1),'ret5':period_return(df,5),
+                   'signal':signal,'delta':signal['score']-v2_precursor(df.iloc[:-1])['score'],
+                   'delta5':signal['score']-v2_precursor(df.iloc[:-5])['score'],
+                   'technical':evaluate_technical_score(df)['score'],'trajectory':[],
+                   'df':df,'source':'Yahoo chart / '+code+suffix}
+                break
+            except Exception:
+                continue
+        if p is None:
+            raise ValueError('네이버·KRX·Yahoo 개별 일봉을 확보하지 못했습니다.')
+    inv=v2_flow(code) if region=='KR' else Result(pd.DataFrame(),'미국 일별 기관 수급 미제공')
+    p['evidence']=v21_evidence(p['df'],inv.data,v21_liquidity(code) if region=='KR' else None)
+    p['flow_source']=inv.source
+    p.pop('df',None)
+    return p
+
+
+@st.cache_data(ttl=1800,max_entries=2,show_spinner=False)
+def v21_universe(region):
+    names=dict(SEED_KR if region=='KR' else SEED_US)
+    if region=='KR': names.update(V21_NAMES)
+    codes=list(dict.fromkeys(c for group in V2_SECTORS[region].values() for c in group))
+    codes+=list(c for c in names if c not in codes)
+    scope='사전 정의 테마·주요 종목 표본 (전 종목 아님)'
+    if region=='KR':
+        market=cached_market()
+        if not market.data.empty:
+            frame=market.data.copy()
+            frame=frame[frame.Market.isin(['KOSPI','KOSDAQ'])&(frame.Marcap>=1e11)]
+            frame['activity_proxy']=frame.Close*frame.Volume
+            frame=frame.sort_values('activity_proxy',ascending=False).head(40)
+            names.update(dict(zip(frame.Code,frame.Name)))
+            codes+=list(c for c in frame.Code if c not in codes)
+            scope='테마·주요 종목 + 수집 시장표본 내 시총 1,000억원 이상 거래활동 상위 40개 (전 종목 아님)'
+    return [{'Code':c,'Name':names.get(c,c)} for c in codes],scope
+
+
+def v21_sector_breadth(profiles,region):
+    if not profiles: return pd.DataFrame()
+    date=max(p['asof'] for p in profiles)
+    rows=[]
+    for sector,codes in V2_SECTORS[region].items():
+        members={p['code']:p for p in profiles if p['code'] in codes and p['asof']==date}
+        n=len(members); coverage=n/len(codes)
+        valid=n>=2 and coverage>=.75
+        e=[p['evidence'] for p in members.values()]
+        breadth=sum(x['above20'] for x in e)/n*100 if n else None
+        delta=sum(int(x['above20'])-int(x['above20_past']) for x in e)/n*100 if n else None
+        positive=sum(x['positive5'] for x in e)/n*100 if n else None
+        ok=bool(valid and breadth>=60 and positive>=60 and delta>0)
+        rows.append({'섹터':sector,'확인/구성':f'{n}/{len(codes)}','20일선 위 비율(%)':breadth,
+                     '5일 전 대비 확산(%p)':delta,'5일 상승 비율(%)':positive,
+                     '확산 충족':ok,'상태':'상승 참여 확대' if ok else '확인 범위 부족' if not valid else '확산 조건 대기','기준일':date})
+    return pd.DataFrame(rows)
+
+
+def v21_candidates(profiles,region,view):
+    if not profiles: return []
+    latest=max(p['asof'] for p in profiles)
+    profiles=[p for p in profiles if p['asof']==latest]
+    breadth=v21_sector_breadth(profiles,region)
+    sectors=list(breadth.loc[breadth['확산 충족'],'섹터']) if not breadth.empty else []
+    rows=[]
+    for p in profiles:
+        e=p['evidence']; reasons=list(e['reasons'])
+        expanding=[s for s in sectors if p['code'] in V2_SECTORS[region][s]]
+        if expanding: reasons.append('섹터 상승 참여 확대: '+', '.join(expanding))
+        qualify=(e['flow_ok'] if view=='flow' else bool(expanding) and e['quality'] if view=='sector' else
+                 e['quality'] and (e['volume_breakout'] or e['squeeze_breakout'] or e['turnover_ok'] or e['flow_ok']))
+        if not qualify: continue
+        flow_label='양매수 지속 확인' if e['flow_ok'] else '양매수 조건 미충족' if e['flow_known'] else '수급 미확인'
+        if region=='US': flow_label='일별 기관 수급 미제공'
+        digits=0 if region=='KR' else 2
+        rows.append({'종목':p['name'],'코드':p['code'],'기준일':p['asof'],'종가':p['close'],
+                     '전조점수(보조)':p['signal']['score'],'선별 근거':' / '.join(reasons),
+                     '수급 확인':flow_label,'지지선':round(e['support'],digits),
+                     '돌파 기준선':round(e['breakout'],digits),
+                     '손절 참고선':round(e['stop'],digits) if e['stop'] is not None else None,
+                     '거래량 배수':round(e['relvol'],2),'회전율(%)':e['turnover'],
+                     '회전율 배수':e['turnover_multiple'],'가격 출처':p['source']})
+    return sorted(rows,key=lambda r:(r['전조점수(보조)'],r['거래량 배수']),reverse=True)
+
+
+def v21_new_job(region):
+    records,scope=v21_universe(region)
+    return {'records':records,'scope':scope,'cursor':0,'profiles':[],'errors':[],
+            'date':datetime.now(EXCHANGE_TZ[region]).date().isoformat(),'halted':False}
+
+
+def v21_advance(job,region):
+    if job['halted'] or job['cursor']>=len(job['records']): return
+    def worker(record):
+        try: return v21_profile(region,record['Code'],record['Name']),None
+        except Exception as exc: return None,{'코드':record['Code'],'사유':str(exc)}
+    batch=job['records'][job['cursor']:job['cursor']+4]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for profile,error in pool.map(worker,batch):
+            if profile: job['profiles'].append(profile)
+            else: job['errors'].append(error)
+    job['cursor']+=len(batch)
+    if job['cursor']>=12 and not job['profiles']:
+        job['halted']=True
+
+
+@st.fragment(run_every='3s')
+def v21_render_auto(region,view):
+    st.markdown('#### 급등 전조·수급 집중 자동 선별')
+    st.caption('확정 일봉 기반 · 한국 KRW / 미국 USD · 장중·휴장에도 최근 수집 거래일까지 분석합니다. 오늘 현지 날짜의 봉은 제외합니다.')
+    key='v21_job_'+region
+    refresh=st.button('자동 선별 다시 계산',key='v21_refresh_'+view+'_'+region)
+    if refresh:
+        v21_profile.clear();v21_universe.clear();v21_liquidity.clear();v21_liquidity_probe.clear()
+        v2_history.clear();v2_flow.clear();cached_market.clear();kr_market_backup.clear()
+    day=datetime.now(EXCHANGE_TZ[region]).date().isoformat()
+    if refresh or key not in st.session_state or st.session_state[key]['date']!=day:
+        st.session_state[key]=v21_new_job(region)
+    job=st.session_state[key]
+    with st.spinner('종목을 자동 분석 중입니다. 4종목씩 결과가 갱신됩니다…'):
+        v21_advance(job,region)
+    total=len(job['records']); done=job['cursor']>=total
+    st.progress(job['cursor']/total if total else 0,text=f"{job['cursor']}/{total}종목 확인 · 성공 {len(job['profiles'])} · 수집 실패 {len(job['errors'])}")
+    st.caption(job['scope']+' · 화면이 열려 있는 동안 자동으로 다음 종목을 분석합니다.')
+    if job['halted']:
+        st.warning('첫 12종목의 일봉 수집이 모두 실패해 자동 요청을 중단했습니다. 휴장 자체는 일봉 조회 실패 사유가 아닙니다. 공급원 접근이 복구된 뒤 다시 계산해 주십시오.')
+    profiles=job['profiles']
+    if profiles:
+        latest=max(p['asof'] for p in profiles)
+        same=[p for p in profiles if p['asof']==latest]
+        st.caption(f'분석 기준일 {latest} · 동일 날짜 {len(same)}종목 · 다른 날짜 {len(profiles)-len(same)}종목 비교 제외 · '+('완료' if done else '분석 중인 일부 결과'))
+        if view in ['sector','market']:
+            st.dataframe(v21_sector_breadth(same,region),hide_index=True,use_container_width=True)
+            st.caption('정의된 테마 표본의 상승 참여 비율입니다. 공식 업종 전체나 실제 자금 유입액이 아닙니다.')
+        rows=v21_candidates(same,region,view)
+        if rows:
+            table=pd.DataFrame(rows)
+            st.dataframe(table,hide_index=True,use_container_width=True)
+            st.download_button('선별 결과 CSV',table.to_csv(index=False).encode('utf-8-sig'),file_name=f'ant_candidates_{region}_{latest}.csv',mime='text/csv',key='v21_csv_'+view)
+            options={p['code']:p for p in same if p['code'] in set(table['코드'])}
+            selected=st.selectbox('선별 종목 근거 보기',list(options),format_func=lambda c:options[c]['name']+' ('+c+')',key='v21_choice_'+view)
+            p=options[selected];e=p['evidence']
+            st.info(p['signal']['comment']+' '+e['flow_text'])
+            st.caption(e['level_basis']+' · 가격 출처 '+p['source']+' · 수급 출처 '+p['flow_source'])
+            st.button('선별 종목 정밀 분석',key='v21_open_'+view,on_click=v2_go_stock,args=(region,p['code'],p['name']))
+        else:
+            st.info('현재까지 확인한 자료에서 이 메뉴의 선별 조건을 모두 충족한 종목이 없습니다.' if not done else '이번 분석 범위에서 선별 조건을 충족한 종목이 없습니다.')
+        missing=sum(not p['evidence']['flow_known'] for p in same)
+        turnover_missing=sum(p['evidence']['turnover'] is None for p in same)
+        st.caption(f'수급 미확인 {missing}/{len(same)} · 실제 거래대금 회전율 미확인 {turnover_missing}/{len(same)}. 미확인 항목은 충족으로 처리하지 않습니다.')
+    else:
+        st.info('분석 가능한 일봉을 아직 확보하지 못했습니다. 종목을 임의로 채우지 않습니다.')
+    with st.expander('자동 선별 계산식·제외 사유'):
+        st.write('공통 추세 필터: 종가>20일선, 20일선 5일간 상승, 20일선 이격 0~10%, RSI 45~75. 급등 전조는 이 필터와 아래 돌파·회전율·양매수 중 하나 이상을 충족해야 합니다.')
+        st.write('① 거래 동반 돌파: 종가가 직전 20일 고점을 상향 돌파하고 전일보다 상승, 거래량이 직전 20일 평균의 1.5배 이상. ② 압축 후 돌파: 전일 BB 폭이 그 이전 60일 하위 25%이고 ① 충족.')
+        st.write('③ 회전율: 실제 일별 거래대금÷같은 날 시가총액×100. 기준일 1% 이상 및 직전 20일 평균의 2배 이상. KRX 원자료 21일이 모두 있을 때만 계산합니다. 종가×거래량은 대체하지 않습니다.')
+        st.write('④ 수급 집중: 최근 5거래일 외국인·기관 각각 누적 양수, 양매수 3일 이상, 기준일까지 2일 이상 연속 양매수, 합산 순매수 수량÷같은 기간 거래량 1% 이상. 수급 추적 메뉴는 이 조건으로 독립 선별합니다.')
+        st.write('⑤ 섹터 확산: 동일 기준일 2종목 이상·정의 구성의 75% 이상 확보, 20일선 위 종목과 5일 상승 종목 각각 60% 이상, 같은 종목들의 20일선 상회 비율이 5일 전보다 증가. 섹터 종목 리스트에는 공통 추세 필터도 적용합니다.')
+        st.caption('임계값은 이 앱의 공개 규칙이며 특정 증권사 내부 모델이나 검증된 상승 확률이 아닙니다. 지지선·돌파선은 이전 봉에서 계산하며 손절 참고선은 지지선−0.5 ATR(14)입니다. 호가 단위·갭·비용을 반영한 주문가는 아닙니다. 미국에서는 일별 외인·기관 수급을 추정하지 않습니다.')
+        if job['errors']: st.dataframe(pd.DataFrame(job['errors']),hide_index=True,use_container_width=True)
+
+
+def v2_render_scan(region):
+    v21_render_auto(region,'scan')
+    with st.expander('직접 종목 입력·전체 목록 스캔 (선택)'):
+        v2_render_scan_manual(region)
+
+
+def v2_render_sectors(region):
+    v21_render_auto(region,'sector')
+    with st.expander('기존 테마 점수 비교·개별 상세 (선택)'):
+        v2_render_sectors_manual(region)
+
+
+def v2_render_flow(region):
+    if region=='KR': v21_render_auto(region,'flow')
+    v2_render_flow_manual(region)
+
+
 def main():
-    st.set_page_config(page_title="퀀트 투자전략실", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="개미 투자전략실", page_icon="📊", layout="wide")
     st.markdown("""<style>
     :root {
         --bg:#070b12;
@@ -4281,7 +4589,7 @@ def main():
     </style>""", unsafe_allow_html=True)
     st.markdown("""<div class="hero">
       <div class="hero-badge">● 데이터 기반 투자 리서치</div>
-      <div class="hero-title">퀀트 투자전략실 V2</div>
+      <div class="hero-title">개미 투자전략실</div>
       <div class="hero-subtitle">차트 · 수급 · 실적 · 전략 검증을 한 화면에서 분석합니다.</div>
       <div class="hero-meta">
         <span class="hero-chip">KOSPI · KOSDAQ · NASDAQ · NYSE</span>
