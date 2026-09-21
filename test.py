@@ -2944,7 +2944,6 @@ def render_us_workspace():
     if st.button('미국 데이터 새로고침'):
         cached_us_history.clear()
         cached_us_news.clear()
-        v3_fundamentals.clear()
         stock_directory.clear('US')
         st.session_state.pop('us_scan_horse', None)
         st.session_state.pop('us_scan_oversold', None)
@@ -2972,12 +2971,6 @@ def render_us_workspace():
             cols[2].metric('20거래일', fmt(period_return(df, 20), '%', 2, True))
             cols[3].metric('RSI', fmt(df.RSI.iloc[-1], digits=1))
             render_v3_research(selected,df,score)
-            scenario = price_scenario(df)
-            if scenario:
-                cols = st.columns(5)
-                for box, label in zip(cols, ["1차 참고 진입가", "2차 참고 진입가", "1차 참고 목표가", "2차 참고 목표가", "참고 손절가"]):
-                    box.metric(label, '$' + fmt(scenario[label], digits=2))
-                st.caption('위 가격대는 단기 ATR 변동성 참고선이며 위의 5년 가치 시나리오·애널리스트 목표가와 별개입니다. 실제 주문 가격이 아닙니다.')
             research = build_general_research_commentary(df, pd.DataFrame(columns=INV_COLS), {}, score, None,
                 stale=(datetime.now(EXCHANGE_TZ['US']).date()-df.index[-1].date()).days>7)
             with st.expander('단기 기술 해석 자세히 보기'):
@@ -4553,69 +4546,174 @@ def v3_commentary(company_score,price_score,timing,company):
     return ' '.join(parts)
 
 
+# ===== V4: 가격 데이터만 사용하는 조건부 진입 가이드 =====
+def v4_trade_plan(name,low,high,stop,resistances,condition):
+    values=[number(x) for x in [low,high,stop]]
+    if any(x is None for x in values) or not 0<stop<low<=high:
+        return {'name':name,'valid':False,'condition':'가격 구조가 성립하지 않아 이 시나리오는 제외합니다.'}
+    obstacles=[float(x) for x in resistances if number(x) is not None and x>=low]
+    risk=high-stop
+    target=min(obstacles) if obstacles else high+2*risk
+    kind='관측 저항' if obstacles else '2R 관리선(가정)'
+    rr=(target-high)/risk
+    risk_pct=risk/high*100
+    return {'name':name,'valid':True,'low':float(low),'high':float(high),'stop':float(stop),
+            'target':float(target),'target_kind':kind,'rr':float(rr),'risk_pct':float(risk_pct),
+            'rr_pass':bool(kind=='관측 저항' and rr>=1.5 and risk_pct<=8),
+            'condition':condition,'state':'조건 대기'}
+
+
+def v4_entry_guide(frame,benchmark=None,reference_price=None,now=None):
+    """A causal, price-only checklist. No institutional secret model or buy probability."""
+    region=frame.attrs.get('region','US')
+    now=now or datetime.now(EXCHANGE_TZ[region])
+    result={'status':'관망','reason':'일봉 이력을 먼저 확인해 주십시오.','plans':[], 'checks':[], 'valid':False}
+    try:
+        df=add_indicators(completed_history(frame,now))
+    except (ValueError,AttributeError,KeyError): return result
+    if len(df)<65:
+        result['reason']='추세와 지지·저항 분석에는 최소 65개 확정 일봉이 필요합니다.';return result
+    age=(pd.Timestamp(now).date()-df.index[-1].date()).days
+    if age>7:
+        result['reason']='최근 일봉이 7일 넘게 경과하여 현재 진입 가격 안내를 중단했습니다.';return result
+    r,p=df.iloc[-1],df.iloc[-2]
+    atr=number(r.ATR14)
+    if atr is None or atr<=0 or r.Volume<=0 or (df.Volume.tail(60)>0).mean()<.9:
+        result['reason']='거래량 또는 변동성 자료가 진입 판단에 충분하지 않습니다.';return result
+    price=float(r.Close) if reference_price is None else number(reference_price)
+    if price is None or price<=0:
+        result['reason']='검토 가격은 0보다 큰 값이어야 합니다.';return result
+    previous=df.iloc[:-1]
+    ma20=float(r.MA20);ma60=float(r.MA60)
+    low10=float(previous.Low.tail(10).min());high20=float(previous.High.tail(20).max())
+    supports=[(ma20,'20일 이동평균선'),(low10,'직전 10일 저점')]
+    supports=[x for x in supports if x[0]<=r.Close]
+    if not supports:
+        result['reason']='확정 종가가 주요 지지 후보를 모두 하회해 지지 회복을 먼저 확인해야 합니다.';return result
+    anchor,basis=max(supports,key=lambda x:x[0])
+    stop=min(anchor-.75*atr,low10-.25*atr)
+    resistance=list(previous.High.tail(n).max() for n in [20,60,252])
+    highs=previous.High.tail(126).to_numpy()
+    resistance.extend(float(highs[i]) for i in range(2,len(highs)-2)
+                      if highs[i]>=max(highs[i-2:i]) and highs[i]>=max(highs[i+1:i+3]))
+    resistance=sorted(set(resistance))
+    low=anchor-.25*atr;high=anchor+.25*atr
+    current=v4_trade_plan('검토 가격 진입',price,price,stop,resistance,'지지 부근 반등·추세 유지 및 관측 저항까지 손익비 1.5 이상 확인')
+    pullback=v4_trade_plan('눌림 진입 구간',low,high,stop,resistance,'해당 구간 도달 후 일봉 반등 확인. 가격 도달만으로 매수하지 않음')
+    trigger=high20+.1*atr
+    breakout=v4_trade_plan('돌파 진입 구간',trigger,trigger+.25*atr,trigger-1.5*atr,resistance,
+                          '직전 20일 고점+0.1 ATR 위 종가·거래량 1.5배·봉 상단 마감 확인 후 진입 검토')
+    relvol=float(r.Volume/df.Volume.iloc[-21:-1].mean())
+    dist_atr=(price-ma20)/atr
+    uptrend=bool(r.Close>r.MA60 and r.MA20>=r.MA60 and r.MA20>df.MA20.iloc[-6])
+    falling=bool(r.Close<r.MA60 and r.MA20<=df.MA20.iloc[-6])
+    overheated=bool(r.RSI>72 or dist_atr>2.5)
+    rebound=bool(r.Close>=p.Close and r.Close>r.Open and relvol>=1)
+    location=(r.Close-r.Low)/(r.High-r.Low) if r.High>r.Low else 0
+    breakout_confirmed=bool(r.Close>=trigger and relvol>=1.5 and location>=.65)
+    momentum6=float(r.Close/df.Close.iloc[-127]-1) if len(df)>=127 else None
+    relative20=None
+    if benchmark is not None and not benchmark.empty:
+        try:
+            b=completed_history(benchmark,now).Close.reindex(df.index[-21:])
+            if b.notna().all() and (b>0).all(): relative20=float(r.Close/df.Close.iloc[-21]-b.iloc[-1]/b.iloc[0])
+        except (ValueError,KeyError,AttributeError): pass
+    # An unavailable benchmark is omitted, never silently counted as outperformance.
+    momentum_ok=momentum6 is None or momentum6>0
+    relative_ok=relative20 is None or relative20>=0
+    near=abs(price-anchor)<=.75*atr
+    common=uptrend and not overheated and momentum_ok and relative_ok and r.RSI>=40
+    ready_current=bool(common and near and rebound and current.get('rr_pass',False))
+    ready_break=bool(common and trigger<=price<=trigger+.25*atr and breakout_confirmed and breakout.get('rr_pass',False))
+    if price<=stop or falling:
+        status='관망';reason='지지 또는 중기 추세가 약해 지금은 신규 진입보다 가격 회복 확인이 우선입니다.'
+    elif overheated:
+        status='눌림 대기';reason='20일선 대비 이격 또는 RSI가 높아 추격 진입 부담이 있습니다. 아래 지지 구간에서 반등을 확인하는 편이 합리적입니다.'
+    elif ready_current or ready_break:
+        status='분할 진입 검토';reason=('검토 가격 진입' if ready_current else '돌파 진입 구간')+'에서 추세·가격 위치·확정 일봉 확인 조건과 관측 저항까지 손익비가 함께 충족됐습니다. 제시된 무효화 기준을 전제로 분할 접근을 검토할 구간입니다.'
+    elif not common:
+        status='돌파 확인' if not falling else '관망'
+        reason='가격 추세와 모멘텀이 충분히 모이지 않았습니다. 아래 돌파 구간에서 추세·거래량·손익비가 함께 개선되는지 확인해 주십시오.'
+    elif current.get('target_kind')=='2R 관리선(가정)':
+        status='돌파 확인';reason='상단의 관측 저항이 없어 손익비 우위를 검증할 수 없습니다. 2R 관리선은 수익 목표 가정일 뿐이므로 이를 근거로 지금 진입을 권하지 않습니다.'
+    else:
+        status='눌림 대기';reason='현재 가격에서는 지지와의 거리, 반등 확인 또는 손익비 조건이 부족합니다. 더 낮은 가격의 지지 구간과 반등을 함께 확인할 필요가 있습니다.'
+    if ready_current: current['state']='조건 충족'
+    if ready_break: breakout['state']='조건 충족'
+    if ready_current and low<=price<=high and pullback.get('rr_pass'): pullback['state']='조건 충족'
+    if status=='관망':
+        for plan in [current,pullback,breakout]: plan['state']='신규 진입 보류'
+    checks=[{'점검':'중기 추세','충족':uptrend,'근거':'확정 종가>60일선, 20일선≥60일선, 20일선 5일간 상승'},
+            {'점검':'추격 부담 제한','충족':not overheated,'근거':f'RSI {r.RSI:.1f} / 검토 가격−20일선 {dist_atr:.2f} ATR (상한 RSI 72·2.5 ATR)'},
+            {'점검':'지지 부근 위치','충족':near,'근거':f'{basis}와 검토 가격의 거리 ≤0.75 ATR'},
+            {'점검':'반등과 거래 동반','충족':rebound,'근거':f'양봉·전일 종가 이상·거래량 {relvol:.2f}배 (≥1)'},
+            {'점검':'현재 손익비·손실폭','충족':current.get('rr_pass',False),'근거':'관측 저항까지 손익비≥1.5, 손절 거리≤8%; 가정 2R은 충족 근거에서 제외'}]
+    if momentum6 is not None: checks.append({'점검':'6개월 가격 모멘텀','충족':momentum6>0,'근거':f'126거래일 가격 수익률 {momentum6*100:+.1f}%'})
+    if relative20 is not None: checks.append({'점검':'시장 대비 상대강도','충족':relative20>=0,'근거':f'동일 20거래일 SPY 초과수익 {relative20*100:+.1f}%p'})
+    return dict(result,valid=True,status=status,reason=reason,plans=[current,pullback,breakout],checks=checks,
+                reference=price,close=float(r.Close),asof=str(df.index[-1].date()),atr=atr,ma20=ma20,ma60=ma60,
+                support=anchor,support_basis=basis,resistance20=high20,relative20=relative20,relvol=relvol)
+
+
 def render_v3_research(code,df,timing):
-    st.markdown('#### 🧬 기업·중장기·단기 분리 분석')
-    with st.spinner('기업 재무와 중장기 팩터를 확인하고 있습니다…'):
-        result=v3_fundamentals(code)
-        benchmark=cached_us_history('SPY')
-    company=v3_company_metrics(result.data)
-    cs=v3_company_score(company)
+    # Compatibility name retained; no financial-data request is made from this screen.
+    st.markdown('#### 🎯 지금 진입해도 될까?')
+    st.caption('확정 일봉 기준 · 약 2~8주 스윙 관찰용 · 실제 주문 전 가격이 달라지면 아래 검토 가격을 바꿔 다시 확인하세요.')
+    benchmark=cached_us_history('SPY')
     try: bench=completed_history(benchmark.data) if not benchmark.data.empty else None
     except (ValueError,AttributeError): bench=None
-    ps=v3_price_factors(df,bench)
-    stale=(datetime.now(EXCHANGE_TZ['US']).date()-df.index[-1].date()).days>7
+    reference=None
+    use_price=st.checkbox('다른 진입 가격으로 손익비 확인',key='v4_custom_'+code)
+    if use_price:
+        reference=st.number_input('검토할 진입 가격 (USD)',min_value=.01,value=float(df.Close.iloc[-1]),step=.1,format='%.2f',key='v4_price_'+code)
+    guide=v4_entry_guide(df,bench,reference)
+    st.markdown('### '+guide['status'])
+    st.info(guide['reason'])
+    if not guide['valid']: return
+    price=guide['reference']
+    st.caption(f"분석 기준 {guide['asof']} · 확정 종가 ${guide['close']:,.2f} · 검토 가격 ${price:,.2f}. 장중 실시간 매수 신호가 아닙니다.")
+    current=guide['plans'][0]
     boxes=st.columns(3)
-    for box,label,item in [(boxes[0],'기업 실적·가치',cs),(boxes[1],'중장기 가격 팩터',ps),(boxes[2],'단기 매매 타이밍',timing)]:
-        value=item['score']
-        box.metric(label,f'{value:.1f} / 100' if value is not None else '평가 보류')
-        box.caption(item['grade'])
-    st.caption('세 점수는 서로 다른 질문에 답합니다. 합산하지 않으며, 39점이 기업 가치 39점이나 상승 확률 39%라는 뜻은 아닙니다. 모든 배점·임계값은 이 앱의 공개 규칙입니다.')
-    if stale: st.warning('일봉이 7일 이상 경과했습니다. 가격 팩터·타이밍을 현재 신호로 해석하지 마십시오.')
-    st.info(v3_commentary(cs,ps,timing,company))
-    st.caption(f"재무 분기말 {company['report_end'] or '미확인'} · 시가총액 기준일 {company['quote_date'] or '미확인'} · 가격 팩터 기준 {df.index[-1]:%Y-%m-%d} · 조회 {result.fetched_at}")
-    a,b,c,d=st.columns(4);m=company['metrics']
-    a.metric('분기 매출 성장률 YoY',fmt(None if m.get('revenue_growth') is None else m['revenue_growth']*100,'%',1,True))
-    b.metric('TTM ROE',fmt(None if m.get('roe') is None else m['roe']*100,'%',1))
-    c.metric('TTM FCF 이익률',fmt(None if m.get('fcf_margin') is None else m['fcf_margin']*100,'%',1))
-    d.metric('TTM FCF / 시가총액',fmt(None if m.get('fcf_yield') is None else m['fcf_yield']*100,'%',2))
-    with st.expander('기업·가격 팩터 배점과 자료 확인',expanded=cs['score'] is None):
-        st.caption(f"기업 점수 확보 배점 {cs['coverage']}/100 · 확보된 득점 {cs['points']} · 미확인 배점을 100점으로 환산하지 않습니다.")
-        st.dataframe(pd.DataFrame(cs['rows']),hide_index=True,use_container_width=True)
-        st.caption(f"가격 팩터 확보 배점 {ps['coverage']}/100 · 확보된 득점 {ps['points']}. 모멘텀은 최근 21거래일을 제외하며 변동성·낙폭은 최근 252거래일입니다. SPY 비교는 같은 날짜만 사용합니다.")
-        st.dataframe(pd.DataFrame(ps['rows']),hide_index=True,use_container_width=True)
-        for note in result.notes+company['notes']: st.write('• '+note)
-        st.caption('재무는 공급원이 제공한 분기 재무제표로 계산한 최신 조회 분석입니다. TTM은 같은 분기말 4개를 합산합니다. 과거 공시 시점별 데이터가 아니므로 과거 신호 백테스트에 섞지 않습니다. 주가 수익률에는 현금배당 재투자가 포함되지 않습니다.')
-        st.caption('성장 30·퀄리티 40·가치 30. 업종 중립 상대 순위나 BlackRock 지수의 복제가 아닙니다. 금융·부동산 업종과 비USD 재무제표는 기업 점수에서 제외합니다. GAAP 일회성 이익·인수합병·주식보상도 별도 검토가 필요합니다.')
-    info=result.data.get('info',{})
-    with st.expander('애널리스트 기대치 · 점수와 별도'):
-        count=number(info.get('numberOfAnalystOpinions'));target=number(info.get('targetMeanPrice'))
-        if info.get('currency')=='USD' and count is not None and count>0 and target is not None and target>0:
-            x,y,z=st.columns(3)
-            x.metric('목표가 평균 (공급원 집계)',f'${target:,.2f}')
-            y.metric('목표가 / 확정 종가 차이',f'{(target/df.Close.iloc[-1]-1)*100:+.1f}%')
-            z.metric('집계 애널리스트 수',f'{count:,.0f}')
-            st.caption('목표가 개별 발표일·집계 기준일은 미제공입니다. 조회 시각의 공급원 집계이며 신규 리포트 또는 현재 컨센서스의 완전성을 보장하지 않습니다. 점수에는 반영하지 않습니다.')
-        else: st.info('확인 가능한 목표가 집계를 확보하지 못했습니다.')
-        st.link_button('Yahoo 종목 분석 원문','https://finance.yahoo.com/quote/'+code.replace('.','-')+'/analysis/')
-    with st.expander('ARK 공개 접근 참고 · 5년 가치 가정 시나리오'):
-        st.caption('ARK는 성장·시장 침투·미래 가치와 정성 판단을 함께 검토합니다. 아래는 그 접근을 참고한 매출→순이익→주당가치 계산기이며 ARK의 내부 모델이나 목표가가 아닙니다. 기본 가정은 모든 기업에 동일한 예시이며 자동 예측치가 아닙니다.')
-        shares=number(info.get('sharesOutstanding'));margin=m.get('net_margin');revenue=m.get('revenue')
-        if revenue is not None and revenue>0 and margin is not None and 0<margin<=1 and shares is not None and shares>0:
-            growth=st.slider('가정: 향후 5년 매출 연평균 성장률(%)',-20,60,10,key='v3_growth_'+code)/100
-            assumed_margin=st.slider('가정: 5년 후 순이익률(%)',1,60,int(np.clip(round(margin*100),1,60)),key='v3_margin_'+code)/100
-            pe=st.slider('가정: 5년 후 PER(배)',5,80,25,key='v3_pe_'+code)
-            dilution=st.slider('가정: 연간 주식 수 증가율(%)',-5,15,1,key='v3_dilution_'+code)/100
-            cases=[]
-            for name,g,p in [('성장·멀티플 하향',growth-.05,max(1,pe-5)),('입력한 가정',growth,pe),('성장·멀티플 상향',growth+.05,pe+5)]:
-                out=v3_five_year_scenario(revenue,assumed_margin,shares,float(df.Close.iloc[-1]),g,p,dilution)
-                cases.append({'가정':name,'매출 CAGR(%)':g*100,'순이익률(%)':assumed_margin*100,'출구 PER':p,'주식수 증가율(%)':dilution*100,'5년 후 가정 가치(USD)':out['price'],'가정 연환산 가격수익률(%)':out['cagr']*100})
-            st.dataframe(pd.DataFrame(cases),hide_index=True,use_container_width=True)
-            st.caption('계산: TTM 매출×(1+성장률)^5×순이익률×출구 PER÷[현재 주식수×(1+희석률)^5]. 순이익률에 금융비용이 포함된 지분가치 방식입니다. 배당·환율·세금 미반영, 현재가치 할인액이 아니며 시나리오 확률은 부여하지 않습니다.')
-        else: st.info('양의 TTM 매출·순이익률·주식 수를 확보해야 시나리오를 계산합니다.')
-        st.write('정성 확인 항목: 경영진·조직, 사업 실행력, 경쟁우위, 제품 리더십, 투자 가정의 위험. 재무 숫자만으로 이 항목들의 점수를 만들어내지 않습니다.')
-    with st.expander('공개 방법론 출처와 적용 범위'):
-        for name,url in V3_SOURCES.items(): st.link_button(name,url)
-        st.caption('참고한 것은 공개 투자 개념입니다. 내부 알고리즘·실제 펀드 포트폴리오 최적화·ARK의 독점 점수체계를 재현하지 않습니다. 이 모델의 초과수익 예측력은 아직 검증되지 않았습니다.')
+    boxes[0].metric('지지 기준',f"${guide['support']:,.2f}")
+    boxes[0].caption(guide['support_basis'])
+    boxes[1].metric('현재 손익비',f"{current['rr']:.2f} : 1" if current.get('valid') and current.get('target_kind')=='관측 저항' else '관측 저항으로 평가 불가')
+    boxes[2].metric('손절 기준까지 가격 하락폭',f"{current['risk_pct']:.1f}%" if current.get('valid') else '현재 가격 구조 재확인')
+    rows=[]
+    for plan in guide['plans']:
+        if not plan['valid']: continue
+        rows.append({'접근 방법':plan['name'],'진입 하단(USD)':round(plan['low'],2),'진입 상단(USD)':round(plan['high'],2),
+                     '손절 참고선(USD)':round(plan['stop'],2),'저항·관리선(USD)':round(plan['target'],2),
+                     '상단 기준':plan['target_kind'],'손익비':round(plan['rr'],2),'손절 거리(%)':round(plan['risk_pct'],2),
+                     '상태':plan['state'],'확인할 조건':plan['condition']})
+    if rows: st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+    st.caption('손익비는 진입 구간 상단 체결을 가정합니다. 손절선 이탈 시 진입 가정은 무효이며, 갭·수수료·슬리피지로 실제 손실은 더 커질 수 있습니다. 가격 도달만으로 자동 매수하지 않습니다.')
+    if any(p.get('target_kind')=='2R 관리선(가정)' for p in guide['plans']):
+        st.caption('2R 관리선은 위험금액의 2배를 더한 관리용 가정입니다. 애널리스트 목표가·관측 저항이 아니며 손익비 우위 판정에는 사용하지 않습니다.')
+    fig=go.Figure(go.Candlestick(x=df.index[-100:],open=df.Open.tail(100),high=df.High.tail(100),low=df.Low.tail(100),close=df.Close.tail(100),name=code))
+    for y,label,color in [(guide['support'],'지지 기준','#38bdf8'),(guide['resistance20'],'직전 20일 고점','#f59e0b')]:
+        fig.add_hline(y=y,line_dash='dot',line_color=color,annotation_text=label)
+    if current.get('valid'): fig.add_hline(y=current['stop'],line_dash='dash',line_color='#ef4444',annotation_text='손절 참고선')
+    pull=guide['plans'][1]
+    if pull.get('valid'): fig.add_hrect(y0=pull['low'],y1=pull['high'],fillcolor='#38bdf8',opacity=.12,line_width=0)
+    fig.update_layout(template='plotly_dark',height=320,xaxis_rangeslider_visible=False,margin=dict(l=8,r=8,t=20,b=8),paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)')
+    st.plotly_chart(fig,use_container_width=True)
+    with st.expander('왜 이런 진입 판단인가?'):
+        st.dataframe(pd.DataFrame(guide['checks']),hide_index=True,use_container_width=True)
+        if guide['relative20'] is None: st.caption('이번 판단에는 시장지수 상대강도를 적용하지 못해 종목 가격·거래량 조건만 사용했습니다.')
+        st.caption('눌림 구간: 지지 기준 ±0.25 ATR. 지지 기준은 종가 아래의 20일선·직전 10일 저점 중 높은 값. 손절: 지지−0.75 ATR과 직전 10일 저점−0.25 ATR 중 낮은 값. 돌파 구간: 직전 20일 고점+0.1~0.35 ATR, 손절은 돌파 하단−1.5 ATR.')
+        st.caption('저항은 신호 봉을 제외한 20·60·252일 고점과 최근 126일 내 좌우 두 봉으로 확인된 고점 중 진입 하단보다 위에 있는 가장 가까운 값입니다. 저항이 진입 구간 안에 있으면 손익비가 낮거나 음수여서 진입 조건을 충족하지 않습니다. ATR은 기존 앱의 14일 True Range 단순평균입니다.')
+    ps=v3_price_factors(df,bench)
+    with st.expander('보조 가격 팩터·단기 점수'):
+        available=[(label,item) for label,item in [('중장기 가격 팩터',ps),('단기 매매 타이밍',timing)] if item['score'] is not None]
+        if available:
+            for box,(label,item) in zip(st.columns(len(available)),available): box.metric(label,f"{item['score']:.1f} / 100")
+        observed=pd.DataFrame(ps['rows']).dropna(subset=['득점'])
+        if not observed.empty: st.dataframe(observed,hide_index=True,use_container_width=True)
+        st.caption('확인되는 항목만 표시합니다. 점수는 상승 확률이 아니며 진입 판단은 위의 개별 조건과 손익비로 결정합니다.')
+    with st.expander('기관 공개 관점과 이 가이드의 차이'):
+        st.markdown('[BlackRock 공개 팩터](https://www.ishares.com/us/strategies/smart-beta-investing)의 모멘텀·위험 관점을 참고합니다. ARK는 [장기 성장·가치 연구](https://www.ark-invest.com/investment-process)를 포함하므로 가격 데이터만으로 ARK 적정가를 산출하지 않습니다.')
+        st.markdown('진입 구간·ATR 배수·손익비 1.5·손절 거리 8%는 이 앱의 자체 규칙입니다. [ATR의 공개 활용 설명](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/atr)을 참고했으며 기관 내부 매수 알고리즘이나 수익이 검증된 추천 모델이 아닙니다.')
+
 
 
 def main():

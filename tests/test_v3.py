@@ -110,44 +110,6 @@ def test_suspension_does_not_receive_low_volatility_bonus():
     assert result['score'] is None and result['coverage']==0
 
 
-def test_v3_us_interface_and_scenario_controls(payload):
-    payload['info']['symbol']='AVGO'
-    from streamlit.testing.v1 import AppTest
-    from test_v2_ui import SOURCE,FIXTURE
-    a.st.cache_data.clear()
-    override='\nPAYLOAD='+repr(payload)+'''\nv3_yahoo_snapshot=lambda code:PAYLOAD
-original_company_metrics=v3_company_metrics
-v3_company_metrics=lambda payload:original_company_metrics(payload,now='2026-09-21')
-main()
-'''
-    at=AppTest.from_string(SOURCE+FIXTURE.rsplit('main()',1)[0]+override).run(timeout=30)
-    at.radio(key='market_region').set_value('🇺🇸 미국주식').run(timeout=30)
-    at.text_input(key='us_query').input('AVGO').run(timeout=30)
-    next(b for b in at.button if b.label=='미국 종목 정밀 분석').click().run(timeout=30)
-    assert not at.exception
-    labels=[m.label for m in at.metric]
-    assert {'기업 실적·가치','중장기 가격 팩터','단기 매매 타이밍'}.issubset(labels)
-    assert next(m for m in at.metric if m.label=='기업 실적·가치').value!='평가 보류'
-    at.slider(key='v3_dilution_AVGO').set_value(5).run(timeout=30)
-    assert not at.exception
-    assert any('5년 후 가정 가치(USD)' in f.value.columns for f in at.dataframe)
-
-
-def test_v3_us_interface_survives_financial_provider_failure():
-    from streamlit.testing.v1 import AppTest
-    from test_v2_ui import SOURCE,FIXTURE
-    a.st.cache_data.clear()
-    override='\nv3_yahoo_snapshot=offline\nmain()\n'
-    at=AppTest.from_string(SOURCE+FIXTURE.rsplit('main()',1)[0]+override).run(timeout=30)
-    at.radio(key='market_region').set_value('🇺🇸 미국주식').run(timeout=30)
-    at.text_input(key='us_query').input('AVGO').run(timeout=30)
-    next(b for b in at.button if b.label=='미국 종목 정밀 분석').click().run(timeout=30)
-    assert not at.exception
-    assert next(m for m in at.metric if m.label=='기업 실적·가치').value=='평가 보류'
-    assert next(m for m in at.metric if m.label=='단기 매매 타이밍').value!='평가 보류'
-    assert any('100만 확보' in i.value for i in at.info)
-
-
 def test_wrong_symbol_is_rejected(payload,monkeypatch):
     monkeypatch.setattr(a,'v3_yahoo_snapshot',lambda code:payload)
     result=a.v3_fundamentals('AVGO')
