@@ -7,7 +7,7 @@ core.py, providers.py, fdr_worker.py, 테마 설정 파일을 별도로 올릴 �
 
 실행: python -m streamlit run test.py
 필요 패키지(기존 앱과 동일):
-    streamlit, finance-datareader, numpy, pandas, plotly, requests, beautifulsoup4
+    streamlit, finance-datareader, numpy, pandas, plotly, requests, beautifulsoup4, yfinance
 권장 Python: 3.12. 기존 requirements.txt는 설치 목록이므로 유지하십시오.
 추가 API 키는 필요하지 않습니다. 미국 뉴스는 영문 헤드라인입니다.
 출처 문서:
@@ -21,7 +21,7 @@ core.py, providers.py, fdr_worker.py, 테마 설정 파일을 별도로 올릴 �
 V2: 기존 v5.5 + 전조 레이더·시장 상황판·섹터 표본·수급 추적·뉴스/공시·보유 종목·관찰 신호 성과.
 자동 스캔은 활성 화면에서만 동작합니다. 개인 기록은 세션 보관 + JSON 백업입니다.
 OpenDART 자동 공시는 DART_API_KEY, SEC 공시는 SEC_USER_AGENT를 Secrets에 설정하십시오.
-미국 재무/수급 미제공 항목은 미확인 처리합니다. 외부 공급원 접근은 배포 환경에 따라 실패할 수 있습니다.
+미국 재무는 Yahoo 분기 자료로 별도 분석하며 수집 실패 및 일별 기관 수급 미제공 항목은 미확인 처리합니다. 외부 공급원 접근은 배포 환경에 따라 실패할 수 있습니다.
 """
 from __future__ import annotations
 
@@ -1180,7 +1180,7 @@ def render_analysis(bundle, code, display_name):
         df, investors, {} if stale else fund, score, news_for_comment, short, stale
     )
     cols = st.columns(3)
-    cols[0].metric("기술 점수 (100점 기준)", f"{score['points']} / {score['possible']}")
+    cols[0].metric("단기 매매 타이밍 (기술 점수)", f"{score['points']} / {score['possible']}")
     cols[1].metric("기술 지표 확보율", f"{score['coverage']}%")
     cols[2].metric("공매도 거래량 비중", fmt((short or {}).get("ShortRatio"), "%", 2))
     st.write(score["grade"])
@@ -2944,6 +2944,7 @@ def render_us_workspace():
     if st.button('미국 데이터 새로고침'):
         cached_us_history.clear()
         cached_us_news.clear()
+        v3_fundamentals.clear()
         stock_directory.clear('US')
         st.session_state.pop('us_scan_horse', None)
         st.session_state.pop('us_scan_oversold', None)
@@ -2970,18 +2971,17 @@ def render_us_workspace():
             cols[1].metric('5거래일', fmt(period_return(df, 5), '%', 2, True))
             cols[2].metric('20거래일', fmt(period_return(df, 20), '%', 2, True))
             cols[3].metric('RSI', fmt(df.RSI.iloc[-1], digits=1))
-            st.metric('기술 점수 (100점 기준)', f"{score['points']} / 확인 배점 {score['possible']}")
-            st.write(score['grade'])
-            st.caption('추세 35 · 모멘텀 25 · 거래량 20 · 진입 부담 20. 한국과 같은 기술 규칙입니다. 기관 수급·재무 점수는 포함하지 않으며, 승률이나 상승 확률을 의미하지 않습니다.')
+            render_v3_research(selected,df,score)
             scenario = price_scenario(df)
             if scenario:
                 cols = st.columns(5)
                 for box, label in zip(cols, ["1차 참고 진입가", "2차 참고 진입가", "1차 참고 목표가", "2차 참고 목표가", "참고 손절가"]):
                     box.metric(label, '$' + fmt(scenario[label], digits=2))
-                st.caption('ATR 변동성으로 계산한 가격 시나리오입니다. 애널리스트 목표가나 주문 가격이 아닙니다.')
+                st.caption('위 가격대는 단기 ATR 변동성 참고선이며 위의 5년 가치 시나리오·애널리스트 목표가와 별개입니다. 실제 주문 가격이 아닙니다.')
             research = build_general_research_commentary(df, pd.DataFrame(columns=INV_COLS), {}, score, None,
                 stale=(datetime.now(EXCHANGE_TZ['US']).date()-df.index[-1].date()).days>7)
-            render_research_cards(research)
+            with st.expander('단기 기술 해석 자세히 보기'):
+                render_research_cards(research)
             with st.expander('긍정 요인과 유의 사항'):
                 for item in research['positives']:
                     st.write('• ' + item)
@@ -4324,6 +4324,298 @@ def v2_render_sectors(region):
 def v2_render_flow(region):
     if region=='KR': v21_render_auto(region,'flow')
     v2_render_flow_manual(region)
+
+
+# ===== V3: 기업 실적·가치 / 중장기 가격 팩터 / 단기 타이밍 분리 =====
+V3_MODEL='public-factor-research-3.0'
+V3_SOURCES={
+    'BlackRock 공개 팩터 설명':'https://www.ishares.com/us/strategies/smart-beta-investing',
+    'ARK 공개 투자 과정':'https://www.ark-invest.com/investment-process',
+    'ARK 정성 평가 항목':'https://helpcenter.ark-funds.com/arks-investment-process',
+}
+_V3_WORKER=r'''
+import sys,json,contextlib,math
+import yfinance as yf
+payload={'info':{},'tables':{},'notes':[]}
+def emit():
+    print('V3_DATA:'+json.dumps(payload,ensure_ascii=False,default=str),flush=True)
+with contextlib.redirect_stdout(sys.stderr):
+    ticker=yf.Ticker(sys.argv[1])
+    try:
+        raw=ticker.get_info()
+        keys=['symbol','currency','financialCurrency','quoteType','sector','industry','marketCap',
+              'regularMarketTime','mostRecentQuarter','sharesOutstanding','targetMeanPrice','targetMedianPrice',
+              'targetLowPrice','targetHighPrice','numberOfAnalystOpinions','recommendationKey']
+        payload['info']={k:raw.get(k) for k in keys}
+    except Exception as exc: payload['notes'].append('기업 요약 조회 실패: '+type(exc).__name__)
+emit()
+for name,method in [('income',ticker.get_income_stmt),('cash',ticker.get_cash_flow),('balance',ticker.get_balance_sheet)]:
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            df=method(freq='quarterly')
+            payload['tables'][name]=json.loads(df.to_json(orient='split',date_format='iso'))
+        except Exception as exc: payload['notes'].append(name+' 조회 실패: '+type(exc).__name__)
+    emit()
+'''
+
+
+def v3_yahoo_snapshot(code):
+    """Bounded public-data worker. Preserve partial results on provider timeout."""
+    if not v2_symbol(code,'US'): raise ValueError('티커 형식 오류')
+    note=[]
+    try:
+        result=subprocess.run([sys.executable,'-c',_V3_WORKER,code.replace('.','-')],
+                              capture_output=True,text=True,encoding='utf-8',timeout=45,check=True)
+        output=result.stdout
+    except subprocess.TimeoutExpired as exc:
+        output=exc.stdout or ''
+        if isinstance(output,bytes): output=output.decode('utf-8',errors='replace')
+        note=['재무 조회 제한시간 도달: 확보된 항목만 표시합니다.']
+    rows=[line[len('V3_DATA:'):] for line in output.splitlines() if line.startswith('V3_DATA:')]
+    if not rows: raise ValueError('기업 재무 응답을 확보하지 못했습니다.')
+    payload=json.loads(rows[-1]);payload.setdefault('notes',[]).extend(note)
+    return payload
+
+
+@st.cache_data(ttl=3600,max_entries=64,show_spinner=False)
+def v3_fundamentals(code):
+    try:
+        data=v3_yahoo_snapshot(code)
+        returned=data.get('info',{}).get('symbol')
+        if returned and str(returned).upper().replace('.','-')!=code.upper().replace('.','-'):
+            raise ValueError('요청 종목과 공급원 응답 종목이 다릅니다.')
+        return Result(data,'Yahoo Finance / yfinance · 분기 재무제표',
+                      'ok' if data.get('tables') else 'partial',data.get('notes',[]))
+    except Exception as exc:
+        return Result({'info':{},'tables':{}},'Yahoo Finance / yfinance','error',
+                      ['재무 자동 조회 실패 ('+type(exc).__name__+'). 확인되지 않은 실적은 채점하지 않습니다.'])
+
+
+def v3_statement(payload,name):
+    raw=payload.get('tables',{}).get(name,{})
+    try:
+        df=pd.DataFrame(raw['data'],index=raw['index'],columns=pd.to_datetime(raw['columns'],errors='coerce'))
+        if df.columns.isna().any() or df.columns.duplicated().any() or df.index.duplicated().any():
+            return pd.DataFrame()
+        return df.apply(pd.to_numeric,errors='coerce').sort_index(axis=1,ascending=False)
+    except (KeyError,ValueError,TypeError): return pd.DataFrame()
+
+
+def v3_company_metrics(payload,now=None):
+    """Use matching quarterly statements. No synthetic forecasts or data filling."""
+    now=pd.Timestamp(now or datetime.now(EXCHANGE_TZ['US'])).tz_localize(None).normalize()
+    info=payload.get('info',{});metrics={};notes=[]
+    result={'metrics':metrics,'notes':notes,'report_end':None,'ttm_start':None,'quote_date':None,
+            'sector':info.get('sector'),'supported':False,'currency':info.get('financialCurrency')}
+    if info.get('quoteType')!='EQUITY' or info.get('currency')!='USD' or info.get('financialCurrency')!='USD':
+        notes.append('USD 재무제표를 제공하는 미국 주식에 적용합니다. 통화 또는 상품 유형이 확인되지 않았습니다.')
+        return result
+    if info.get('sector') in ['Financial Services','Real Estate']:
+        notes.append('금융·부동산 업종은 현금흐름·부채 기준이 달라 이 기업 점수의 적용 대상에서 제외합니다.')
+        return result
+    income=v3_statement(payload,'income');cash=v3_statement(payload,'cash');balance=v3_statement(payload,'balance')
+    if income.empty: notes.append('분기 손익계산서 미확인');return result
+    ends=list(income.columns)
+    latest=ends[0]
+    if latest>now or (now-latest).days>200:
+        notes.append('최신 재무 분기말이 미래이거나 200일을 초과해 기업 점수를 보류합니다.')
+        return result
+    result.update(report_end=str(latest.date()),supported=True)
+    def value(table,field,date):
+        return number(table.at[field,date]) if field in table.index and date in table.columns else None
+    def series(table,field,dates):
+        values=[value(table,field,d) for d in dates]
+        return values if all(v is not None for v in values) else None
+    # 4 standalone quarters, not annual or cumulative YTD periods.
+    dates=ends[:4]
+    contiguous=len(dates)==4 and all(60<=(dates[i]-dates[i+1]).days<=115 for i in range(3))
+    prior=next((d for d in ends[1:] if 350<=(latest-d).days<=385),None)
+    revenue=value(income,'TotalRevenue',latest);net=value(income,'NetIncome',latest)
+    oldrev=value(income,'TotalRevenue',prior) if prior is not None else None
+    oldnet=value(income,'NetIncome',prior) if prior is not None else None
+    metrics['revenue_growth']=revenue/oldrev-1 if revenue is not None and oldrev is not None and oldrev>0 else None
+    metrics['earnings_growth']=net/oldnet-1 if net is not None and oldnet is not None and oldnet>0 else None
+    if oldnet is not None and oldnet<=0: notes.append('전년 동기 순이익이 0 이하라 이익 성장률을 점수화하지 않습니다. 적자 기저효과를 별도로 확인해 주십시오.')
+    totals={}
+    if contiguous:
+        result['ttm_start']=str(dates[-1].date())
+        for label,table,field in [('revenue',income,'TotalRevenue'),('net_income',income,'NetIncome'),
+                                  ('operating_income',income,'OperatingIncome'),('ocf',cash,'OperatingCashFlow'),
+                                  ('capex',cash,'CapitalExpenditure')]:
+            vals=series(table,field,dates)
+            totals[label]=sum(vals) if vals is not None else None
+        ocf,capex=totals.get('ocf'),totals.get('capex')
+        # yfinance cash-flow capex is a signed outflow. Unexpected positive sign is not silently flipped.
+        capex_values=series(cash,'CapitalExpenditure',dates)
+        totals['fcf']=ocf+capex if ocf is not None and capex is not None and all(v<=0 for v in capex_values) else None
+        if capex_values is not None and any(v>0 for v in capex_values): notes.append('설비투자 지출의 부호가 예상과 달라 FCF 계산을 보류합니다.')
+    else: notes.append('연속된 4개 분기 자료가 부족하여 TTM 비율을 보류합니다.')
+    metrics.update(totals)
+    rev,ni,fcf=totals.get('revenue'),totals.get('net_income'),totals.get('fcf')
+    metrics['fcf_margin']=fcf/rev if fcf is not None and rev is not None and rev>0 else None
+    metrics['net_margin']=ni/rev if ni is not None and rev is not None and rev>0 else None
+    equity=value(balance,'StockholdersEquity',latest)
+    oldequity=value(balance,'StockholdersEquity',prior) if prior is not None else None
+    metrics['roe']=ni/((equity+oldequity)/2) if ni is not None and equity is not None and oldequity is not None and min(equity,oldequity)>0 else None
+    debt=value(balance,'TotalDebt',latest);money=value(balance,'CashAndCashEquivalents',latest)
+    ocf=totals.get('ocf')
+    metrics['net_debt_ocf']=(debt-money)/ocf if debt is not None and debt>=0 and money is not None and money>=0 and ocf is not None and ocf>0 else None
+    marketcap=number(info.get('marketCap'));epoch=number(info.get('regularMarketTime'))
+    try: quote=pd.Timestamp(epoch,unit='s',tz='UTC').tz_convert(EXCHANGE_TZ['US']).tz_localize(None).normalize() if epoch is not None else None
+    except (ValueError,OverflowError): quote=None
+    fresh=quote is not None and 0<=(now-quote).days<=7
+    result['quote_date']=str(quote.date()) if quote is not None else None
+    usable_cap=marketcap is not None and marketcap>0 and fresh
+    metrics['marketcap']=marketcap if usable_cap else None
+    metrics['earnings_yield']=ni/marketcap if ni is not None and usable_cap else None
+    metrics['fcf_yield']=fcf/marketcap if fcf is not None and usable_cap else None
+    if not usable_cap: notes.append('같은 통화의 최근 시가총액 기준일을 확인하지 못해 가치 비율을 보류합니다.')
+    return result
+
+
+def v3_score_rows(specs,metrics):
+    rows=[]
+    for group,label,key,weight,xs,ys,unit in specs:
+        value=number(metrics.get(key))
+        points=None if value is None else round(float(np.interp(value,xs,ys)*weight),1)
+        anchors=' / '.join(f'{x*100:g}%' if unit=='%' else f'{x:g}배' for x in xs)
+        rows.append({'영역':group,'항목':label,'관측값':value*100 if value is not None and unit=='%' else value,
+                     '단위':unit,'득점':points,'배점':weight,'상태':'확인' if value is not None else '미확인',
+                     '기준':'선형 보간 기준 '+anchors+' → 배점 비율 '+', '.join(str(y) for y in ys)})
+    possible=sum(r['배점'] for r in rows if r['득점'] is not None)
+    points=round(sum(r['득점'] for r in rows if r['득점'] is not None),1)
+    return {'score':points if possible==100 else None,'points':points,'coverage':possible,'rows':rows}
+
+
+def v3_company_score(company):
+    specs=[('성장','분기 매출 YoY','revenue_growth',20,[-.1,0,.1,.2,.4],[0,.2,.5,.8,1],'%'),
+           ('성장','분기 순이익 YoY','earnings_growth',10,[-.2,0,.1,.3,.6],[0,.2,.5,.8,1],'%'),
+           ('퀄리티','TTM ROE (평균 자기자본)','roe',15,[0,.05,.1,.2,.3],[0,.2,.5,.8,1],'%'),
+           ('퀄리티','TTM 잉여현금흐름률','fcf_margin',15,[0,.05,.1,.2,.3],[0,.2,.5,.8,1],'%'),
+           ('퀄리티','순부채 / TTM 영업현금흐름','net_debt_ocf',10,[-1,0,1,3,5],[1,1,.8,.3,0],'배'),
+           ('가치','TTM 순이익 / 시가총액','earnings_yield',15,[-.01,0,.02,.04,.07],[0,0,.3,.7,1],'%'),
+           ('가치','TTM FCF / 시가총액','fcf_yield',15,[-.01,0,.02,.04,.06],[0,0,.3,.7,1],'%')]
+    result=v3_score_rows(specs,company['metrics'] if company['supported'] else {})
+    result['grade']='재무 확인 대기' if result['score'] is None else '실적·가치 조건 우호' if result['score']>=70 else '장단점 혼재' if result['score']>=45 else '실적·가치 부담 점검'
+    return result
+
+
+def v3_price_factors(df,benchmark=None):
+    metrics={}
+    close=df.Close
+    valid=close.notna().all() and np.isfinite(close).all() and (close>0).all()
+    if 'Volume' in df:
+        valid=valid and df.Volume.iloc[-1]>0 and (df.Volume.tail(252)>0).mean()>=.9
+    if valid and len(close)>=253:
+        metrics['momentum12']=close.iloc[-22]/close.iloc[-253]-1
+        returns=close.tail(253).pct_change().dropna()
+        metrics['volatility']=returns.std(ddof=1)*np.sqrt(252)
+        metrics['drawdown']=float((close.tail(253)/close.tail(253).cummax()-1).min())
+    if valid and len(close)>=127: metrics['momentum6']=close.iloc[-22]/close.iloc[-127]-1
+    if valid and benchmark is not None and not benchmark.empty and len(close)>=253:
+        aligned=benchmark.Close.reindex(df.index[-253:])
+        if aligned.notna().all() and np.isfinite(aligned).all() and (aligned>0).all():
+            metrics['relative12']=metrics.get('momentum12',np.nan)-(aligned.iloc[-22]/aligned.iloc[0]-1)
+    specs=[('모멘텀','12→1개월 가격 모멘텀','momentum12',20,[-.2,0,.1,.3,.6],[0,.3,.5,.8,1],'%'),
+           ('모멘텀','6→1개월 가격 모멘텀','momentum6',20,[-.15,0,.05,.15,.3],[0,.3,.5,.8,1],'%'),
+           ('상대강도','12→1개월 SPY 초과수익','relative12',20,[-.2,-.05,0,.1,.25],[0,.2,.5,.8,1],'%'),
+           ('위험','252일 연율 변동성','volatility',20,[.15,.25,.4,.6,.9],[1,.8,.5,.2,0],'%'),
+           ('위험','252일 최대낙폭','drawdown',20,[-.6,-.4,-.25,-.1,0],[0,.2,.5,.8,1],'%')]
+    result=v3_score_rows(specs,metrics);result['metrics']=metrics
+    result['grade']='가격 이력 확인 대기' if result['score'] is None else '중장기 팩터 우호' if result['score']>=70 else '중장기 조건 혼재' if result['score']>=45 else '중장기 위험 점검'
+    return result
+
+
+def v3_five_year_scenario(revenue,margin,shares,price,growth,exit_pe,dilution):
+    values=[number(x) for x in [revenue,margin,shares,price,growth,exit_pe,dilution]]
+    if any(x is None for x in values): raise ValueError('가정과 기초 재무자료가 필요합니다.')
+    revenue,margin,shares,price,growth,exit_pe,dilution=values
+    if min(revenue,shares,price,exit_pe)<=0 or not 0<margin<=1 or not -1<growth<=1 or not -.5<=dilution<=1:
+        raise ValueError('가정의 단위와 범위를 확인해 주십시오.')
+    future=revenue*(1+growth)**5*margin*exit_pe/(shares*(1+dilution)**5)
+    return {'price':future,'cagr':(future/price)**.2-1}
+
+
+def v3_commentary(company_score,price_score,timing,company):
+    c=company_score['score'];p=price_score['score'];t=timing['score'];m=company['metrics']
+    parts=[]
+    if c is None: parts.append(f"기업 평가에 필요한 재무 배점 {company_score['coverage']}/100만 확보되어 종합 기업 판단은 보류합니다.")
+    else: parts.append(f"기업 실적·가치 점수는 {c:.1f}점으로 {company_score['grade']} 상태입니다.")
+    if m.get('revenue_growth') is not None: parts.append(f"최근 분기 매출은 전년 동기 대비 {m['revenue_growth']*100:+.1f}%입니다.")
+    if m.get('fcf_yield') is not None: parts.append(f"최근 4분기 FCF/시가총액은 {m['fcf_yield']*100:.2f}%로, 성장 전망과 별도로 현재 가격 부담을 확인해야 합니다.")
+    if p is not None: parts.append(f"중장기 가격 팩터는 {p:.1f}점입니다.")
+    if t is not None:
+        parts.append(f"단기 타이밍은 {t:.1f}점입니다.")
+        if t<55 and c is not None and c>=70: parts.append('기업 지표는 우호적이지만 단기 가격 추세의 회복은 아직 확인할 필요가 있습니다. 좋은 기업인지와 지금 진입하기 좋은지는 구분해서 검토하실 만합니다.')
+        elif t<55: parts.append('단기 점수만으로 기업의 중장기 경쟁력을 부정할 수는 없습니다. 기업 실적·밸류에이션과 가격 추세를 함께 확인할 구간입니다.')
+        elif c is not None and c<45: parts.append('가격 흐름에 비해 기업 실적·가치 지표의 부담이 있어 실적 개선이 뒤따르는지 확인할 필요가 있습니다.')
+    parts.append('애널리스트 목표가는 별도의 기대치이며 점수를 올리는 입력값으로 사용하지 않습니다.')
+    return ' '.join(parts)
+
+
+def render_v3_research(code,df,timing):
+    st.markdown('#### 🧬 기업·중장기·단기 분리 분석')
+    with st.spinner('기업 재무와 중장기 팩터를 확인하고 있습니다…'):
+        result=v3_fundamentals(code)
+        benchmark=cached_us_history('SPY')
+    company=v3_company_metrics(result.data)
+    cs=v3_company_score(company)
+    try: bench=completed_history(benchmark.data) if not benchmark.data.empty else None
+    except (ValueError,AttributeError): bench=None
+    ps=v3_price_factors(df,bench)
+    stale=(datetime.now(EXCHANGE_TZ['US']).date()-df.index[-1].date()).days>7
+    boxes=st.columns(3)
+    for box,label,item in [(boxes[0],'기업 실적·가치',cs),(boxes[1],'중장기 가격 팩터',ps),(boxes[2],'단기 매매 타이밍',timing)]:
+        value=item['score']
+        box.metric(label,f'{value:.1f} / 100' if value is not None else '평가 보류')
+        box.caption(item['grade'])
+    st.caption('세 점수는 서로 다른 질문에 답합니다. 합산하지 않으며, 39점이 기업 가치 39점이나 상승 확률 39%라는 뜻은 아닙니다. 모든 배점·임계값은 이 앱의 공개 규칙입니다.')
+    if stale: st.warning('일봉이 7일 이상 경과했습니다. 가격 팩터·타이밍을 현재 신호로 해석하지 마십시오.')
+    st.info(v3_commentary(cs,ps,timing,company))
+    st.caption(f"재무 분기말 {company['report_end'] or '미확인'} · 시가총액 기준일 {company['quote_date'] or '미확인'} · 가격 팩터 기준 {df.index[-1]:%Y-%m-%d} · 조회 {result.fetched_at}")
+    a,b,c,d=st.columns(4);m=company['metrics']
+    a.metric('분기 매출 성장률 YoY',fmt(None if m.get('revenue_growth') is None else m['revenue_growth']*100,'%',1,True))
+    b.metric('TTM ROE',fmt(None if m.get('roe') is None else m['roe']*100,'%',1))
+    c.metric('TTM FCF 이익률',fmt(None if m.get('fcf_margin') is None else m['fcf_margin']*100,'%',1))
+    d.metric('TTM FCF / 시가총액',fmt(None if m.get('fcf_yield') is None else m['fcf_yield']*100,'%',2))
+    with st.expander('기업·가격 팩터 배점과 자료 확인',expanded=cs['score'] is None):
+        st.caption(f"기업 점수 확보 배점 {cs['coverage']}/100 · 확보된 득점 {cs['points']} · 미확인 배점을 100점으로 환산하지 않습니다.")
+        st.dataframe(pd.DataFrame(cs['rows']),hide_index=True,use_container_width=True)
+        st.caption(f"가격 팩터 확보 배점 {ps['coverage']}/100 · 확보된 득점 {ps['points']}. 모멘텀은 최근 21거래일을 제외하며 변동성·낙폭은 최근 252거래일입니다. SPY 비교는 같은 날짜만 사용합니다.")
+        st.dataframe(pd.DataFrame(ps['rows']),hide_index=True,use_container_width=True)
+        for note in result.notes+company['notes']: st.write('• '+note)
+        st.caption('재무는 공급원이 제공한 분기 재무제표로 계산한 최신 조회 분석입니다. TTM은 같은 분기말 4개를 합산합니다. 과거 공시 시점별 데이터가 아니므로 과거 신호 백테스트에 섞지 않습니다. 주가 수익률에는 현금배당 재투자가 포함되지 않습니다.')
+        st.caption('성장 30·퀄리티 40·가치 30. 업종 중립 상대 순위나 BlackRock 지수의 복제가 아닙니다. 금융·부동산 업종과 비USD 재무제표는 기업 점수에서 제외합니다. GAAP 일회성 이익·인수합병·주식보상도 별도 검토가 필요합니다.')
+    info=result.data.get('info',{})
+    with st.expander('애널리스트 기대치 · 점수와 별도'):
+        count=number(info.get('numberOfAnalystOpinions'));target=number(info.get('targetMeanPrice'))
+        if info.get('currency')=='USD' and count is not None and count>0 and target is not None and target>0:
+            x,y,z=st.columns(3)
+            x.metric('목표가 평균 (공급원 집계)',f'${target:,.2f}')
+            y.metric('목표가 / 확정 종가 차이',f'{(target/df.Close.iloc[-1]-1)*100:+.1f}%')
+            z.metric('집계 애널리스트 수',f'{count:,.0f}')
+            st.caption('목표가 개별 발표일·집계 기준일은 미제공입니다. 조회 시각의 공급원 집계이며 신규 리포트 또는 현재 컨센서스의 완전성을 보장하지 않습니다. 점수에는 반영하지 않습니다.')
+        else: st.info('확인 가능한 목표가 집계를 확보하지 못했습니다.')
+        st.link_button('Yahoo 종목 분석 원문','https://finance.yahoo.com/quote/'+code.replace('.','-')+'/analysis/')
+    with st.expander('ARK 공개 접근 참고 · 5년 가치 가정 시나리오'):
+        st.caption('ARK는 성장·시장 침투·미래 가치와 정성 판단을 함께 검토합니다. 아래는 그 접근을 참고한 매출→순이익→주당가치 계산기이며 ARK의 내부 모델이나 목표가가 아닙니다. 기본 가정은 모든 기업에 동일한 예시이며 자동 예측치가 아닙니다.')
+        shares=number(info.get('sharesOutstanding'));margin=m.get('net_margin');revenue=m.get('revenue')
+        if revenue is not None and revenue>0 and margin is not None and 0<margin<=1 and shares is not None and shares>0:
+            growth=st.slider('가정: 향후 5년 매출 연평균 성장률(%)',-20,60,10,key='v3_growth_'+code)/100
+            assumed_margin=st.slider('가정: 5년 후 순이익률(%)',1,60,int(np.clip(round(margin*100),1,60)),key='v3_margin_'+code)/100
+            pe=st.slider('가정: 5년 후 PER(배)',5,80,25,key='v3_pe_'+code)
+            dilution=st.slider('가정: 연간 주식 수 증가율(%)',-5,15,1,key='v3_dilution_'+code)/100
+            cases=[]
+            for name,g,p in [('성장·멀티플 하향',growth-.05,max(1,pe-5)),('입력한 가정',growth,pe),('성장·멀티플 상향',growth+.05,pe+5)]:
+                out=v3_five_year_scenario(revenue,assumed_margin,shares,float(df.Close.iloc[-1]),g,p,dilution)
+                cases.append({'가정':name,'매출 CAGR(%)':g*100,'순이익률(%)':assumed_margin*100,'출구 PER':p,'주식수 증가율(%)':dilution*100,'5년 후 가정 가치(USD)':out['price'],'가정 연환산 가격수익률(%)':out['cagr']*100})
+            st.dataframe(pd.DataFrame(cases),hide_index=True,use_container_width=True)
+            st.caption('계산: TTM 매출×(1+성장률)^5×순이익률×출구 PER÷[현재 주식수×(1+희석률)^5]. 순이익률에 금융비용이 포함된 지분가치 방식입니다. 배당·환율·세금 미반영, 현재가치 할인액이 아니며 시나리오 확률은 부여하지 않습니다.')
+        else: st.info('양의 TTM 매출·순이익률·주식 수를 확보해야 시나리오를 계산합니다.')
+        st.write('정성 확인 항목: 경영진·조직, 사업 실행력, 경쟁우위, 제품 리더십, 투자 가정의 위험. 재무 숫자만으로 이 항목들의 점수를 만들어내지 않습니다.')
+    with st.expander('공개 방법론 출처와 적용 범위'):
+        for name,url in V3_SOURCES.items(): st.link_button(name,url)
+        st.caption('참고한 것은 공개 투자 개념입니다. 내부 알고리즘·실제 펀드 포트폴리오 최적화·ARK의 독점 점수체계를 재현하지 않습니다. 이 모델의 초과수익 예측력은 아직 검증되지 않았습니다.')
 
 
 def main():

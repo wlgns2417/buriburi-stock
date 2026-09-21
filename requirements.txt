@@ -5,3 +5,4 @@ pandas
 plotly
 requests
 beautifulsoup4
+yfinance>=0.2.65,<1
