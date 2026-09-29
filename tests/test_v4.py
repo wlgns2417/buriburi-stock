@@ -88,6 +88,7 @@ main()
 '''
     at=AppTest.from_string(SOURCE+fixture).run(timeout=30)
     at.radio(key='market_region').set_value('🇺🇸 미국주식').run(timeout=30)
+    at.radio(key='v2_menu').set_value('📊 종목 분석').run(timeout=30)
     at.text_input(key='us_query').input('AVGO').run(timeout=30)
     next(b for b in at.button if b.label=='미국 종목 정밀 분석').click().run(timeout=30)
     assert not at.exception

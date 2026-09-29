@@ -3248,7 +3248,7 @@ def render_research_cards(research):
 
 # ===== 개인용 주식 터미널 V2 (확정 일봉, 공개 데이터 기반) =====
 V2_MODEL = 'precursor-2.0'
-V2_MENU = ['📊 종목 분석', '🧭 시장 상황판', '🚨 급등 전조', '🔥 섹터 순환',
+V2_MENU = ['🔎 반등 스크리너', '📊 종목 분석', '🧭 시장 상황판', '🚨 급등 전조', '🔥 섹터 순환',
            '🐋 수급 추적', '📰 뉴스·공시', '💼 내 종목', '🧪 백테스트·성과']
 V2_SECTORS = {
     'KR': {'반도체': ['005930','000660','042700'], '전력기기': ['010120','267260','298040'],
@@ -4015,7 +4015,7 @@ def render_v2_terminal(region):
     menu=st.radio('V2 메뉴',V2_MENU,horizontal=True,key='v2_menu')
     if menu=='📊 종목 분석':
         return False
-    handlers={'🧭 시장 상황판':v2_render_market,'🚨 급등 전조':v2_render_scan,'🔥 섹터 순환':v2_render_sectors,
+    handlers={'🔎 반등 스크리너':lambda region:render_v5_screener(),'🧭 시장 상황판':v2_render_market,'🚨 급등 전조':v2_render_scan,'🔥 섹터 순환':v2_render_sectors,
               '🐋 수급 추적':v2_render_flow,'📰 뉴스·공시':v2_render_news,'💼 내 종목':v2_render_portfolio,'🧪 백테스트·성과':v2_render_performance}
     handlers[menu](region)
     return True
@@ -4713,6 +4713,253 @@ def render_v3_research(code,df,timing):
     with st.expander('기관 공개 관점과 이 가이드의 차이'):
         st.markdown('[BlackRock 공개 팩터](https://www.ishares.com/us/strategies/smart-beta-investing)의 모멘텀·위험 관점을 참고합니다. ARK는 [장기 성장·가치 연구](https://www.ark-invest.com/investment-process)를 포함하므로 가격 데이터만으로 ARK 적정가를 산출하지 않습니다.')
         st.markdown('진입 구간·ATR 배수·손익비 1.5·손절 거리 8%는 이 앱의 자체 규칙입니다. [ATR의 공개 활용 설명](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/atr)을 참고했으며 기관 내부 매수 알고리즘이나 수익이 검증된 추천 모델이 아닙니다.')
+
+
+
+# ===== V5: price-only rebound screener, confirmed daily data =====
+V5_MARKETS=['🇰🇷 KODEX ETF','🇰🇷 코스피 대형 100','🇺🇸 S&P 500','🇺🇸 나스닥 100']
+V5_FILTERS=['전체','⚡ 상승 다이버전스','🚨 하락 다이버전스','🛡️ 5대 조건 충족','🏆 기술 S등급','🎯 진입 검토']
+V5_ETFS=[('069500','KODEX 200'),('122630','KODEX 레버리지'),('233740','KODEX 코스닥150레버리지'),('229200','KODEX 코스닥150'),('091160','KODEX 반도체'),('305720','KODEX 2차전지산업'),('379800','KODEX 미국S&P500')]
+
+@st.cache_data(ttl=86400,show_spinner=False)
+def v5_universe(market):
+    region='KR' if market in V5_MARKETS[:2] else 'US'
+    try:
+        if market==V5_MARKETS[0]:
+            d=normalize_directory(fdr_table('listing','ETF/KR'),'KR')
+            d=d[d.Name.str.contains('KODEX',case=False,regex=False)]
+            if d.empty: raise ValueError('KODEX 목록 없음')
+            source='FDR 국내 ETF 목록의 KODEX 상품'
+        elif market==V5_MARKETS[1]:
+            raw=fdr_table('listing','KOSPI')
+            if 'Marcap' not in raw: raise ValueError('시총 없음')
+            raw['Marcap']=pd.to_numeric(raw.Marcap,errors='coerce')
+            d=normalize_directory(raw.dropna(subset=['Marcap']).sort_values('Marcap',ascending=False).head(100),'KR')
+            source='코스피 시가총액 상위 100개 (KOSPI100 공식 지수 구성과 다를 수 있음)'
+        elif market==V5_MARKETS[2]:
+            d=normalize_directory(fdr_table('listing','S&P500'),'US');source='FDR S&P 500 구성 목록'
+        else:
+            body=request_bytes('https://en.wikipedia.org/wiki/Nasdaq-100')
+            tables=pd.read_html(StringIO(body.decode('utf-8')))
+            d=next(t for t in tables if 'Ticker' in t.columns and 'Company' in t.columns)
+            d=normalize_directory(d.rename(columns={'Ticker':'Code','Company':'Name'}),'US')
+            if len(d)<90: raise ValueError('불완전한 지수 구성')
+            source='공개 Nasdaq-100 구성 표 (조회 시점 목록)'
+        if d.empty: raise ValueError('빈 목록')
+        return d[['Code','Name']].to_dict('records'),source
+    except Exception:
+        seeds=V5_ETFS if market==V5_MARKETS[0] else (SEED_KR if region=='KR' else SEED_US)
+        return [{'Code':c,'Name':n} for c,n in seeds], '전체 목록 조회 실패 · 주요 종목 대체 표본 (지수 전체 또는 구성 보장 아님)'
+
+
+def v5_divergences(df):
+    """Two-sided pivots: signal is available only after three confirming bars."""
+    events=[]
+    for side,column in [('low','Low'),('high','High')]:
+        values=df[column].to_numpy();pivots=[]
+        for i in range(max(3,len(df)-100),len(df)-3):
+            around=np.r_[values[i-3:i],values[i+1:i+4]]
+            if (values[i]<around.min() if side=='low' else values[i]>around.max()):pivots.append(i)
+        if len(pivots)<2:continue
+        b=pivots[-1]
+        earlier=[i for i in pivots[:-1] if 5<=b-i<=60]
+        if not earlier or len(df)-1-(b+3)>10:continue
+        a=earlier[-1]
+        for indicator in ['RSI','MACD_HIST']:
+            x,y=number(df[indicator].iloc[a]),number(df[indicator].iloc[b])
+            if x is None or y is None:continue
+            delta=y-x;minimum=2 if indicator=='RSI' else float(df.ATR14.iloc[b])*.02
+            if abs(delta)<minimum or abs(values[b]/values[a]-1)<.002:continue
+            kind=None
+            if side=='low' and values[b]<values[a] and delta>0:kind='일반 상승'
+            if side=='low' and values[b]>values[a] and delta<0 and df.Close.iloc[b]>df.MA200.iloc[b]:kind='히든 상승'
+            if side=='high' and values[b]>values[a] and delta<0:kind='일반 하락'
+            if side=='high' and values[b]<values[a] and delta>0 and df.Close.iloc[b]<df.MA200.iloc[b]:kind='히든 하락'
+            if kind:
+                invalid=(df.Low.iloc[b+1:]<values[b]).any() if side=='low' else (df.High.iloc[b+1:]>values[b]).any()
+                if not invalid:events.append({'유형':kind,'지표':indicator,'첫 피벗':str(df.index[a].date()),'둘째 피벗':str(df.index[b].date()),'확인일':str(df.index[b+3].date()),'가격1':values[a],'가격2':values[b],'지표1':x,'지표2':y})
+    return events
+
+
+def v5_analyze(frame,now=None):
+    df=add_indicators(completed_history(frame,now)).tail(756).copy()
+    if len(df)<252:raise ValueError('252개 이상 확정 일봉이 필요합니다.')
+    region=frame.attrs.get('region','KR');today=(now or datetime.now(EXCHANGE_TZ[region])).date()
+    if (today-df.index[-1].date()).days>7:raise ValueError('일봉이 7일 넘게 경과했습니다.')
+    if df.Volume.iloc[-1]<=0 or (df.Volume.tail(60)>0).mean()<.9:raise ValueError('거래 정지 또는 거래량 부족')
+    df['MA200']=df.Close.rolling(200).mean()
+    # Wilder RSI, seeded using the first 14 changes; neutral flat prices are 50.
+    delta=df.Close.diff();g=delta.clip(lower=0);l=-delta.clip(upper=0)
+    for series in [g,l]:
+        series.iloc[14]=series.iloc[1:15].mean();series.iloc[:14]=np.nan
+    ag=g.ewm(alpha=1/14,adjust=False).mean();al=l.ewm(alpha=1/14,adjust=False).mean()
+    df['RSI']=_oscillator(ag,al)
+    lo=df.Low.rolling(14).min();hi=df.High.rolling(14).max()
+    df['STO_K']=((df.Close-lo)/(hi-lo).replace(0,np.nan)*100).fillna(50)
+    df['STO_D']=df.STO_K.rolling(3).mean()
+    r=df.iloc[-1];atr=float(r.ATR14)
+    if atr<=0:raise ValueError('변동성이 없어 가격 시나리오를 계산하지 못했습니다.')
+    dd=1-df.Close/df.Close.cummax();current=float(dd.iloc[-1])
+    # Exclude last bar from historical MDD to let a fresh record exceed 100%.
+    historical=float(dd.iloc[:-1].max());reach=current/historical if historical>0 else None
+    volume=float(r.Volume/df.Volume.iloc[-21:-1].mean())
+    checks={'볼린저 하단~중단':bool(r.BB_Lower<=r.Close<=r.MA20),'200일선 위':bool(r.Close>r.MA200),
+            'RSI 40 이하':bool(r.RSI<=40),'표본 MDD 70~100%':bool(reach is not None and .7<=reach<=1),
+            '거래량 회복':bool(volume>=1.2 and r.Close>=df.Close.iloc[-2])}
+    events=v5_divergences(df);bull=any('상승' in e['유형'] for e in events);bear=any('하락' in e['유형'] for e in events)
+    rebound=bool(r.Close>r.Open and r.Close>df.Close.iloc[-2])
+    points=[('가격 위치',15 if checks['볼린저 하단~중단'] else 0),('장기 추세',20 if checks['200일선 위'] else 0),
+            ('RSI 조정',10 if checks['RSI 40 이하'] else 0),('표본 낙폭',10 if checks['표본 MDD 70~100%'] else 0),
+            ('거래량 회복',15 if checks['거래량 회복'] else 0),('상승 다이버전스',20 if bull else 0),('반등 확인',10 if rebound else 0),('하락 다이버전스',-20 if bear else 0)]
+    score=max(0,sum(p for _,p in points))
+    support=float(df.Low.iloc[-21:-1].min());stop=support-.5*atr
+    barriers=[float(x) for x in [r.MA20,r.BB_Upper,df.High.iloc[-253:-1].max()]]
+    plan=v4_trade_plan('1차 검토 40%',float(r.Close),float(r.Close),stop,barriers,'확정 양봉 반등 + 상승 다이버전스 + 200일선 위 + 손익비 2 이상')
+    second=min(float(r.BB_Lower),support+.25*atr)
+    plan2=v4_trade_plan('2차 검토 60%',second,second,stop,barriers,'지지 재확인 때만 검토 · 1차보다 낮지 않거나 손절 이하이면 미제공') if stop<second<r.Close else {'valid':False}
+    rr=plan.get('rr',0)
+    eligible=bool(plan.get('valid') and plan.get('target_kind')=='관측 저항' and rr>=2 and plan.get('risk_pct',100)<=8 and bull and not bear and rebound and checks['200일선 위'] and checks['거래량 회복'])
+    status='진입 검토' if eligible else ('하락 경계' if bear else ('반등 관찰' if bull else '조건 대기'))
+    return {'df':df,'close':float(r.Close),'asof':str(df.index[-1].date()),'checks':checks,'count':sum(checks.values()),'events':events,'bull':bull,'bear':bear,'score':score,'s_grade':score>=82 and not bear,
+            'status':status,'eligible':eligible,'plans':[plan,plan2],'points':points,'rsi':float(r.RSI),'volume_ratio':volume,'dd':current,'mdd':historical,'reach':reach,'support':support,'stop':stop}
+
+@st.cache_data(ttl=600,max_entries=700,show_spinner=False)
+def v5_profile(region,code,name):
+    result=fetch_history(code,days=1200,region=region)
+    if result.data.empty and region=='KR':
+        try:
+            frame=yahoo_history(code+'.KS','KR',days=1200);frame.attrs['region']='KR'
+            result=Result(frame,'Yahoo chart / '+code+'.KS')
+        except Exception:pass
+    if result.data.empty:raise ValueError('일봉 공급원 조회 실패')
+    p=v5_analyze(result.data);p.update(code=code,name=name,region=region,source=result.source)
+    return p
+
+
+def v5_matches(p,preset):
+    return {'전체':True,'⚡ 상승 다이버전스':p['bull'],'🚨 하락 다이버전스':p['bear'],'🛡️ 5대 조건 충족':p['count']==5,'🏆 기술 S등급':p['s_grade'],'🎯 진입 검토':p['eligible']}[preset]
+
+
+def v5_details(p):
+    st.subheader(p['name']+' · '+p['code'])
+    st.write('**'+p['status']+'** · 기술적 반등 점수 '+str(p['score'])+'/100')
+    st.caption(p['asof']+' 확정 일봉 · '+p['source'])
+    df=p['df'].tail(180)
+    fig=make_subplots(rows=4,cols=1,shared_xaxes=True,row_heights=[.5,.18,.17,.15],vertical_spacing=.035)
+    fig.add_trace(go.Candlestick(x=df.index,open=df.Open,high=df.High,low=df.Low,close=df.Close,name='가격'),row=1,col=1)
+    for col,color in [('MA200','#fbbf24'),('MA20','#60a5fa'),('BB_Upper','#64748b'),('BB_Lower','#64748b')]:
+        fig.add_trace(go.Scatter(x=df.index,y=df[col],name=col,line=dict(color=color,width=1)),row=1,col=1)
+    for col,row in [('RSI',2),('MACD',3),('MACD_SIGNAL',3),('STO_K',4),('STO_D',4)]:
+        fig.add_trace(go.Scatter(x=df.index,y=df[col],name=col),row=row,col=1)
+    fig.add_hline(y=p['stop'],line_dash='dot',line_color='#f87171',row=1,col=1)
+    fig.update_layout(template='plotly_dark',height=690,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=20,b=10))
+    st.plotly_chart(fig,use_container_width=True)
+    st.dataframe(pd.DataFrame([{'조건':k,'결과':'충족' if v else '대기'} for k,v in p['checks'].items()]),hide_index=True,use_container_width=True)
+    if p['events']:st.dataframe(pd.DataFrame(p['events']),hide_index=True,use_container_width=True)
+    rows=[]
+    for plan in p['plans']:
+        if plan.get('valid'):
+            rows.append({'구분':plan['name'],'검토 가격':round(plan['low'],2),'손절 참고':round(plan['stop'],2),'1차 저항':round(plan['target'],2),'저항 유형':plan['target_kind'],'손익비':round(plan['rr'],2),'손절 거리 %':round(plan['risk_pct'],2),'조건':plan['condition']})
+    if rows:st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+    else:st.info('유효한 지지·손절 순서가 없어 매매 시나리오를 제공하지 않습니다.')
+    above=sorted(set(float(v) for v in [df.MA20.iloc[-1],df.BB_Upper.iloc[-1],p['df'].High.tail(252).max()] if v>p['close']))
+    if len(above)>1:st.caption(f'2차 관측 저항 참고: {above[1]:,.2f} · 1차 저항 통과 후 재평가')
+    st.caption('40%/60%는 선택적 시나리오 비중이며 자동 주문이 아닙니다. 2차 가격 도달만으로 추가 매수하지 않습니다. 2R 가정 관리선은 손익비 충족 근거에서 제외합니다.')
+    with st.expander('점수 산식 및 신호 해석'):
+        st.dataframe(pd.DataFrame(p['points'],columns=['항목','득점']),hide_index=True)
+        st.write('상승 다이버전스는 반등 관찰 신호입니다. 진입 검토에는 200일선·양봉 반등·거래량 회복·관측 저항까지 손익비 2 이상·손절 거리 8% 이하가 추가로 필요합니다.')
+
+
+@st.dialog('종목 정밀 분석')
+def v5_dialog(p):
+    v5_details(p)
+
+
+@st.fragment(run_every='5s')
+def v5_results(market,region,records,source,preset,query,paused):
+    key='v5_job_'+market;day=str(datetime.now(EXCHANGE_TZ[region]).date())
+    identity=(day,tuple((r['Code'],r['Name']) for r in records))
+    job=st.session_state.get(key)
+    if not job or job['identity']!=identity:
+        job={'identity':identity,'cursor':0,'profiles':[],'errors':[]};st.session_state[key]=job
+    blocked=not job['profiles'] and len(job['errors'])>=6
+    if blocked:st.warning('6개 종목 연속 조회 실패로 자동 요청을 중단했습니다. 실패 사유를 확인한 뒤 데이터 새로고침으로 다시 시도해 주십시오.')
+    if not paused and not blocked and job['cursor']<len(records):
+        # Bounded batch; no full-universe blocking request on initial render.
+        for record in records[job['cursor']:job['cursor']+2]:
+            try:job['profiles'].append(v5_profile(region,record['Code'],record['Name']))
+            except Exception as exc:job['errors'].append({'종목':record['Code'],'사유':str(exc)[:180]})
+            job['cursor']+=1
+    st.progress(job['cursor']/max(1,len(records)),text=f"분석 {job['cursor']}/{len(records)} · 성공 {len(job['profiles'])} · 실패 {len(job['errors'])}")
+    st.caption(source+' · 화면이 열려 있는 동안 2종목씩 자동 분석 · 목록은 조회 시점 기준')
+    profiles=job['profiles'];cols=st.columns(4)
+    for col,label,value in zip(cols,['상승 신호','하락 경계','5/5 충족','진입 검토'],[sum(p['bull'] for p in profiles),sum(p['bear'] for p in profiles),sum(p['count']==5 for p in profiles),sum(p['eligible'] for p in profiles)]):col.metric(label,value)
+    selected=[p for p in profiles if v5_matches(p,preset) and (not query or query.casefold() in (p['code']+' '+p['name']).casefold())]
+    selected.sort(key=lambda p:(p['eligible'],p['score'],p['count']),reverse=True)
+    if not selected:st.info('현재까지 조건에 맞는 종목이 없습니다.' if profiles else '일봉을 분석하고 있습니다. 실패 사유는 아래에서 확인하실 수 있습니다.')
+    pages=max(1,(len(selected)+17)//18)
+    page_key='v5_page_'+market
+    if st.session_state.get(page_key,1)>pages:st.session_state[page_key]=1
+    page=st.number_input('결과 페이지',min_value=1,max_value=pages,step=1,key=page_key)
+    for start in range((page-1)*18,min(page*18,len(selected)),3):
+        for col,p in zip(st.columns(3),selected[start:min(start+3,page*18)]):
+            with col:
+                with st.container(border=True):
+                    st.markdown('### '+p['name'])
+                    st.caption(p['code']+' · '+p['asof'])
+                    st.metric('확정 종가',('$' if region=='US' else '₩')+f"{p['close']:,.2f}")
+                    st.write(f"**{p['status']} · {p['score']}점** {'🏆 S' if p['s_grade'] else ''}")
+                    st.caption(' / '.join(sorted(set(e['유형'] for e in p['events']))) or '최근 확정 다이버전스 없음')
+                    st.progress(p['count']/5,text=f"기술 조건 {p['count']}/5")
+                    st.caption(f"RSI {p['rsi']:.1f} · 거래량 {p['volume_ratio']:.2f}배")
+                    st.caption('표본 MDD 도달률 '+(f"{p['reach']*100:.1f}%" if p['reach'] is not None else '산정 불가'))
+                    if st.button('차트 · 진입 시나리오',key='v5_detail_'+market+p['code'],use_container_width=True):v5_dialog(p)
+    if selected:
+        out=pd.DataFrame([{k:p[k] for k in ['code','name','asof','close','score','count','status']} for p in selected])
+        st.download_button('선별 결과 CSV',out.to_csv(index=False).encode('utf-8-sig'),'screener.csv','text/csv')
+    if job['errors']:
+        with st.expander('수집 실패 사유'):st.dataframe(pd.DataFrame(job['errors']),hide_index=True)
+
+
+def render_v5_screener():
+    st.subheader('🔎 반등 퀀트 스크리너')
+    st.caption('확정 일봉으로 찾는 조정·반등 후보 · 가상화폐 제외 · 실제 매수 추천 확률이 아닌 공개 조건식')
+    market=st.radio('스크리너 마켓',V5_MARKETS,horizontal=True,key='v5_market')
+    region='KR' if market in V5_MARKETS[:2] else 'US'
+    top=st.columns([1,1,2])
+    if top[0].button('↻ 데이터 새로고침',key='v5_refresh'):
+        v5_universe.clear();v5_profile.clear();st.session_state.pop('v5_job_'+market,None);st.rerun()
+    paused=top[1].checkbox('분석 일시정지',key='v5_pause')
+    query=top[2].text_input('종목명·코드 필터',key='v5_query',placeholder='삼성전자 / AAPL')
+    with st.expander('📖 전략 / 사용설명서'):
+        st.markdown('''**흐름:** 마켓 선택 → 자동 배치 분석 → 프리셋 선택 → 종목 상세.
+
+**5대 기술 조건:** 볼린저 하단~중단, 200일선 위, Wilder RSI14≤40, 표본 MDD 도달률 70~100%, 거래량 1.2배 이상 및 전일 종가 회복. 기업 흑자 대신 거래량 회복을 사용하므로 ETF도 같은 기술 조건으로 평가합니다.
+
+**다이버전스:** 좌우 3개 봉으로 확인된 가격 피벗 두 개(간격 5~60봉)에서 RSI 또는 MACD 히스토그램 방향을 비교합니다. 최근 확인 후 10봉 이내만 표시하며 가격 저점/고점이 다시 무너지면 취소합니다. 히든 상승/하락은 각각 200일선 위/아래를 요구합니다.
+
+**MDD:** 최대 최근 756거래일의 종가 기준 낙폭입니다. 역대 전체가 아니며, 마지막 봉을 제외한 과거 MDD와 현재 낙폭을 비교하므로 100%를 넘을 수 있습니다. 추가 하락의 한도가 아닙니다.
+
+**S등급:** 기술 반등 점수 82 이상, 하락 다이버전스 없음. 진입 검토는 별도의 손익비 2 이상·반등·거래량 조건을 요구합니다. 통계적 수익성은 아직 검증하지 않았습니다.
+
+**데이터:** 당일 봉을 보수적으로 제외한 확정 일봉입니다. 갱신은 재조회이며 실시간 체결가가 아닙니다. 재무 점수·기업 흑자 보장·암호화폐 분석은 제공하지 않습니다. 공급원 기업행사/수정주가 방식에 따라 신호가 달라질 수 있습니다.''')
+    records,source=v5_universe(market);records=list(records)
+    with st.expander('＋ 새 종목 추가'):
+        with st.form('v5_add'):
+            code=st.text_input('한국 6자리 코드 / 미국 티커').strip().upper();name=st.text_input('표시 이름 (선택)').strip()
+            submitted=st.form_submit_button('현재 마켓에 추가')
+        if submitted:
+            valid=bool(re.fullmatch(r'\d{6}',code) if region=='KR' else re.fullmatch(r'[A-Z]{1,6}(?:[.-][A-Z]{1,2})?',code))
+            if valid:
+                key='v5_custom_'+market;custom=st.session_state.setdefault(key,[])
+                if code not in [x['Code'] for x in custom]:custom.insert(0,{'Code':code,'Name':name or code})
+                st.success('사용자 추가 표본에 등록했습니다. 지수 구성 종목 여부는 별도로 확인해 주십시오.')
+            else:st.error('종목 코드 형식을 확인해 주십시오.')
+    custom=st.session_state.get('v5_custom_'+market,[])
+    records=custom+[r for r in records if r['Code'] not in {x['Code'] for x in custom}]
+    if custom:source+=' + 사용자 추가 '+str(len(custom))+'개 (지수 구성 여부 미검증)'
+    preset=st.radio('선별 프리셋',V5_FILTERS,horizontal=True,key='v5_preset')
+    v5_results(market,region,records,source,preset,query,paused)
 
 
 
