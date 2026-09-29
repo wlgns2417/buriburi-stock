@@ -1,7 +1,7 @@
-streamlit>=1.37,<2
+streamlit>=1.41,<2
 finance-datareader
 numpy
 pandas
 plotly
 requests
-beautifulsoup4
+lxml
