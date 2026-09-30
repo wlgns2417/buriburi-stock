@@ -1,6 +1,8 @@
-"""개미 투자전략실 — 독립형 주식·ETF 퀀트 스크리너. 실행: streamlit run test.py"""
+"""개미 투자전략실 — 독립형 주식 퀀트 스크리너. 실행: streamlit run test.py"""
 from __future__ import annotations
-import math, re, json, sys, subprocess, threading, html
+import math, re, json, sys, subprocess, threading, html, time, tempfile, hashlib
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
@@ -11,8 +13,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import streamlit as st
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 KST=ZoneInfo('Asia/Seoul')
 EXCHANGE_TZ={'KR':KST,'US':ZoneInfo('America/New_York')}
 OHLCV=['Open','High','Low','Close','Volume']
@@ -39,9 +39,8 @@ with contextlib.redirect_stdout(sys.stderr):
 print(df.to_json(orient='split', date_format='iso'))
 '''
 
-MARKETS=['🇰🇷 KODEX ETF','🇰🇷 코스피 대형 100','🇺🇸 S&P 500','🇺🇸 나스닥 100']
+MARKETS=['🇰🇷 코스피 대형 100','🇺🇸 S&P 500','🇺🇸 나스닥 100']
 
-ETF_SEEDS=[('069500','KODEX 200'),('122630','KODEX 레버리지'),('233740','KODEX 코스닥150레버리지'),('229200','KODEX 코스닥150'),('091160','KODEX 반도체'),('305720','KODEX 2차전지산업'),('379800','KODEX 미국S&P500')]
 
 def number(value):
     """None is missing; zero is a valid observation."""
@@ -236,22 +235,16 @@ def trade_plan(name,low,high,stop,resistances,condition):
             'rr_pass':bool(kind=='관측 저항' and rr>=1.5 and risk_pct<=8),
             'condition':condition,'state':'조건 대기'}
 
-@st.cache_data(ttl=86400,show_spinner=False)
 def market_universe(market):
-    region='KR' if market in MARKETS[:2] else 'US'
+    region='KR' if market==MARKETS[0] else 'US'
     try:
         if market==MARKETS[0]:
-            d=normalize_directory(fdr_table('listing','ETF/KR'),'KR')
-            d=d[d.Name.str.contains('KODEX',case=False,regex=False)]
-            if d.empty: raise ValueError('KODEX 목록 없음')
-            source='FDR 국내 ETF 목록의 KODEX 상품'
-        elif market==MARKETS[1]:
             raw=fdr_table('listing','KOSPI')
             if 'Marcap' not in raw: raise ValueError('시총 없음')
             raw['Marcap']=pd.to_numeric(raw.Marcap,errors='coerce')
             d=normalize_directory(raw.dropna(subset=['Marcap']).sort_values('Marcap',ascending=False).head(100),'KR')
             source='코스피 시가총액 상위 100개 (KOSPI100 공식 지수 구성과 다를 수 있음)'
-        elif market==MARKETS[2]:
+        elif market==MARKETS[1]:
             d=normalize_directory(fdr_table('listing','S&P500'),'US');source='FDR S&P 500 구성 목록'
         else:
             body=request_bytes('https://en.wikipedia.org/wiki/Nasdaq-100')
@@ -263,7 +256,7 @@ def market_universe(market):
         if d.empty: raise ValueError('빈 목록')
         return d[['Code','Name']].to_dict('records'),source
     except Exception:
-        seeds=ETF_SEEDS if market==MARKETS[0] else (SEED_KR if region=='KR' else SEED_US)
+        seeds=SEED_KR if region=='KR' else SEED_US
         return [{'Code':c,'Name':n} for c,n in seeds], '전체 목록 조회 실패 · 주요 종목 대체 표본 (지수 전체 또는 구성 보장 아님)'
 
 def find_divergences(df):
@@ -336,7 +329,6 @@ def analyze(frame,now=None):
     return {'df':df,'close':float(r.Close),'asof':str(df.index[-1].date()),'checks':checks,'count':sum(checks.values()),'events':events,'bull':bull,'bear':bear,'score':score,'s_grade':score>=82 and not bear,
             'status':status,'eligible':eligible,'plans':[plan,plan2],'points':points,'rsi':float(r.RSI),'volume_ratio':volume,'dd':current,'mdd':historical,'reach':reach,'support':support,'stop':stop}
 
-@st.cache_data(ttl=600,max_entries=700,show_spinner=False)
 def load_profile(region,code,name):
     result=fetch_history(code,days=1200,region=region)
     if result.data.empty and region=='KR':
@@ -348,35 +340,120 @@ def load_profile(region,code,name):
     p=analyze(result.data);p.update(code=code,name=name,region=region,source=result.source)
     return p
 
-def render_detail(p):
-    st.subheader(p['name']+' · '+p['code'])
-    st.write('**'+p['status']+'** · 기술적 반등 점수 '+str(p['score'])+'/100')
-    st.caption(p['asof']+' 확정 일봉 · '+p['source'])
-    df=p['df'].tail(180)
-    fig=make_subplots(rows=4,cols=1,shared_xaxes=True,row_heights=[.5,.18,.17,.15],vertical_spacing=.035)
-    fig.add_trace(go.Candlestick(x=df.index,open=df.Open,high=df.High,low=df.Low,close=df.Close,name='가격'),row=1,col=1)
-    for col,color in [('MA200','#fbbf24'),('MA20','#60a5fa'),('BB_Upper','#64748b'),('BB_Lower','#64748b')]:
-        fig.add_trace(go.Scatter(x=df.index,y=df[col],name=col,line=dict(color=color,width=1)),row=1,col=1)
-    for col,row in [('RSI',2),('MACD',3),('MACD_SIGNAL',3),('STO_K',4),('STO_D',4)]:
-        fig.add_trace(go.Scatter(x=df.index,y=df[col],name=col),row=row,col=1)
-    fig.add_hline(y=p['stop'],line_dash='dot',line_color='#f87171',row=1,col=1)
-    fig.update_layout(template='plotly_dark',height=690,xaxis_rangeslider_visible=False,margin=dict(l=10,r=10,t=20,b=10))
-    st.plotly_chart(fig,use_container_width=True)
-    st.dataframe(pd.DataFrame([{'조건':k,'결과':'충족' if v else '대기'} for k,v in p['checks'].items()]),hide_index=True,use_container_width=True)
-    if p['events']:st.dataframe(pd.DataFrame(p['events']),hide_index=True,use_container_width=True)
-    rows=[]
-    for plan in p['plans']:
-        if plan.get('valid'):
-            rows.append({'구분':plan['name'],'검토 가격':round(plan['low'],2),'손절 참고':round(plan['stop'],2),'1차 저항':round(plan['target'],2),'저항 유형':plan['target_kind'],'손익비':round(plan['rr'],2),'손절 거리 %':round(plan['risk_pct'],2),'조건':plan['condition']})
-    if rows:st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-    else:st.info('유효한 지지·손절 순서가 없어 매매 시나리오를 제공하지 않습니다.')
-    above=sorted(set(float(v) for v in [df.MA20.iloc[-1],df.BB_Upper.iloc[-1],p['df'].High.tail(252).max()] if v>p['close']))
-    if len(above)>1:st.caption(f'2차 관측 저항 참고: {above[1]:,.2f} · 1차 저항 통과 후 재평가')
-    st.caption('40%/60%는 선택적 시나리오 비중이며 자동 주문이 아닙니다. 2차 가격 도달만으로 추가 매수하지 않습니다. 2R 가정 관리선은 손익비 충족 근거에서 제외합니다.')
-    with st.expander('점수 산식 및 신호 해석'):
-        st.dataframe(pd.DataFrame(p['points'],columns=['항목','득점']),hide_index=True)
-        st.write('상승 다이버전스는 반등 관찰 신호입니다. 진입 검토에는 200일선·양봉 반등·거래량 회복·관측 저항까지 손익비 2 이상·손절 거리 8% 이하가 추가로 필요합니다.')
+MODEL_VERSION='fast-1'
+class ScanService:
+    """Bounded process-wide workers; no Streamlit calls or session data in workers."""
+    def __init__(self,root=None,workers=4,loader=None,universe_loader=None):
+        self.pool=ThreadPoolExecutor(max_workers=workers,thread_name_prefix='stock-data')
+        self.workers=workers;self.lock=threading.RLock();self.values={};self.pending={};self.errors={};self.generations={};self.universes={};self.universe_pending={}
+        self.loader=loader or load_profile;self.universe_loader=universe_loader or market_universe
+        self.root=Path(root or Path(tempfile.gettempdir())/'ant-stock-cache'/MODEL_VERSION)
+        self.root.mkdir(parents=True,exist_ok=True)
+        for old in self.root.glob('*.json'):
+            try:
+                if time.time()-old.stat().st_mtime>8*86400:old.unlink()
+            except OSError:pass
+    def key(self,region,code):
+        return (region,code,str(datetime.now(EXCHANGE_TZ[region]).date()))
+    def path(self,key):return self.root/(hashlib.sha256('|'.join(key).encode()).hexdigest()+'.json')
+    def read(self,key):
+        if key in self.values:return self.values[key]
+        try:
+            data=json.loads(self.path(key).read_text());p=data['profile']
+            p['df']=pd.read_json(StringIO(data['frame']),orient='split');p['df'].attrs['region']=key[0]
+            if p['region']!=key[0] or p['code']!=key[1] or (datetime.now(EXCHANGE_TZ[key[0]]).date()-pd.Timestamp(p['asof']).date()).days>7: return None
+            self.values[key]=p;return p
+        except (OSError,ValueError,KeyError,TypeError):return None
+    def save(self,key,p):
+        try:
+            target=self.path(key);temp=target.with_suffix('.tmp')
+            data={'profile':{k:v for k,v in p.items() if k!='df'},'frame':p['df'].to_json(orient='split',date_format='iso')}
+            temp.write_text(json.dumps(data,default=lambda x:x.item() if isinstance(x,np.generic) else str(x)));temp.replace(target)
+        except (OSError,ValueError,TypeError):pass
+    def harvest(self):
+        for key,(generation,future) in list(self.pending.items()):
+            if not future.done():continue
+            del self.pending[key]
+            if self.generations.get(key,0)!=generation:continue
+            try:
+                p=future.result();self.values[key]=p;self.errors.pop(key,None);self.save(key,p)
+            except Exception as exc:self.errors[key]=(time.monotonic(),str(exc)[:180])
+        # Bound memory and prune obsolete disk files without deleting today's results.
+        if len(self.values)>1500:
+            for key in list(self.values)[:len(self.values)-1500]:self.values.pop(key,None)
+    def invalidate(self,region,records):
+        with self.lock:
+            for r in records:
+                key=self.key(region,r['Code']);self.generations[key]=self.generations.get(key,0)+1
+                self.values.pop(key,None);self.errors.pop(key,None)
+                try:self.path(key).unlink(missing_ok=True)
+                except OSError:pass
+    def universe(self,market):
+        key=(market,str(datetime.now(KST).date()))
+        with self.lock:
+            if key in self.universes:return self.universes[key]
+            future=self.universe_pending.get(key)
+            if future is None:self.universe_pending[key]=self.pool.submit(self.universe_loader,market);return None
+            if not future.done():return None
+            try:result=future.result()
+            except Exception:
+                seeds=SEED_KR if market==MARKETS[0] else SEED_US
+                result=([{'Code':c,'Name':n} for c,n in seeds],'목록 조회 실패 · 주요 종목 대체 표본')
+            self.universes[key]=result;del self.universe_pending[key];return result
+    def poll(self,region,records,paused=False):
+        unique=list({r['Code']:r for r in records}.values())
+        with self.lock:
+            self.harvest();profiles=[];errors=[];missing=[]
+            for r in unique:
+                key=self.key(region,r['Code']);p=self.read(key)
+                if p is not None:profiles.append(dict(p,name=r['Name']))
+                elif key in self.errors and time.monotonic()-self.errors[key][0]<120:errors.append({'종목':r['Code'],'사유':self.errors[key][1]})
+                else:missing.append((key,r))
+            blocked=not profiles and len(errors)>=self.workers
+            if not paused and not blocked:
+                for key,r in missing:
+                    if key in self.pending:continue
+                    if len(self.pending)>=self.workers:break
+                    self.pending[key]=(self.generations.get(key,0),self.pool.submit(self.loader,region,r['Code'],r['Code']))
+            done=len(profiles)+len(errors);total=len(unique)
+            return {'profiles':profiles,'errors':errors,'cursor':done,'total':total,'progress':min(1.,max(0.,done/max(1,total))),'blocked':blocked,'pending':sum(self.key(region,r['Code']) in self.pending for r in unique),'checked_at':datetime.now(KST).strftime('%H:%M:%S')}
+    def close(self):self.pool.shutdown(wait=True,cancel_futures=True)
 
+@st.cache_resource
+def scan_service():return ScanService()
+
+
+def detail_html(p):
+    e=html.escape;currency='$' if p['region']=='US' else '₩'
+    def price(value):return '—' if value is None else currency+f'{value:,.2f}'
+    plan=p['plans'][0];valid=plan.get('valid',False)
+    signal=' · '.join(sorted(set(x['유형'] for x in p['events']))) or '최근 확정 다이버전스 없음'
+    explanation=('상승 신호와 반등·거래량·손익비 조건이 함께 충족된 구간입니다. 손절 기준을 전제로 분할 접근을 검토합니다.' if p['eligible'] else
+                 '하락 다이버전스가 확인되어 신규 진입보다 추세 회복 확인이 우선입니다.' if p['bear'] else
+                 '일부 반등 조건은 보이지만 진입 요건이 모두 충족되지는 않았습니다. 가격만 보고 진입하기보다 거래량과 반등 확인을 기다리는 구간입니다.')
+    facts=[('검토 진입가',price(plan.get('low'))),('1차 저항 / 목표',price(plan.get('target'))),('손절 참고가',price(plan.get('stop'))),('손익비',f"1 : {plan['rr']:.2f}" if valid else '산정 불가')]
+    cards=''.join(f'<div class="detail-metric"><small>{label}</small><b>{value}</b></div>' for label,value in facts)
+    r=p['df'].iloc[-1]
+    obs=[f"BB {price(float(r.BB_Lower))} ~ {price(float(r.MA20))}",f"SMA200 {price(float(r.MA200))}",f"RSI {p['rsi']:.1f}",f"현재 낙폭 {p['dd']*100:.1f}% / 과거 최대 {p['mdd']*100:.1f}%",f"직전20일 대비 {p['volume_ratio']:.2f}배"]
+    checks=''.join(f'<div class="condition {"passed" if ok else "waiting"}"><small>{i+1}. {e(label)}</small><b>{"✓ 충족" if ok else "확인 대기"}</b><span>{e(value)}</span></div>' for i,((label,ok),value) in enumerate(zip(p['checks'].items(),obs)))
+    # Explain the actual existing eight factors; do not invent 24-indicator measurements.
+    groups=[('추세 · 위치',35,['가격 위치','장기 추세']),('반등 모멘텀',40,['RSI 조정','상승 다이버전스','반등 확인']),('낙폭 · 위험',10,['표본 낙폭']),('거래량',15,['거래량 회복'])]
+    pts=dict(p['points']);group_html=''
+    for title,maximum,labels in groups:
+        points=sum(pts.get(k,0) for k in labels)
+        rows=''.join(f'<li>{e(k)} <strong>{pts.get(k,0)}점</strong></li>' for k in labels)
+        group_html+=f'<div class="factor"><h4>{title}<span>{points}/{maximum}</span></h4><div class="factor-bar"><i style="width:{points/maximum*100:.0f}%"></i></div><ul>{rows}</ul></div>'
+    return f'''<section class="detail-panel"><div class="detail-title"><h3>종목 매매 타이밍 · {e(p['name'])}</h3><span class="badge">{e(p['status'])}</span></div><div class="detail-signal">{e(signal)}</div><p>{explanation}</p><div class="detail-grid">{cards}</div><small>기준 {e(p['asof'])} 확정 종가 · {e(plan.get('target_kind','유효 가격 구조 없음'))}</small></section><h4 class="section-title">◎ 5대 기술 조건 충족 결과　{p['count']} / 5</h4><div class="condition-grid">{checks}</div><section class="detail-panel"><div class="detail-title"><h3>기술적 반등 점수 종합 평가</h3><span class="score-big">{p['score']}<small>/100</small></span></div><p>{explanation}</p><div class="factor-grid">{group_html}</div><p>하락 다이버전스 조정: {pts.get('하락 다이버전스',0)}점 · 총점은 0점 미만으로 내려가지 않습니다.</p></section>'''
+
+
+def render_detail(p):
+    st.markdown(detail_html(p),unsafe_allow_html=True)
+    st.caption(p['source']+' · 상승 확률이 아닌 자체 기술 조건식입니다. 기업 흑자·24개 지표·AI 분석으로 표시하지 않습니다.')
+    rows=[{'시나리오':x['name'],'검토 가격':x['low'],'손절선':x['stop'],'저항/목표':x['target'],'손익비':round(x['rr'],2),'조건':x['condition']} for x in p['plans'] if x.get('valid')]
+    with st.expander('분할 진입 가격과 신호 근거'):
+        if rows:st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+        if p['events']:st.dataframe(pd.DataFrame(p['events']),hide_index=True,use_container_width=True)
+        st.caption('2R 관리선은 가정이며 관측 저항이 아닙니다. 40%/60%는 참고 비중이고 가격 도달만으로 추가 매수하지 않습니다.')
 
 PRESETS=['전체 종목','↗ 상승 다이버전스','↘ 하락 다이버전스','✓ 5개 조건 충족','♛ S등급','◉ 진입 검토','▥ 거래량 급증']
 SORTS=['퀀트 반등 점수 높은순','조건 충족 많은순','거래량 증가순','낙폭 큰순','종목명순']
@@ -450,6 +527,16 @@ h1,h2,h3,p{letter-spacing:-.025em}
 [role="listbox"]{background:#152039!important;color:#d7e7ff!important}
 
 @media(max-width:700px){.block-container{padding:9px 12px}.brand h1{font-size:20px!important}.intro h2{font-size:16px!important}.topline span:last-child{display:none}.resultline{display:block}.stock{min-height:270px}.name{max-width:160px}}
+
+.detail-panel{border:1px solid #08785f;background:#10192b;border-radius:12px;padding:18px;margin:8px 0 18px}
+.detail-title{display:flex;align-items:center;justify-content:space-between;gap:12px}.detail-title h3{font-size:18px!important;padding:0;margin:0}
+.detail-panel p{color:#aabbd6;font-size:12px;line-height:1.8}.detail-panel small{font-size:10px;color:#8296b8}
+.detail-signal{color:#00e5b2;background:#102b2a;border:1px solid #285548;border-radius:6px;padding:10px;margin-top:13px;font-weight:700;font-size:12px}
+.detail-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}.detail-metric{border:1px solid #2c3852;background:#111b2e;border-radius:7px;padding:12px}.detail-metric small{display:block;margin-bottom:7px}.detail-metric b{font-size:19px;color:#25e2b3}.detail-metric:nth-child(2) b{color:#2ad1f1}.detail-metric:nth-child(3) b{color:#ff6383}.detail-metric:nth-child(4) b{color:#ffd24c}
+.section-title{font-size:14px!important}.condition-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:12px 0 20px}.condition{border:1px solid #344158;background:#111b2e;border-radius:9px;padding:12px;min-width:0}.condition.passed{border-color:#009f7e}.condition small{font-size:10px;color:#97a9c3;display:block}.condition b{display:block;font-size:14px;margin:8px 0;color:#d4e5ff}.condition.passed b{color:#1fe5b1}.condition span{font-size:10px;color:#889dbc;overflow-wrap:anywhere}
+.score-big{color:#22dfd5;font-size:29px;font-weight:800;white-space:nowrap}.score-big small{font-size:12px;margin-left:5px}
+.factor-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.factor{border:1px solid #22425b;border-radius:9px;padding:14px;background:#0e1a2b}.factor h4{font-size:13px!important;color:#20debb;padding:0;margin:0}.factor h4 span{float:right;color:#a9dff6}.factor li{font-size:11px;color:#9cb0ce;line-height:2}.factor li strong{float:right;color:#50dfc4}.factor ul{padding-left:14px}.factor-bar{height:4px;background:#243550;margin:12px 0}.factor-bar i{display:block;height:4px;background:#06ccac}
+@media(max-width:700px){.detail-grid,.condition-grid{grid-template-columns:repeat(2,1fr)}.factor-grid{grid-template-columns:1fr}.detail-title h3{font-size:15px!important}}
 </style>
 '''
 GUIDE='''### 스크리너 사용 순서
@@ -467,7 +554,7 @@ GUIDE='''### 스크리너 사용 순서
 
 **분할 시나리오:** 1차40%·2차60%는 참고 비중입니다. 2차 가격에 도달했다는 이유만으로 추가 매수하지 않습니다. 손절=직전20일 저점−0.5ATR, 목표 후보는20일선·BB상단·직전252봉 고점 중 가까운 저항입니다.2R 가정선은 진입 조건 충족 근거에서 제외합니다.
 
-**운영:** 화면이 열려 있는 동안2종목씩 분석합니다. 첫6종목 모두 실패하면 요청을 중단합니다. 날짜가 바뀌면 새로 분석합니다. 직접 추가한 목록은 현재 세션에 보관합니다. 목록 조회 실패 시 주요 종목 표본임을 표시합니다. 수익성은 검증되지 않은 자체 기술 조건식입니다.
+**운영:** 최대4개 백그라운드 작업으로 병렬 조회하고 화면은1초마다 완료 결과만 확인합니다. 초기 조회가 모두 실패하면 추가 요청을 중단합니다. 같은 날 저장된 결과를 재사용하며 서버 재배포·절전으로 저장소가 초기화되면 다시 조회합니다. 일시정지는 신규 요청만 중단하며 진행 중 작업은 완료됩니다. 날짜가 바뀌면 새로 분석합니다. 직접 추가한 목록은 현재 세션에 보관합니다. 목록 조회 실패 시 주요 종목 표본임을 표시합니다. 수익성은 검증되지 않은 자체 기술 조건식입니다.
 '''
 
 @st.dialog('전략 지표 · 사용설명서')
@@ -479,7 +566,7 @@ def detail_dialog(profile):
     render_detail(profile)
 
 def register_symbol(market):
-    region='KR' if market in MARKETS[:2] else 'US'
+    region='KR' if market==MARKETS[0] else 'US'
     code=st.session_state.get('add_code','').strip().upper()
     name=st.session_state.get('add_name','').strip()
     valid=valid_code(code) if region=='KR' else bool(re.fullmatch(r'[A-Z]{1,6}(?:[.-][A-Z]{1,2})?',code))
@@ -487,12 +574,11 @@ def register_symbol(market):
     if valid:
         records=st.session_state.setdefault('custom_'+market,[])
         if code not in [r['Code'] for r in records]:records.insert(0,{'Code':code,'Name':name or code})
-        st.session_state.pop('scan_'+market,None)
 
 
 @st.dialog('새 종목 추가')
 def add_dialog(market):
-    region='KR' if market in MARKETS[:2] else 'US'
+    region='KR' if market==MARKETS[0] else 'US'
     st.caption('현재 마켓의 사용자 목록에 추가합니다. 지수 구성 종목 여부는 보장하지 않습니다.')
     with st.form('add_form'):
         st.text_input('6자리 종목코드' if region=='KR' else '미국 주식 티커',key='add_code')
@@ -518,7 +604,7 @@ def card_html(p,market):
     signals=' · '.join(sorted(set(x['유형'] for x in p['events']))) or '신호 대기'
     checks=''.join(f'<span class="{"yes" if value else ""}">{"✓" if value else "·"} {label}</span>' for label,value in zip(['BB','200MA','RSI','MDD','거래량'],p['checks'].values()))
     reach=f"{p['reach']*100:.0f}%" if p['reach'] is not None else '—'
-    label=['ETF','KR','S&P','NDX'][MARKETS.index(market)]
+    label=['KR','S&P','NDX'][MARKETS.index(market)]
     price=f"{p['close']:,.2f}" if p['region']=='US' else f"{p['close']:,.0f}"
     return f'''<article class="stock {tone}"><div class="stockhead"><div><div class="symbol">{e(p['code'])}<small>{label}</small></div><div class="name" title="{e(p['name'])}">{e(p['name'])}</div></div><div class="price">{currency}{price}<div class="change {'up' if change>=0 else 'down'}">{change:+.2f}%</div></div></div><div class="signal"><span class="pill">{e(signals)}</span><span>{'♛ S · ' if p['s_grade'] else ''}<b>{p['score']}</b> / 100</span></div>{sparkline(p['df'].Close.tail(40),color)}<div class="stats"><div><small>표본 MDD 도달률</small><b>{reach}</b></div><div><small>RSI · 14</small><b>{p['rsi']:.1f}</b></div><div><small>거래량 / 20일</small><b>{p['volume_ratio']:.2f}x</b></div></div><div class="checks">{checks}</div><div class="cardfoot"><span>{e(p['status'])} · 조건 {p['count']}/5</span><span>{e(p['asof'])} 종가</span></div></article>'''
 
@@ -532,35 +618,23 @@ def filter_profiles(profiles,preset,query,requirements,sort):
     return sorted(out,key=keys[sort])
 
 
-def prepare_job(market,records):
-    region='KR' if market in MARKETS[:2] else 'US'
-    identity=(str(datetime.now(EXCHANGE_TZ[region]).date()),tuple((r['Code'],r['Name']) for r in records))
-    key='scan_'+market;job=st.session_state.get(key)
-    if not job or job['identity']!=identity:
-        job={'identity':identity,'cursor':0,'profiles':[],'errors':[],'checked_at':None}
-        st.session_state[key]=job
-    return job
-
-
-def advance_job(job,records,region):
-    if not job['profiles'] and len(job['errors'])>=6:return
-    for record in records[job['cursor']:job['cursor']+2]:
-        try:job['profiles'].append(load_profile(region,record['Code'],record['Name']))
-        except Exception as exc:job['errors'].append({'종목':record['Code'],'사유':str(exc)[:180]})
-        job['cursor']+=1
-    job['checked_at']=datetime.now(KST).strftime('%H:%M:%S')
-
-
-@st.fragment(run_every='5s')
-def screen_results(market,records,source,preset,query,requirements,sort,paused):
-    region='KR' if market in MARKETS[:2] else 'US';job=prepare_job(market,records)
-    if not paused and job['cursor']<len(records):advance_job(job,records,region)
+@st.fragment(run_every='1s')
+def screen_results(market,custom,preset,query,requirements,sort,paused):
+    region='KR' if market==MARKETS[0] else 'US';service=scan_service()
+    universe=service.universe(market)
+    if universe is None:
+        st.info('종목 목록을 백그라운드에서 불러오고 있습니다. 화면 조작은 계속 가능합니다.')
+        return
+    records,source=universe;codes={r['Code'] for r in custom}
+    records=custom+[r for r in records if r['Code'] not in codes]
+    if custom:source+=f' + 사용자 추가 {len(custom)}개'
+    job=service.poll(region,records,paused)
     profiles=job['profiles'];selected=filter_profiles(profiles,preset,query,requirements,sort)
     st.markdown(f'<div class="summary"><span>분석 완료<b>{len(profiles)}</b></span><span>상승 신호<b>{sum(p["bull"] for p in profiles)}</b></span><span>하락 경계<b>{sum(p["bear"] for p in profiles)}</b></span><span>5개 충족<b>{sum(p["count"]==5 for p in profiles)}</b></span><span>S등급<b>{sum(p["s_grade"] for p in profiles)}</b></span><span>진입 검토<b>{sum(p["eligible"] for p in profiles)}</b></span></div>',unsafe_allow_html=True)
-    st.progress(job['cursor']/max(1,len(records)))
+    st.progress(job['progress'])
     st.caption(f"{source} · {job['cursor']}/{len(records)} 처리 · 실패 {len(job['errors'])} · 최근 처리 {job['checked_at'] or '대기'} KST")
-    if not profiles and len(job['errors'])>=6:st.warning('공급원 조회가 6개 연속 실패하여 자동 요청을 중단했습니다. 실패 사유 확인 후 즉시 갱신으로 재시도해 주십시오.')
-    st.markdown(f'<div class="resultline"><span>스크리닝 결과: <strong>{len(selected)}개 종목</strong>　|　<em>{"분석 일시정지" if paused else "확정 일봉 자동 분석"}</em></span><span>종목 상세에서 차트 · 조건 근거 · 진입/손절/저항을 확인하세요</span></div>',unsafe_allow_html=True)
+    if job['blocked']:st.warning('공급원 조회가 4개 이상 실패하여 자동 요청을 중단했습니다. 실패 사유 확인 후 즉시 갱신으로 재시도해 주십시오.')
+    st.markdown(f'<div class="resultline"><span>스크리닝 결과: <strong>{len(selected)}개 종목</strong>　|　<em>{"분석 일시정지" if paused else "확정 일봉 자동 분석"}</em></span><span>종목 상세에서 매매 타이밍 · 5대 조건 · 점수 근거를 확인하세요</span></div>',unsafe_allow_html=True)
     if not selected:
         title='현재 조건에 맞는 종목이 없습니다' if profiles else ('분석을 일시정지했습니다' if paused else '시장 데이터를 확인하고 있습니다')
         st.markdown(f'<div class="empty"><b>{title}</b>조건을 변경하시거나 분석 진행 상태와 수집 실패 사유를 확인해 주십시오.</div>',unsafe_allow_html=True)
@@ -572,7 +646,7 @@ def screen_results(market,records,source,preset,query,requirements,sort,paused):
         for col,p in zip(st.columns(3),visible[offset:offset+3]):
             with col:
                 st.markdown(card_html(p,market),unsafe_allow_html=True)
-                if st.button('차트 · 매매 시나리오 열기 ↗',key='detail_'+market+p['code'],use_container_width=True):detail_dialog(p)
+                if st.button('매매 타이밍 · 종합 평가 ↗',key='detail_'+market+p['code'],use_container_width=True):detail_dialog(p)
     bottom=st.columns([1,2,1])
     bottom[0].number_input('결과 페이지',min_value=1,max_value=pages,step=1,key=page_key)
     bottom[1].caption(f'페이지 {page}/{pages} · 한 페이지 12종목 · 조건별 점수는 상승 확률이 아닙니다.')
@@ -586,18 +660,20 @@ def screen_results(market,records,source,preset,query,requirements,sort,paused):
 def main():
     st.set_page_config(page_title='개미 투자전략실 | 퀀트 스크리너',page_icon='📈',layout='wide',initial_sidebar_state='collapsed')
     st.markdown(CSS,unsafe_allow_html=True)
-    st.markdown('<div class="topline"><span>◉ ANT QUANT LAB　 ·　주식 & ETF 데이터 기반 리서치</span><span>확정 일봉 · 공개 조건식 · 가상화폐 제외</span></div>',unsafe_allow_html=True)
+    st.markdown('<div class="topline"><span>◉ ANT QUANT LAB　 ·　주식 데이터 기반 리서치</span><span>확정 일봉 · 공개 조건식 · 가상화폐 제외</span></div>',unsafe_allow_html=True)
     st.markdown('<div class="brand"><div class="logo">↗</div><div><h1>개미 투자전략실 <span class="badge">QUANT SCREENER</span></h1><p>5대 기술 조건 · RSI/MACD 다이버전스 · 거래량 · 손익비</p></div></div>',unsafe_allow_html=True)
-    if 'market' not in st.session_state:st.session_state.market=MARKETS[0]
+    if st.session_state.get('market') not in MARKETS:st.session_state.market=MARKETS[0]
     market=st.session_state.market
     bar=st.columns([1.25,2.1,1.1,1.1,1.1])
     paused=bar[0].toggle('자동 분석',value=True,key='auto_scan') is False
-    bar[1].markdown('<div class="toolbar-label">● 확정 일봉 스캔　<span style="color:#00d5a3">2종목씩 순차 분석</span><br>종가 기준 · 장중 실시간 가격 아님</div>',unsafe_allow_html=True)
+    bar[1].markdown('<div class="toolbar-label">● 확정 일봉 스캔　<span style="color:#00d5a3">최대 4종목 병렬 · 저장 결과 우선</span><br>종가 기준 · 장중 실시간 가격 아님</div>',unsafe_allow_html=True)
     if bar[2].button('＋ 종목 추가',use_container_width=True):add_dialog(market)
     if bar[3].button('▣ 전략 / 설명서',use_container_width=True):guide_dialog()
     if bar[4].button('⟳ 즉시 갱신',type='primary',use_container_width=True):
-        market_universe.clear();load_profile.clear();st.session_state.pop('scan_'+market,None);st.rerun()
-    st.markdown('<section class="intro"><div class="eyebrow">● GLOBAL STOCKS & ETF QUANT SCREENER</div><h2>낙폭과 다이버전스로 찾는 주식 반등 후보</h2><p>국내 ETF · 대형주 · 미국 주요 지수 구성 종목을 자동으로 살펴봅니다.<br><span style="color:#00d5a3">상승 다이버전스</span>와 <span style="color:#ff6183">하락 경계 신호</span>를 구분하고, 진입 조건과 손익비를 함께 확인합니다.</p><div class="keyrules"><span>1. 볼린저 위치</span><span>2. 200일선</span><span>3. RSI ≤ 40</span><span>4. 표본 MDD</span><span>5. 거래량 회복</span></div></section>',unsafe_allow_html=True)
+        service=scan_service();universe=service.universe(market)
+        if universe is not None:service.invalidate('KR' if market==MARKETS[0] else 'US',universe[0]+st.session_state.get('custom_'+market,[]))
+        st.rerun()
+    st.markdown('<section class="intro"><div class="eyebrow">● GLOBAL STOCKS QUANT SCREENER</div><h2>낙폭과 다이버전스로 찾는 주식 반등 후보</h2><p>국내 대형주 · 미국 주요 지수 구성 종목을 자동으로 살펴봅니다.<br><span style="color:#00d5a3">상승 다이버전스</span>와 <span style="color:#ff6183">하락 경계 신호</span>를 구분하고, 진입 조건과 손익비를 함께 확인합니다.</p><div class="keyrules"><span>1. 볼린저 위치</span><span>2. 200일선</span><span>3. RSI ≤ 40</span><span>4. 표본 MDD</span><span>5. 거래량 회복</span></div></section>',unsafe_allow_html=True)
     controls=st.columns([2.3,1,1])
     market=controls[0].radio('마켓 선택',MARKETS,horizontal=True,key='market',label_visibility='collapsed')
     query=controls[1].text_input('종목 검색',placeholder='티커, 종목명 (NVDA, 삼성전자)',label_visibility='collapsed',key='search')
@@ -606,12 +682,8 @@ def main():
     with st.expander('세부 5대 조건 · 원하는 조건을 추가로 선택하세요'):
         labels=['볼린저 하단~중단','200일선 위','RSI 40 이하','표본 MDD 70~100%','거래량 회복']
         requirements=[label for col,label in zip(st.columns(5),labels) if col.checkbox(label,key='require_'+label)]
-        st.caption('흑자 조건은 재무 조회 없이 판단할 수 없어 거래량 회복으로 대체했습니다. ETF도 같은 기술 조건을 적용합니다.')
-    records,source=market_universe(market)
-    custom=st.session_state.get('custom_'+market,[]);codes={r['Code'] for r in custom}
-    records=custom+[r for r in records if r['Code'] not in codes]
-    if custom:source+=f' + 사용자 추가 {len(custom)}개 (지수 구성 여부 미검증)'
-    screen_results(market,records,source,preset,query,requirements,sort,paused)
+        st.caption('흑자 조건은 재무 조회 없이 판단할 수 없어 거래량 회복으로 대체했습니다. ')
+    screen_results(market,st.session_state.get('custom_'+market,[]),preset,query,requirements,sort,paused)
 
 
 if __name__=='__main__':

@@ -2,6 +2,5 @@ streamlit>=1.41,<2
 finance-datareader
 numpy
 pandas
-plotly
 requests
 lxml

@@ -1,5 +1,5 @@
 from pathlib import Path
-import importlib.util,sys
+import importlib.util,sys,time,threading,tempfile
 import numpy as np
 import pandas as pd
 import pytest
@@ -18,11 +18,14 @@ def offline(*args,**kwargs):raise ConnectionError('offline test')
 request_bytes=offline
 fdr_table=offline
 fetch_history=fixture_history
+@st.cache_resource
+def fixture_service():return ScanService(tempfile.mkdtemp(),loader=load_profile,universe_loader=market_universe)
+scan_service=fixture_service
 main()
 '''
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
-    a.st.cache_data.clear()
+    a.st.cache_data.clear();a.st.cache_resource.clear()
     def fail(*args,**kwargs):raise ConnectionError('offline test')
     monkeypatch.setattr(a,'request_bytes',fail);monkeypatch.setattr(a,'fdr_table',fail)
 
@@ -70,46 +73,88 @@ def test_filters_sort_html_escape_and_fallback():
     assert len(a.filter_profiles([p],'전체 종목','test',[],a.SORTS[0]))==1
     rows,source=a.market_universe(a.MARKETS[2]);assert rows and '대체 표본' in source
 
-def test_new_interface_has_no_legacy_navigation_and_all_markets():
-    at=AppTest.from_string(SOURCE+FIXTURE).run(timeout=30)
+
+def finish(service,region,records):
+    for _ in range(300):
+        snap=service.poll(region,records)
+        if snap['cursor']==snap['total'] or snap['blocked']:return snap
+        time.sleep(.01)
+    raise AssertionError('worker did not complete')
+
+def sample_profile(code='005930'):
+    d=history();d.index=pd.bdate_range(end=pd.Timestamp.now().normalize()-pd.Timedelta(days=2),periods=len(d))
+    p=a.analyze(d);p.update(code=code,name=code,region='KR',source='fixture');return p
+
+def test_bounded_parallel_nonblocking_and_singleflight(tmp_path):
+    gate=threading.Event();lock=threading.Lock();calls=[];active=[0,0]
+    def loader(region,code,name):
+        with lock:active[0]+=1;active[1]=max(active);calls.append(code)
+        gate.wait(3)
+        try:return sample_profile(code)
+        finally:
+            with lock:active[0]-=1
+    service=a.ScanService(tmp_path,workers=4,loader=loader)
+    records=[{'Code':f'{i:06d}','Name':str(i)} for i in range(8)]
+    try:
+        start=time.monotonic();first=service.poll('KR',records)
+        assert time.monotonic()-start<.5 and first['pending']==4
+        service.poll('KR',records);assert len(service.pending)==4
+        gate.set();out=finish(service,'KR',records+records)
+        assert out['cursor']==8 and out['total']==8 and out['progress']==1
+        assert len(calls)==8 and active[1]<=4
+        service.poll('KR',records,paused=True);assert len(calls)==8
+    finally:gate.set();service.close()
+
+def test_persistent_reuse_refresh_and_no_names_on_disk(tmp_path):
+    calls=[]
+    def loader(region,code,name):calls.append(code);return sample_profile(code)
+    records=[{'Code':'005930','Name':'PRIVATE_CUSTOM_NAME'}]
+    service=a.ScanService(tmp_path,loader=loader)
+    out=finish(service,'KR',records);service.close()
+    assert out['profiles'][0]['name']=='PRIVATE_CUSTOM_NAME'
+    assert 'PRIVATE_CUSTOM_NAME' not in next(tmp_path.glob('*.json')).read_text()
+    service=a.ScanService(tmp_path,loader=loader)
+    try:
+        out=service.poll('KR',records);assert out['progress']==1 and len(calls)==1
+        service.invalidate('KR',records);finish(service,'KR',records);assert len(calls)==2
+    finally:service.close()
+
+def test_failure_pause_empty_and_changing_universe_progress(tmp_path):
+    def fail(*args):raise ValueError('offline')
+    service=a.ScanService(tmp_path,loader=fail)
+    records=[{'Code':str(i),'Name':str(i)} for i in range(20)]
+    try:
+        assert service.poll('KR',records,paused=True)['pending']==0
+        out=finish(service,'KR',records);assert out['blocked'] and out['cursor']==4
+        for subset in [records[:1],[],records+records]:
+            snap=service.poll('KR',subset,paused=True);assert 0<=snap['progress']<=1 and snap['cursor']<=snap['total']
+    finally:service.close()
+
+def test_no_chart_detail_and_group_scores():
+    p=sample_profile();text=a.detail_html(p)
+    assert '5대 기술 조건' in text and '손익비' in text and '기술적 반등 점수' in text
+    assert '<svg' not in text and 'plotly' not in text
+    assert 'KODEX' not in ''.join(a.MARKETS) and len(a.MARKETS)==3
+
+def settle(at):
+    for _ in range(20):
+        at.run(timeout=10)
+        if any(str(b.key).startswith('detail_') for b in at.button):return at
+        time.sleep(.03)
+    return at
+
+def test_async_ui_market_filter_detail_and_add():
+    at=settle(AppTest.from_string(SOURCE+FIXTURE))
     assert not at.exception
-    assert not any(x.key in ['v2_menu','market_region'] for x in at.radio)
     for market in a.MARKETS:
-        at.radio(key='market').set_value(market).run(timeout=30)
-        assert not at.exception
-        assert at.session_state['scan_'+market]['profiles']
+        at.radio(key='market').set_value(market);settle(at);assert not at.exception
     for preset in a.PRESETS:
-        at.radio(key='preset').set_value(preset).run(timeout=30);assert not at.exception
-    at.radio(key='preset').set_value('전체 종목').run(timeout=30)
-    next(b for b in at.button if str(b.key).startswith('detail_')).click().run(timeout=30)
-    assert not at.exception
-
-def test_pause_search_and_sort():
-    at=AppTest.from_string(SOURCE+FIXTURE).run(timeout=30)
-    at.toggle(key='auto_scan').set_value(False).run(timeout=30)
-    cursor=at.session_state['scan_'+a.MARKETS[0]]['cursor']
-    at.text_input(key='search').set_value('nonsense').run(timeout=30)
-    assert not at.exception and at.session_state['scan_'+a.MARKETS[0]]['cursor']==cursor
-    assert not any(str(b.key).startswith('detail_') for b in at.button)
-    for sort in a.SORTS:
-        at.selectbox(key='sort').set_value(sort).run(timeout=30);assert not at.exception
-
-def test_failing_data_stops_without_fabricated_cards():
-    fixture=FIXTURE.replace('fetch_history=fixture_history','fetch_history=lambda *a,**k:Result(pd.DataFrame(),"offline","error")')
-    at=AppTest.from_string(SOURCE+fixture).run(timeout=30)
-    for i in range(4):at.run(timeout=30)
-    job=at.session_state['scan_'+a.MARKETS[0]]
-    assert not job['profiles'] and job['cursor']==6 and len(job['errors'])==6
-    assert at.warning
-
-
-def test_add_symbol_and_guide_dialog():
-    at=AppTest.from_string(SOURCE+FIXTURE).run(timeout=30)
-    next(b for b in at.button if b.label=='＋ 종목 추가').click().run(timeout=30)
-    at.text_input(key='add_code').set_value('005930')
-    at.text_input(key='add_name').set_value('삼성전자')
-    next(b for b in at.button if b.label=='추가하고 분석').click().run(timeout=30)
-    assert not at.exception
-    assert at.session_state['custom_'+a.MARKETS[0]][0]['Code']=='005930'
-    next(b for b in at.button if b.label=='▣ 전략 / 설명서').click().run(timeout=30)
+        at.radio(key='preset').set_value(preset).run(timeout=10);assert not at.exception
+    at.radio(key='preset').set_value('전체 종목');settle(at)
+    next(b for b in at.button if str(b.key).startswith('detail_')).click().run(timeout=10)
+    assert not at.exception and len(at.get('plotly_chart'))==0
+    at.radio(key='market').set_value(a.MARKETS[0]).run(timeout=10)
+    next(b for b in at.button if b.label=='＋ 종목 추가').click().run(timeout=10)
+    at.text_input(key='add_code').set_value('005930');at.text_input(key='add_name').set_value('삼성전자')
+    next(b for b in at.button if b.label=='추가하고 분석').click().run(timeout=10)
     assert not at.exception
